@@ -1,0 +1,6 @@
+# IDE
+.vscode/
+.idea/
+
+# Rust compiled files
+/target
