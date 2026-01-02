@@ -16,33 +16,16 @@ pub mod core {
             pub mod packet;
         }
         pub mod crypto {
-            pub mod crypto_pool;
             pub mod crypto_pool_phantom;
-            pub mod cipher {
-                pub mod aes_gcm;
-                pub mod key_derivation;
-            }
-            pub mod handshake {
-                pub mod handshake;
-            }
-            pub mod key_manager {
-                pub mod psk_manager;
-                pub mod session_keys;
-            }
-            pub mod signature {
-                pub mod hmac;
-                pub mod verification;
-            }
         }
         pub mod packets {
             pub mod decoder {
                 pub mod frame_reader;
-                pub mod packet_parser;
                 pub mod packet_parser_phantom;
             }
             pub mod encoder {
                 pub mod frame_writer;
-                pub mod packet_builder;
+                pub mod packet_builder_phantom;
             }
             pub mod processor {
                 pub mod dispatcher;
@@ -55,15 +38,13 @@ pub mod core {
                         pub mod decryption;
                         pub mod encryption;
                         pub mod processing;
-                        pub mod response;
                     }
                 }
             }
         }
         pub mod server {
-            pub mod connection_manager;
-            pub mod session_manager;
-            pub mod tcp_server;
+            pub mod connection_manager_phantom;
+            pub mod session_manager_phantom;
             pub mod tcp_server_phantom;
             pub mod heartbeat {
                 pub mod manager;

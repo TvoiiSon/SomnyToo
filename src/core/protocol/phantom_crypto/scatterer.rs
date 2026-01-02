@@ -17,6 +17,7 @@ pub struct ScatteredParts {
     pub(crate) ram_part_iv: [u8; 12],
 
     // Метаданные для вычисления регистровой части
+    // ЭТО ТЕПЕРЬ НЕ ИСПОЛЬЗУЕТСЯ ДЛЯ ГЕНЕРАЦИИ КЛЮЧЕЙ!
     pub(crate) register_seed: [u8; 16],
     // Не включаем AtomicU64 в Clone
 }

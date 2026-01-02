@@ -4,19 +4,21 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tracing::{info, error, warn, trace};
 
-use crate::core::protocol::crypto::key_manager::session_keys::SessionKeys;
-use crate::core::protocol::packets::processor::packet_service::PacketService;
-use crate::core::protocol::packets::processor::priority::Priority;
+// Заменяем старые импорты на фантомные
+use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
 // Импорты для pipeline
 use crate::core::protocol::packets::processor::pipeline::orchestrator::PipelineOrchestrator;
-use crate::core::protocol::packets::processor::pipeline::stages::common::PipelineContext;
-use crate::core::protocol::packets::processor::pipeline::stages::decryption::DecryptionStage;
-use crate::core::protocol::packets::processor::pipeline::stages::processing::ProcessingStage;
-use crate::core::protocol::packets::processor::pipeline::stages::encryption::EncryptionStage;
+use crate::core::protocol::packets::processor::pipeline::stages::common::{PipelineContext};
+use crate::core::protocol::packets::processor::pipeline::stages::decryption::PhantomDecryptionStage;
+use crate::core::protocol::packets::processor::pipeline::stages::processing::PhantomProcessingStage;
+use crate::core::protocol::packets::processor::pipeline::stages::encryption::PhantomEncryptionStage;
+use super::priority::Priority;
+use super::packet_service::PhantomPacketService;
 
 pub struct Work {
-    pub ctx: Arc<SessionKeys>,
+    pub ctx: Arc<PhantomSession>,  // Заменяем SessionKeys на PhantomSession
     pub raw_payload: Vec<u8>,
     pub client_ip: SocketAddr,
     pub reply: oneshot::Sender<Vec<u8>>,
@@ -27,42 +29,43 @@ pub struct Work {
 
 pub struct Dispatcher {
     tx: mpsc::Sender<Work>,
-    packet_service: PacketService,
+    phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
 }
 
 impl Dispatcher {
-    pub fn spawn(num_workers: usize, packet_service: PacketService) -> Self {
+    pub fn spawn(
+        num_workers: usize,
+        phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+        phantom_packet_service: Arc<PhantomPacketService>,  // Добавляем сервис
+    ) -> Self {
         let (tx, rx) = mpsc::channel::<Work>(65536);
         let rx = Arc::new(Mutex::new(rx));
 
         for _ in 0..num_workers {
             let rx = Arc::clone(&rx);
-            let packet_service = packet_service.clone();
+            let phantom_crypto_pool = phantom_crypto_pool.clone();
+            let phantom_packet_service = phantom_packet_service.clone();  // Клонируем сервис
 
             tokio::spawn(async move {
-                let mut worker = DispatcherWorker::new(rx, packet_service);
+                let mut worker = DispatcherWorker::new(rx, phantom_crypto_pool, phantom_packet_service);
                 worker.run().await;
             });
         }
 
-        Dispatcher { tx, packet_service }
+        Dispatcher { tx, phantom_crypto_pool }
     }
 
-    pub fn get_packet_service(&self) -> &PacketService {
-        &self.packet_service
-    }
-
-    // Добавляем метод для обработки пакетов напрямую через сервис
     pub async fn process_directly(
         &self,
-        ctx: Arc<SessionKeys>,
+        ctx: Arc<PhantomSession>,
         packet_type: u8,
         payload: Vec<u8>,
-        client_ip: SocketAddr
+        _client_ip: SocketAddr
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        let packet_type_enum = crate::core::protocol::packets::decoder::packet_parser::PacketType::from(packet_type);
-        let result = self.packet_service.process_packet(ctx, packet_type_enum, payload, client_ip).await?;
-        Ok(result.response)
+        // Используем фантомный пакетный процессор напрямую
+        let processor = PhantomPacketProcessor::new();
+        let result = processor.create_outgoing(&ctx, packet_type, &payload)?;
+        Ok(result)
     }
 
     pub async fn submit(&self, work: Work) -> Result<(), mpsc::error::SendError<Work>> {
@@ -72,12 +75,17 @@ impl Dispatcher {
 
 struct DispatcherWorker {
     rx: Arc<Mutex<mpsc::Receiver<Work>>>,
-    packet_service: PacketService,
+    phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+    phantom_packet_service: Arc<PhantomPacketService>,
 }
 
 impl DispatcherWorker {
-    fn new(rx: Arc<Mutex<mpsc::Receiver<Work>>>, packet_service: PacketService) -> Self {
-        Self { rx, packet_service }
+    fn new(
+        rx: Arc<Mutex<mpsc::Receiver<Work>>>,
+        phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+        phantom_packet_service: Arc<PhantomPacketService>
+    ) -> Self {
+        Self { rx, phantom_crypto_pool, phantom_packet_service }
     }
 
     async fn run(&mut self) {
@@ -111,15 +119,22 @@ impl DispatcherWorker {
             0x10 // Fallback to Test packet type
         };
 
-        info!("Processing work for {} (size: {} bytes, priority: {:?})",
-          work.client_ip, work.raw_payload.len(), work.priority);
+        info!("Processing phantom work for {} (size: {} bytes, priority: {:?})",
+              work.client_ip, work.raw_payload.len(), work.priority);
 
-        // Создаем pipeline для обработки пакета
+        // Создаем pipeline для обработки фантомного пакета
         let pipeline_start = Instant::now();
+        // Создаем pipeline с PhantomPacketService
         let pipeline = PipelineOrchestrator::new()
-            .add_stage(DecryptionStage)
-            .add_stage(ProcessingStage::new(self.packet_service.clone(), work.client_ip))
-            .add_stage(EncryptionStage::new(response_packet_type));
+            .add_stage(PhantomDecryptionStage::new(self.phantom_crypto_pool.clone()))
+            .add_stage(PhantomProcessingStage::new(
+                self.phantom_packet_service.clone(),
+                work.client_ip
+            ))
+            .add_stage(PhantomEncryptionStage::new(
+                response_packet_type,
+                self.phantom_crypto_pool.clone()
+            ));
 
         let pipeline_init_time = pipeline_start.elapsed();
 
@@ -131,29 +146,29 @@ impl DispatcherWorker {
                 let execute_time = execute_start.elapsed();
                 let total_work_time = work_start.elapsed();
 
-                info!("Pipeline execution - init: {:?}, execute: {:?}, total: {:?}, response size: {} bytes",
-                  pipeline_init_time, execute_time, total_work_time, encrypted_response.len());
+                info!("Phantom pipeline execution - init: {:?}, execute: {:?}, total: {:?}, response size: {} bytes",
+                      pipeline_init_time, execute_time, total_work_time, encrypted_response.len());
 
                 let processing_time = Instant::now().duration_since(work.received_at);
                 if processing_time.as_millis() > 100 {
-                    warn!("Slow packet processing: {}ms for {}", processing_time.as_millis(), work.client_ip);
+                    warn!("Slow phantom packet processing: {}ms for {}", processing_time.as_millis(), work.client_ip);
                 }
 
                 let send_start = Instant::now();
                 if let Err(e) = work.reply.send(encrypted_response) {
-                    info!("Failed to send response: {:?}", e);
+                    info!("Failed to send phantom response: {:?}", e);
                 }
                 let send_time = send_start.elapsed();
 
-                trace!("Response send time: {:?}", send_time);
+                trace!("Phantom response send time: {:?}", send_time);
             }
             Err(e) => {
-                error!("Pipeline processing failed: {}", e);
+                error!("Phantom pipeline processing failed: {}", e);
                 let total_time = work_start.elapsed();
-                warn!("Pipeline failed after {:?}: {}", total_time, e);
+                warn!("Phantom pipeline failed after {:?}: {}", total_time, e);
 
                 // Отправляем ошибку клиенту
-                let error_response = format!("Processing error: {}", e).into_bytes();
+                let error_response = format!("Phantom processing error: {}", e).into_bytes();
                 let _ = work.reply.send(error_response);
             }
         }

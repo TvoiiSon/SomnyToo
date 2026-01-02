@@ -4,7 +4,7 @@ use zeroize::Zeroize;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use rand_core::{OsRng, RngCore};
-use tracing::info;
+use tracing::{info, debug};
 
 use super::scatterer::{ScatteredParts, MemoryScatterer};
 
@@ -12,6 +12,10 @@ use super::scatterer::{ScatteredParts, MemoryScatterer};
 pub struct PhantomMasterKey {
     // Рассеянные части мастер-ключа
     pub(crate) scattered_parts: ScatteredParts,
+
+    // ДЕТЕРМИНИРОВАННЫЙ seed для генерации операционных ключей
+    // Должен быть одинаковым на клиенте и сервере!
+    pub(crate) operation_seed: [u8; 32],
 
     // Метаданные сессии
     pub(crate) session_id: [u8; 16],
@@ -23,11 +27,13 @@ pub struct PhantomMasterKey {
 }
 
 impl PhantomMasterKey {
-    pub fn new(scattered_parts: ScatteredParts, session_id: [u8; 16]) -> Self {
+    pub fn new(scattered_parts: ScatteredParts, session_id: [u8; 16], operation_seed: [u8; 32]) -> Self {
         info!("Creating new phantom master key for session: {}", hex::encode(session_id));
+        debug!("Operation seed (first 8 bytes): {}", hex::encode(&operation_seed[..8]));
 
         Self {
             scattered_parts,
+            operation_seed,
             session_id,
             created_at: Instant::now(),
             sequence_number: AtomicU64::new(0),
@@ -40,6 +46,7 @@ impl Zeroize for PhantomMasterKey {
     fn zeroize(&mut self) {
         info!("Zeroizing phantom master key for session: {}", hex::encode(self.session_id));
         self.scattered_parts.zeroize();
+        self.operation_seed.zeroize();
         self.session_id.zeroize();
         self.sequence_number.store(0, Ordering::SeqCst);
         self.operation_count.store(0, Ordering::SeqCst);
@@ -74,7 +81,7 @@ impl Drop for PhantomOperationKey {
 impl PhantomOperationKey {
     /// Создает новый операционный ключ
     pub fn new(key_bytes: [u8; 32], sequence: u64) -> Self {
-        info!("Creating new phantom operation key with sequence: {}", sequence);
+        debug!("Creating new phantom operation key with sequence: {}", sequence);
 
         Self {
             key_bytes,
@@ -87,7 +94,7 @@ impl PhantomOperationKey {
     pub fn is_expired(&self) -> bool {
         let expired = self.created_at.elapsed() > Duration::from_millis(10);
         if expired {
-            info!("Phantom operation key expired (sequence: {})", self.sequence);
+            debug!("Phantom operation key expired (sequence: {})", self.sequence);
         }
         expired
     }
@@ -105,10 +112,13 @@ pub struct PhantomSession {
 }
 
 impl PhantomSession {
-    /// Создает новую тестовую сессию
+    /// Создает новую тестовую сессию (только для тестов)
     pub fn new() -> Self {
         let mut session_id = [0u8; 16];
         OsRng.fill_bytes(&mut session_id);
+
+        let mut operation_seed = [0u8; 32];
+        OsRng.fill_bytes(&mut operation_seed);
 
         let scatterer = MemoryScatterer::new();
         let master_key_bytes = [0u8; 32];
@@ -117,7 +127,7 @@ impl PhantomSession {
         info!("Creating new phantom test session: {}", hex::encode(session_id));
 
         Self {
-            master_key: PhantomMasterKey::new(scattered_parts, session_id),
+            master_key: PhantomMasterKey::new(scattered_parts, session_id, operation_seed),
             handshake_completed: false,
         }
     }
@@ -151,14 +161,28 @@ impl PhantomSession {
         hk.expand(b"session-id", &mut session_id)
             .expect("HKDF session id");
 
-        // 4. Рассеиваем мастер-ключ
+        // 4. Генерируем ДЕТЕРМИНИРОВАННЫЙ operation_seed
+        // Это ключевое изменение - seed должен быть одинаковым на клиенте и сервере!
+        let mut operation_seed = [0u8; 32];
+        let mut seed_input = Vec::new();
+        seed_input.extend_from_slice(shared_secret);
+        seed_input.extend_from_slice(&session_id);
+
+        // Используем HKDF для создания детерминированного seed
+        let seed_hk = Hkdf::<Sha256>::new(None, &seed_input);
+        seed_hk.expand(b"phantom-operation-seed", &mut operation_seed)
+            .expect("HKDF expansion failed");
+
+        debug!("Generated operation seed (first 8 bytes): {}", hex::encode(&operation_seed[..8]));
+
+        // 5. Рассеиваем мастер-ключ
         let scatterer = MemoryScatterer::new();
         let scattered_parts = scatterer.scatter(&master_key_bytes);
 
-        // 5. Немедленно уничтожаем сырые байты мастер-ключа
+        // 6. Немедленно уничтожаем сырые байты мастер-ключа
         master_key_bytes.zeroize();
 
-        let master_key = PhantomMasterKey::new(scattered_parts, session_id);
+        let master_key = PhantomMasterKey::new(scattered_parts, session_id, operation_seed);
 
         info!("Phantom session created: {}", hex::encode(master_key.session_id));
 
@@ -176,8 +200,16 @@ impl PhantomSession {
         // Увеличиваем счетчик всех операций
         self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
 
-        info!(
-            "Generating phantom operation key: session={}, sequence={}, type={}",
+        self.generate_operation_key_for_sequence(sequence, operation_type)
+    }
+
+    /// Генерирует операционный ключ для конкретной последовательности
+    pub fn generate_operation_key_for_sequence(&self, sequence: u64, operation_type: &str) -> PhantomOperationKey {
+        // Увеличиваем счетчик всех операций
+        self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
+
+        debug!(
+            "Generating phantom operation key for sequence: session={}, sequence={}, type={}",
             hex::encode(self.master_key.session_id),
             sequence,
             operation_type
@@ -189,14 +221,23 @@ impl PhantomSession {
         seed.extend_from_slice(&sequence.to_be_bytes());
         seed.extend_from_slice(operation_type.as_bytes());
 
-        // Используем HKDF для генерации ключа операции
-        let hk = Hkdf::<Sha256>::new(Some(&seed), &self.master_key.scattered_parts.register_seed);
+        debug!("HKDF seed ({} bytes): {}", seed.len(), hex::encode(&seed));
+        debug!("Operation seed (first 8 bytes): {}",
+               hex::encode(&self.master_key.operation_seed[..8]));
+
+        // Используем HKDF для генерации ключа операции с ДЕТЕРМИНИРОВАННЫМ seed
+        let hk = Hkdf::<Sha256>::new(Some(&seed), &self.master_key.operation_seed);
         let mut operation_key_bytes = [0u8; 32];
         hk.expand(b"phantom-operation-key", &mut operation_key_bytes)
             .expect("HKDF expansion failed");
 
         // Создаем операционный ключ
         PhantomOperationKey::new(operation_key_bytes, sequence)
+    }
+
+    /// Получает текущую последовательность
+    pub fn current_sequence(&self) -> u64 {
+        self.master_key.sequence_number.load(Ordering::SeqCst)
     }
 
     /// Проверяет валидность сессии
@@ -226,6 +267,11 @@ impl PhantomSession {
             operation_count: self.master_key.operation_count.load(Ordering::SeqCst),
             is_valid: self.is_valid(),
         }
+    }
+
+    /// DEBUG: Получает operation seed для отладки
+    pub fn get_operation_seed(&self) -> [u8; 32] {
+        self.master_key.operation_seed
     }
 }
 

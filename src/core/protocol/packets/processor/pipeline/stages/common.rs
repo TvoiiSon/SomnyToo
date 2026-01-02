@@ -1,9 +1,11 @@
 use async_trait::async_trait;
 use std::sync::Arc;
-use crate::core::protocol::crypto::key_manager::session_keys::SessionKeys;
+
+// Заменяем SessionKeys на PhantomSession
+use crate::core::protocol::phantom_crypto::keys::PhantomSession;
 
 pub struct PipelineContext {
-    pub session_keys: Arc<SessionKeys>,
+    pub phantom_session: Arc<PhantomSession>,  // Изменяем поле
     pub raw_payload: Vec<u8>,
     pub packet_type: Option<u8>,
     pub decrypted_data: Option<Vec<u8>>,
@@ -12,9 +14,9 @@ pub struct PipelineContext {
 }
 
 impl PipelineContext {
-    pub fn new(session_keys: Arc<SessionKeys>, raw_payload: Vec<u8>) -> Self {
+    pub fn new(phantom_session: Arc<PhantomSession>, raw_payload: Vec<u8>) -> Self {
         Self {
-            session_keys,
+            phantom_session,
             raw_payload,
             packet_type: None,
             decrypted_data: None,
@@ -24,6 +26,7 @@ impl PipelineContext {
     }
 }
 
+// Остальной код остается прежним...
 #[async_trait]
 pub trait PipelineStage: Send + Sync {
     async fn execute(&self, context: &mut PipelineContext) -> Result<(), StageError>;

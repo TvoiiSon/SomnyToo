@@ -1,19 +1,17 @@
 use std::sync::Arc;
 use std::time::Duration;
-use tokio::time::{interval};
-use tracing::{info, warn};
+use tokio::time::interval;
+use tracing::{info, warn, debug};
 
-use crate::core::protocol::packets::encoder::packet_builder::PacketBuilder;
-use crate::core::protocol::server::session_manager::SessionManager;
-use crate::core::protocol::crypto::key_manager::session_keys::SessionKeys;
+use crate::core::protocol::server::heartbeat::manager::{HeartbeatManager, HeartbeatSessionInfo};
 
 pub struct HeartbeatSender {
-    session_manager: Arc<SessionManager>,
+    heartbeat_manager: Arc<HeartbeatManager>,
 }
 
 impl HeartbeatSender {
-    pub fn new(session_manager: Arc<SessionManager>) -> Self {
-        Self { session_manager }
+    pub fn new(heartbeat_manager: Arc<HeartbeatManager>) -> Self {
+        Self { heartbeat_manager }
     }
 
     pub async fn start(self: Arc<Self>) {
@@ -28,45 +26,48 @@ impl HeartbeatSender {
     }
 
     async fn send_heartbeats(&self) {
-        info!("Heartbeat sender: checking active sessions");
+        debug!("Heartbeat sender: checking active sessions");
 
-        let active_sessions = self.session_manager.get_active_sessions().await;
+        // Получаем активные сессии через heartbeat_manager
+        let active_sessions = self.heartbeat_manager.get_active_sessions().await;
 
-        for session_keys in active_sessions {
+        for session_info in active_sessions {
+            let session_id = session_info.session_id.clone();
+
             // Проверяем, жива ли сессия перед отправкой heartbeat
-            if self.session_manager.is_connection_alive(&session_keys.session_id).await {
-                if self.session_manager.should_send_heartbeat(&session_keys.session_id).await {
-                    if let Err(e) = self.send_heartbeat_to_session(&session_keys).await {
+            if self.heartbeat_manager.is_connection_alive(&session_id).await {
+                // Проверяем, нужно ли отправлять heartbeat
+                if self.heartbeat_manager.should_send_heartbeat(&session_id).await {
+                    if let Err(e) = self.send_heartbeat(session_info).await {
                         warn!("Failed to send heartbeat to session {}: {}",
-                          hex::encode(&session_keys.session_id), e);
+                            hex::encode(&session_id), e);
                     }
+                } else {
+                    debug!("Heartbeat not needed for session {} yet",
+                        hex::encode(&session_id));
                 }
             } else {
                 // Сессия мертва, убираем из активных
-                info!("Removing dead session from heartbeat: {}", hex::encode(&session_keys.session_id));
-                self.session_manager.force_remove_session(&session_keys.session_id).await;
+                info!("Removing dead session from heartbeat: {}", hex::encode(&session_id));
+                self.heartbeat_manager.force_remove_session(&session_id).await;
             }
         }
     }
 
-    // Добавляем метод для проверки необходимости отправки heartbeat
-    pub async fn should_send_heartbeat(&self, session_id: &[u8]) -> bool {
-        self.session_manager.should_send_heartbeat(session_id).await
+    async fn send_heartbeat(&self, session_info: HeartbeatSessionInfo)
+                            -> Result<(), anyhow::Error> // Изменяем тип возвращаемого значения
+    {
+        let session_id = session_info.session_id;
+
+        debug!("Sending heartbeat to session: {} from {}",
+            hex::encode(&session_id), session_info.addr);
+
+        // Отправляем heartbeat через heartbeat_manager
+        self.heartbeat_manager.send_heartbeat(session_id).await
     }
 
-    // This would be called when we have a specific connection to send heartbeats to
-    pub async fn send_heartbeat_to_session(&self, session_keys: &SessionKeys) -> Result<(), Box<dyn std::error::Error>> {
-        // Build heartbeat packet
-        let _heartbeat_packet = PacketBuilder::build_encrypted_packet(
-            session_keys,
-            0x11, // Heartbeat packet type
-            b"ping", // Heartbeat payload
-        ).await;
-
-        // In a real implementation, we would send this packet through the connection
-        // For now, we'll just log it
-        info!("Would send heartbeat to session: {}", hex::encode(&session_keys.session_id));
-
-        Ok(())
+    /// Проверяет, нужно ли отправлять heartbeat для сессии
+    pub async fn should_send_heartbeat(&self, session_id: &[u8]) -> bool {
+        self.heartbeat_manager.should_send_heartbeat(session_id).await
     }
 }

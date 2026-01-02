@@ -1,23 +1,24 @@
 use async_trait::async_trait;
 use tracing::info;
 use std::net::SocketAddr;
+use std::sync::Arc;
 
 use super::common::{PipelineStage, PipelineContext, StageError};
-use crate::core::protocol::packets::processor::packet_service::PacketService;
+use crate::core::protocol::packets::processor::packet_service::PhantomPacketService;
 
-pub struct ProcessingStage {
-    packet_service: PacketService,
+pub struct PhantomProcessingStage {
+    packet_service: Arc<PhantomPacketService>,  // Используем PhantomPacketService
     client_ip: SocketAddr,
 }
 
-impl ProcessingStage {
-    pub fn new(packet_service: PacketService, client_ip: SocketAddr) -> Self {
+impl PhantomProcessingStage {
+    pub fn new(packet_service: Arc<PhantomPacketService>, client_ip: SocketAddr) -> Self {
         Self { packet_service, client_ip }
     }
 }
 
 #[async_trait]
-impl PipelineStage for ProcessingStage {
+impl PipelineStage for PhantomProcessingStage {
     async fn execute(&self, context: &mut PipelineContext) -> Result<(), StageError> {
         let packet_type = context.packet_type
             .ok_or_else(|| StageError::ProcessingFailed("No packet type available".to_string()))?;
@@ -26,14 +27,13 @@ impl PipelineStage for ProcessingStage {
             .take()
             .ok_or_else(|| StageError::ProcessingFailed("No decrypted data available".to_string()))?;
 
-        info!("Processing packet type: {:?} from {}",
-              crate::core::protocol::packets::decoder::packet_parser::PacketType::from(packet_type),
-              self.client_ip);
+        info!("Processing phantom packet type: 0x{:02X} from {}",
+              packet_type, self.client_ip);
 
         let processing_result = self.packet_service
             .process_packet(
-                context.session_keys.clone(),
-                crate::core::protocol::packets::decoder::packet_parser::PacketType::from(packet_type),
+                context.phantom_session.clone(),
+                packet_type,
                 decrypted_data,
                 self.client_ip,
             )

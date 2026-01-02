@@ -2,42 +2,49 @@ use thiserror::Error;
 use std::net::IpAddr;
 use tracing::{error, warn};
 
-use crate::core::protocol::packets::decoder::packet_parser::DecodeError;
-
 #[derive(Debug, Error, Clone)]
 pub enum ProtocolError {
-    #[error("Crypto operation failed: {source}")]
+    #[error("👻 Crypto operation failed: {source}")]
     Crypto {
         #[from]
         source: CryptoError,
     },
 
-    #[error("IO error: {0}")]
-    Io(String), // Изменяем на String вместо std::io::Error
+    #[error("👻 IO error: {0}")]
+    Io(String),
 
-    #[error("Packet format error: {details}")]
+    #[error("👻 Packet format error: {details}")]
     MalformedPacket { details: String },
 
-    #[error("Handshake failed: {reason}")]
+    #[error("👻 Handshake failed: {reason}")]
     HandshakeFailed { reason: String },
 
-    #[error("Rate limit exceeded for {ip}")]
+    #[error("👻 Rate limit exceeded for {ip}")]
     RateLimitExceeded { ip: IpAddr },
 
-    #[error("Session error: {details}")]
+    #[error("👻 Session error: {details}")]
     SessionError { details: String },
 
-    #[error("Authentication failed: {reason}")]
+    #[error("👻 Authentication failed: {reason}")]
     AuthenticationFailed { reason: String },
 
-    #[error("Configuration error: {details}")]
+    #[error("👻 Configuration error: {details}")]
     ConfigError { details: String },
 
-    #[error("Timeout occurred after {duration:?}")]
+    #[error("👻 Timeout occurred after {duration:?}")]
     Timeout { duration: std::time::Duration },
 
-    #[error("Internal server error: {details}")]
+    #[error("👻 Internal server error: {details}")]
     InternalError { details: String },
+
+    #[error("👻 Phantom crypto error: {details}")]
+    PhantomCryptoError { details: String },
+
+    #[error("👻 Memory scatter error: {details}")]
+    MemoryScatterError { details: String },
+
+    #[error("👻 Hardware acceleration unavailable")]
+    HardwareAccelerationUnavailable,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -59,6 +66,12 @@ pub enum CryptoError {
 
     #[error("Nonce reuse detected")]
     NonceReuse,
+
+    #[error("Phantom key assembly failed: {reason}")]
+    PhantomKeyAssemblyFailed { reason: String },
+
+    #[error("Memory scattering failed: {reason}")]
+    MemoryScatteringFailed { reason: String },
 }
 
 // Реализация автоматического логирования для ProtocolError
@@ -66,43 +79,49 @@ impl ProtocolError {
     pub fn log(self) -> Self {
         match &self {
             ProtocolError::RateLimitExceeded { ip } => {
-                warn!("Rate limit exceeded for IP: {}", ip);
+                warn!("👻 Rate limit exceeded for IP: {}", ip);
             }
             ProtocolError::HandshakeFailed { reason } => {
-                warn!("Handshake failed: {}", reason);
+                warn!("👻 Handshake failed: {}", reason);
             }
             ProtocolError::Crypto { source } => {
-                error!("Crypto error: {}", source);
+                error!("👻 Crypto error: {}", source);
+            }
+            ProtocolError::PhantomCryptoError { details } => {
+                error!("👻 Phantom crypto error: {}", details);
             }
             _ => {
-                error!("Protocol error: {}", self);
+                error!("👻 Protocol error: {}", self);
             }
         }
         self
     }
 }
 
-// Конвертация из других типов ошибок
+// TODO
+impl From<hkdf::InvalidLength> for ProtocolError {
+    fn from(_err: hkdf::InvalidLength) -> Self {
+        ProtocolError::Crypto {
+            source: CryptoError::InvalidKeyLength {
+                expected: 32, // стандартный размер для HKDF
+                actual: 0, // hkdf::InvalidLength не предоставляет фактическую длину
+            },
+        }
+    }
+}
+
+// Конвертация из aes_gcm::Error
 impl From<aes_gcm::Error> for ProtocolError {
     fn from(err: aes_gcm::Error) -> Self {
         ProtocolError::Crypto {
-            source: CryptoError::EncryptionFailed {
+            source: CryptoError::DecryptionFailed {
                 reason: err.to_string(),
             },
         }
     }
 }
 
-impl From<digest::InvalidLength> for ProtocolError {
-    fn from(_: digest::InvalidLength) -> Self {
-        ProtocolError::Crypto {
-            source: CryptoError::InvalidKeyLength {
-                expected: 32,
-                actual: 0,
-            },
-        }
-    }
-}
+// Убрана некорректная конвертация для constant_time_eq - эта библиотека не имеет публичного типа ошибок
 
 // Конвертация из std::io::Error
 impl From<std::io::Error> for ProtocolError {
@@ -111,37 +130,69 @@ impl From<std::io::Error> for ProtocolError {
     }
 }
 
-// ОДНА имплементация для anyhow::Error
+// Конвертация из anyhow::Error
 impl From<anyhow::Error> for ProtocolError {
     fn from(err: anyhow::Error) -> Self {
-        // Для любых anyhow ошибок просто используем строковое представление
         ProtocolError::InternalError {
             details: err.to_string(),
         }
     }
 }
 
-// Добавляем конвертацию для DecodeError
-impl From<DecodeError> for ProtocolError {
-    fn from(err: DecodeError) -> Self {
-        match err {
-            DecodeError::InvalidLength => ProtocolError::MalformedPacket {
-                details: "Invalid packet length".to_string(),
+// Конвертация для hmac::digest::InvalidLength
+// TODO
+impl From<digest::InvalidLength> for ProtocolError {
+    fn from(_err: digest::InvalidLength) -> Self {
+        ProtocolError::Crypto {
+            source: CryptoError::InvalidKeyLength {
+                expected: 0, // к сожалению, тип не предоставляет эту информацию
+                actual: 0,
             },
-            DecodeError::InvalidMagic => ProtocolError::MalformedPacket {
-                details: "Invalid magic bytes".to_string(),
-            },
-            DecodeError::InvalidSignature => ProtocolError::Crypto {
-                source: CryptoError::HmacVerificationFailed,
-            },
-            DecodeError::DecryptionFailed => ProtocolError::Crypto {
-                source: CryptoError::DecryptionFailed {
-                    reason: "Packet decryption failed".to_string(),
-                },
-            },
-            DecodeError::InvalidPacketType => ProtocolError::MalformedPacket {
-                details: "Invalid packet type".to_string(),
-            },
+        }
+    }
+}
+
+// Конвертация для rand_core::Error
+impl From<rand_core::Error> for ProtocolError {
+    fn from(err: rand_core::Error) -> Self {
+        ProtocolError::PhantomCryptoError {
+            details: format!("Random generation failed: {}", err),
+        }
+    }
+}
+
+// Добавляем поддержку std::array::TryFromSliceError
+impl From<std::array::TryFromSliceError> for ProtocolError {
+    fn from(err: std::array::TryFromSliceError) -> Self {
+        ProtocolError::MalformedPacket {
+            details: format!("Array conversion failed: {}", err),
+        }
+    }
+}
+
+// Конвертация для tokio::time::error::Elapsed (таймауты)
+impl From<tokio::time::error::Elapsed> for ProtocolError {
+    fn from(_: tokio::time::error::Elapsed) -> Self {
+        ProtocolError::Timeout {
+            duration: std::time::Duration::from_secs(5), // Default timeout
+        }
+    }
+}
+
+// Добавляем конвертацию для tokio::sync::mpsc::error::SendError
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ProtocolError {
+    fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        ProtocolError::InternalError {
+            details: format!("Channel send error: {}", err),
+        }
+    }
+}
+
+// Конвертация для tokio::sync::oneshot::error::RecvError
+impl From<tokio::sync::oneshot::error::RecvError> for ProtocolError {
+    fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
+        ProtocolError::InternalError {
+            details: format!("Oneshot receive error: {}", err),
         }
     }
 }

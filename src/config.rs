@@ -4,6 +4,151 @@ use std::env;
 use std::net::IpAddr;
 use std::time::Duration;
 
+/// Конфигурация фантомной криптосистемы
+#[derive(Debug, Deserialize, Serialize, Clone)]
+pub struct PhantomConfig {
+    pub enabled: bool,
+    pub session_timeout_ms: u64,
+    pub max_sessions: usize,
+    pub enable_hardware_acceleration: bool,
+    pub constant_time_enforced: bool,
+    pub hardware_auth_enabled: bool,
+    pub hardware_secret_key: String,
+    pub enable_emulation_detection: bool,
+    pub min_session_lifetime_ms: u64,
+    pub max_operations_per_session: u64,
+    pub assembler_type: String, // "auto", "avx2", "neon", "generic"
+}
+
+impl Default for PhantomConfig {
+    fn default() -> Self {
+        dotenv().ok();
+
+        Self {
+            enabled: env::var("PHANTOM_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            session_timeout_ms: env::var("PHANTOM_SESSION_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(90_000),
+            max_sessions: env::var("PHANTOM_MAX_SESSIONS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(100_000),
+            enable_hardware_acceleration: env::var("PHANTOM_HW_ACCELERATION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            constant_time_enforced: env::var("PHANTOM_CONSTANT_TIME")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            hardware_auth_enabled: env::var("HARDWARE_AUTH_ENABLED")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(false),
+            hardware_secret_key: env::var("HARDWARE_SECRET_KEY")
+                .unwrap_or_else(|_| "".to_string()),
+            enable_emulation_detection: env::var("ENABLE_EMULATION_DETECTION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(true),
+            min_session_lifetime_ms: env::var("PHANTOM_MIN_SESSION_LIFETIME_MS")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(10_000),
+            max_operations_per_session: env::var("PHANTOM_MAX_OPERATIONS_PER_SESSION")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1_000_000),
+            assembler_type: env::var("PHANTOM_ASSEMBLER_TYPE")
+                .unwrap_or_else(|_| "auto".to_string()),
+        }
+    }
+}
+
+impl PhantomConfig {
+    pub fn from_env() -> Self {
+        Self::default()
+    }
+
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.session_timeout_ms < self.min_session_lifetime_ms {
+            return Err(ConfigError::InvalidPhantomConfig(
+                format!("session_timeout_ms ({}) must be greater than min_session_lifetime_ms ({})",
+                        self.session_timeout_ms, self.min_session_lifetime_ms)
+            ));
+        }
+
+        if self.max_sessions > 1_000_000 {
+            return Err(ConfigError::InvalidPhantomConfig(
+                "max_sessions cannot exceed 1,000,000".to_string()
+            ));
+        }
+
+        if self.session_timeout_ms == 0 {
+            return Err(ConfigError::InvalidPhantomConfig(
+                "session_timeout_ms cannot be zero".to_string()
+            ));
+        }
+
+        if self.hardware_auth_enabled && self.hardware_secret_key.is_empty() {
+            return Err(ConfigError::MissingSecretKey(
+                "HARDWARE_SECRET_KEY must be set when hardware_auth_enabled is true".to_string()
+            ));
+        }
+
+        let valid_assembler_types = ["auto", "avx2", "neon", "generic"];
+        if !valid_assembler_types.contains(&self.assembler_type.as_str()) {
+            return Err(ConfigError::InvalidPhantomConfig(
+                format!("assembler_type must be one of: {:?}", valid_assembler_types)
+            ));
+        }
+
+        if self.min_session_lifetime_ms < 1000 {
+            return Err(ConfigError::InvalidPhantomConfig(
+                "min_session_lifetime_ms must be at least 1000ms".to_string()
+            ));
+        }
+
+        Ok(())
+    }
+
+    pub fn get_session_timeout(&self) -> Duration {
+        Duration::from_millis(self.session_timeout_ms)
+    }
+
+    pub fn get_min_session_lifetime(&self) -> Duration {
+        Duration::from_millis(self.min_session_lifetime_ms)
+    }
+
+    pub fn should_use_hardware_auth(&self) -> bool {
+        self.enabled && self.hardware_auth_enabled
+    }
+
+    pub fn get_assembler_type(&self) -> &str {
+        &self.assembler_type
+    }
+
+    pub fn test_config() -> Self {
+        Self {
+            enabled: true,
+            session_timeout_ms: 30_000,
+            max_sessions: 10_000,
+            enable_hardware_acceleration: true,
+            constant_time_enforced: true,
+            hardware_auth_enabled: false,
+            hardware_secret_key: "".to_string(),
+            enable_emulation_detection: true,
+            min_session_lifetime_ms: 5_000,
+            max_operations_per_session: 100_000,
+            assembler_type: "auto".to_string(),
+        }
+    }
+}
+
 /// Структура конфигурации сервера
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ServerConfig {
@@ -424,6 +569,7 @@ pub struct AppConfig {
     pub security: SecurityConfig,
     pub scaling: ScalingConfig,
     pub cache: CacheConfig,
+    pub phantom: PhantomConfig,
     pub log_level: String,
     pub server: ServerConfig,
 }
@@ -437,6 +583,7 @@ impl Default for AppConfig {
             security: SecurityConfig::from_env(),
             scaling: ScalingConfig::from_env(),
             cache: CacheConfig::from_env(),
+            phantom: PhantomConfig::from_env(),
             log_level: env::var("LOG_LEVEL").unwrap_or_else(|_| "info".to_string()),
             server: ServerConfig::from_env(),
         }
@@ -453,6 +600,7 @@ impl AppConfig {
         self.security.validate()?;
         self.scaling.validate()?;
         self.cache.validate()?;
+        self.phantom.validate()?;
 
         let valid_log_levels = ["error", "warn", "info", "debug", "trace"];
         if !valid_log_levels.contains(&self.log_level.as_str()) {
@@ -487,4 +635,6 @@ pub enum ConfigError {
     InvalidLogLevel(String),
     #[error("Missing secret key: {0}")]
     MissingSecretKey(String),
+    #[error("Invalid phantom configuration: {0}")]
+    InvalidPhantomConfig(String),
 }
