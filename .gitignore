@@ -4,3 +4,5 @@
 
 # Rust compiled files
 /target
+
+.env

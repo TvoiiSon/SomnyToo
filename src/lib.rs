@@ -6,8 +6,18 @@ pub mod core {
         pub mod error;
         pub mod buffer;
         pub mod telemetry;
+        pub mod phantom_crypto {
+            pub mod scatterer;
+            pub mod assembler;
+            pub mod keys;
+            pub mod runtime;
+            pub mod instance;
+            pub mod handshake;
+            pub mod packet;
+        }
         pub mod crypto {
             pub mod crypto_pool;
+            pub mod crypto_pool_phantom;
             pub mod cipher {
                 pub mod aes_gcm;
                 pub mod key_derivation;
@@ -28,6 +38,7 @@ pub mod core {
             pub mod decoder {
                 pub mod frame_reader;
                 pub mod packet_parser;
+                pub mod packet_parser_phantom;
             }
             pub mod encoder {
                 pub mod frame_writer;
@@ -51,9 +62,9 @@ pub mod core {
         }
         pub mod server {
             pub mod connection_manager;
-            pub mod gateway;
             pub mod session_manager;
             pub mod tcp_server;
+            pub mod tcp_server_phantom;
             pub mod heartbeat {
                 pub mod manager;
                 pub mod sender;

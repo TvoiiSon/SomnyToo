@@ -3,6 +3,7 @@ pub mod signature;
 pub mod handshake;
 pub mod key_manager;
 pub mod crypto_pool;
+pub mod crypto_pool_phantom;
 pub mod crypto_bench;
 
 // Re-export

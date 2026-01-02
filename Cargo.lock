@@ -1533,7 +1533,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "somny_too"
+name = "somnytoo"
 version = "1.0.0"
 dependencies = [
  "aes-gcm",

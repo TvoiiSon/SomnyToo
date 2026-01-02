@@ -4,7 +4,7 @@ use tracing::{error, warn};
 
 use crate::core::protocol::packets::decoder::packet_parser::DecodeError;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum ProtocolError {
     #[error("Crypto operation failed: {source}")]
     Crypto {
@@ -12,11 +12,8 @@ pub enum ProtocolError {
         source: CryptoError,
     },
 
-    #[error("IO error: {source}")]
-    Io {
-        #[from]
-        source: std::io::Error,
-    },
+    #[error("IO error: {0}")]
+    Io(String), // Изменяем на String вместо std::io::Error
 
     #[error("Packet format error: {details}")]
     MalformedPacket { details: String },
@@ -41,11 +38,9 @@ pub enum ProtocolError {
 
     #[error("Internal server error: {details}")]
     InternalError { details: String },
-
-    // УДАЛЯЕМ дублирующий вариант Anyhow и оставляем только одну имплементацию From
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Error, Clone)]
 pub enum CryptoError {
     #[error("Encryption failed: {reason}")]
     EncryptionFailed { reason: String },
@@ -109,19 +104,19 @@ impl From<digest::InvalidLength> for ProtocolError {
     }
 }
 
+// Конвертация из std::io::Error
+impl From<std::io::Error> for ProtocolError {
+    fn from(err: std::io::Error) -> Self {
+        ProtocolError::Io(err.to_string())
+    }
+}
+
 // ОДНА имплементация для anyhow::Error
 impl From<anyhow::Error> for ProtocolError {
     fn from(err: anyhow::Error) -> Self {
-        // Пытаемся извлечь io::Error из anyhow::Error
-        if let Some(io_err) = err.downcast_ref::<std::io::Error>() {
-            ProtocolError::Io {
-                source: std::io::Error::new(io_err.kind(), io_err.to_string()),
-            }
-        } else {
-            // Для других anyhow ошибок создаем общий InternalError
-            ProtocolError::InternalError {
-                details: err.to_string(),
-            }
+        // Для любых anyhow ошибок просто используем строковое представление
+        ProtocolError::InternalError {
+            details: err.to_string(),
         }
     }
 }

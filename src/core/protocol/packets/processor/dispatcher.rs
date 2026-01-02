@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::net::SocketAddr;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, trace};
 
 use crate::core::protocol::crypto::key_manager::session_keys::SessionKeys;
 use crate::core::protocol::packets::processor::packet_service::PacketService;
@@ -96,6 +96,8 @@ impl DispatcherWorker {
     }
 
     async fn process_work(&self, work: Work) {
+        let work_start = Instant::now();
+
         if work.reply.is_closed() {
             info!("Client disconnected, skipping processing");
             return;
@@ -109,26 +111,47 @@ impl DispatcherWorker {
             0x10 // Fallback to Test packet type
         };
 
+        info!("Processing work for {} (size: {} bytes, priority: {:?})",
+          work.client_ip, work.raw_payload.len(), work.priority);
+
         // Создаем pipeline для обработки пакета
+        let pipeline_start = Instant::now();
         let pipeline = PipelineOrchestrator::new()
             .add_stage(DecryptionStage)
             .add_stage(ProcessingStage::new(self.packet_service.clone(), work.client_ip))
             .add_stage(EncryptionStage::new(response_packet_type));
 
+        let pipeline_init_time = pipeline_start.elapsed();
+
         let context = PipelineContext::new(work.ctx, work.raw_payload);
 
+        let execute_start = Instant::now();
         match pipeline.execute(context).await {
             Ok(encrypted_response) => {
+                let execute_time = execute_start.elapsed();
+                let total_work_time = work_start.elapsed();
+
+                info!("Pipeline execution - init: {:?}, execute: {:?}, total: {:?}, response size: {} bytes",
+                  pipeline_init_time, execute_time, total_work_time, encrypted_response.len());
+
                 let processing_time = Instant::now().duration_since(work.received_at);
                 if processing_time.as_millis() > 100 {
-                    warn!("Slow packet processing: {}ms", processing_time.as_millis());
+                    warn!("Slow packet processing: {}ms for {}", processing_time.as_millis(), work.client_ip);
                 }
+
+                let send_start = Instant::now();
                 if let Err(e) = work.reply.send(encrypted_response) {
                     info!("Failed to send response: {:?}", e);
                 }
+                let send_time = send_start.elapsed();
+
+                trace!("Response send time: {:?}", send_time);
             }
             Err(e) => {
                 error!("Pipeline processing failed: {}", e);
+                let total_time = work_start.elapsed();
+                warn!("Pipeline failed after {:?}: {}", total_time, e);
+
                 // Отправляем ошибку клиенту
                 let error_response = format!("Processing error: {}", e).into_bytes();
                 let _ = work.reply.send(error_response);

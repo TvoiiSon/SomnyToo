@@ -1,10 +1,13 @@
 [package]
-name = "somny_too"
+name = "somnytoo"
 version = "1.0.0"
 authors = ["TvoiiSon tvoiison.dev@gmail.com"]
-license = "AGPL-3"
-description = ""
+license = "AGPL-3.0-only"
+description = "Binary protocol server for secure communications"
 repository = "https://github.com/TvoiiSon/SomnyToo"
+readme = "README.md"
+keywords = ["server", "tcp", "binary", "protocol", "network"]
+categories = ["network-programming", "command-line-utilities"]
 edition = "2024"
 
 [dependencies]

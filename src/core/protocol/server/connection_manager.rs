@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, RwLock};
 use tokio::time::{Instant, Duration};
-use tracing::{info, warn};
+use tracing::{info, warn, debug, trace};
 use tokio::time;
 
 use crate::core::protocol::packets::processor::dispatcher::{Dispatcher, Work};
@@ -228,6 +228,7 @@ async fn process_loop(
     Ok(())
 }
 
+// Обновим функцию handle_frame:
 async fn handle_frame(
     frame: &[u8],
     peer: SocketAddr,
@@ -238,23 +239,23 @@ async fn handle_frame(
     start_time: Instant,
     session_manager: &Arc<SessionManager>,
 ) -> bool {
+    let frame_start = Instant::now();
     let ip_str = peer.ip().to_string();
 
     // Rate limiting per packet с логированием
+    let rate_limit_start = Instant::now();
     let allowed = RATE_LIMITER.check_packet(&ip_str, frame);
+    let rate_limit_time = rate_limit_start.elapsed();
 
-    // Логируем результат проверки
+    if rate_limit_time > Duration::from_millis(1) {
+        debug!("Rate limit check took {:?} for {}", rate_limit_time, peer);
+    }
+
     let priority = crate::core::protocol::packets::processor::priority::determine_priority(frame);
     let _ = SecurityAudit::log_rate_limit_event(&ip_str, frame.len(), &format!("{:?}", priority), allowed).await;
 
     if !allowed {
         warn!("Rate limit exceeded for {} (size: {}, priority: {:?})", peer, frame.len(), priority);
-        return false;
-    }
-
-    // Rate limiting per packet
-    if !RATE_LIMITER.check_packet(&peer.ip().to_string(), frame) {
-        warn!("Rate limit exceeded for {} (size: {})", peer, frame.len());
         return false;
     }
 
@@ -278,8 +279,8 @@ async fn handle_frame(
 
     // Обработка heartbeat пакетов
     if frame.len() >= 1 && frame[0] == 0x10 {
-        info!(target: "heartbeat", "Heartbeat received from {} session: {}",
-              peer, hex::encode(&ctx.session_id));
+        let heartbeat_start = Instant::now();
+        info!(target: "heartbeat", "Heartbeat received from {} session: {}", peer, hex::encode(&ctx.session_id));
 
         // Обновляем heartbeat в менеджере
         session_manager.on_heartbeat_received(&ctx.session_id).await;
@@ -291,15 +292,30 @@ async fn handle_frame(
             b"pong",
         ).await;
 
+        let send_start = Instant::now();
         let _ = out_tx.send(response).await;
+        let send_time = send_start.elapsed();
+
+        let total_heartbeat_time = heartbeat_start.elapsed();
+        trace!("Heartbeat processing - total: {:?}, send: {:?}", total_heartbeat_time, send_time);
+
         return true;
     }
 
     // Process the frame
+    let _process_start = Instant::now();
     process_valid_frame(frame, peer, ctx, dispatcher, out_tx).await;
+    let total_frame_time = frame_start.elapsed();
+
+    if total_frame_time > Duration::from_millis(10) {
+        debug!("Frame processing took {:?} for {} (size: {} bytes)",
+               total_frame_time, peer, frame.len());
+    }
+
     true
 }
 
+// Обновим функцию process_valid_frame:
 async fn process_valid_frame(
     frame: &[u8],
     peer: SocketAddr,
@@ -307,6 +323,7 @@ async fn process_valid_frame(
     dispatcher: &Arc<Dispatcher>,
     out_tx: &mpsc::Sender<Vec<u8>>,
 ) {
+    let process_start = Instant::now();
     let priority = crate::core::protocol::packets::processor::priority::determine_priority(frame);
     let is_large = frame.len() > LARGE_THRESHOLD;
 
@@ -322,29 +339,55 @@ async fn process_valid_frame(
         is_large,
     };
 
+    let submit_start = Instant::now();
     if dispatcher.submit(work).await.is_err() {
+        warn!("Dispatcher submit failed for {}", peer);
         send_error(ctx, out_tx, "server busy").await;
         return;
     }
+    let submit_time = submit_start.elapsed();
+
+    if submit_time > Duration::from_micros(100) {
+        debug!("Dispatcher submit took {:?} for {}", submit_time, peer);
+    }
 
     handle_response(reply_rx, ctx, out_tx).await;
+    let total_process_time = process_start.elapsed();
+
+    if total_process_time > Duration::from_millis(5) {
+        info!("Total frame processing took {:?} for {} (size: {} bytes, priority: {:?})",
+              total_process_time, peer, frame.len(), priority);
+    }
 }
 
+// Обновим функцию handle_response:
 async fn handle_response(
     reply_rx: tokio::sync::oneshot::Receiver<Vec<u8>>,
     ctx: &Arc<SessionKeys>,
     out_tx: &mpsc::Sender<Vec<u8>>,
 ) {
+    let wait_start = Instant::now();
     match tokio::time::timeout(Duration::from_secs(10), reply_rx).await {
         Ok(Ok(resp_bytes)) => {
+            let wait_time = wait_start.elapsed();
+            let send_start = Instant::now();
+
             if let Err(e) = out_tx.send(resp_bytes).await {
-                info!(target: "connection_manager","Failed to send response: {}", e);
+                info!(target: "connection_manager", "Failed to send response: {}", e);
+            }
+
+            let send_time = send_start.elapsed();
+
+            if wait_time > Duration::from_millis(5) {
+                debug!("Response wait time: {:?}, send time: {:?}", wait_time, send_time);
             }
         }
         Ok(Err(_)) => {
+            warn!("Handler channel closed");
             send_error(ctx, out_tx, "internal error").await;
         }
         Err(_) => {
+            warn!("Handler timeout after {:?}", wait_start.elapsed());
             send_error(ctx, out_tx, "worker timeout").await;
         }
     }

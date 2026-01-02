@@ -6,7 +6,7 @@ use sha2::Sha256;
 use tracing::info;
 use constant_time_eq::constant_time_eq;
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::core::protocol::crypto::key_manager::session_keys::SessionKeys;
 use crate::core::protocol::crypto::key_manager::psk_manager::{get_psk, derive_psk_keys};
@@ -146,13 +146,16 @@ async fn client_handshake(stream: &mut tokio::net::TcpStream) -> ProtocolResult<
 
 /// Серверная часть handshake
 async fn server_handshake(stream: &mut tokio::net::TcpStream) -> ProtocolResult<SessionKeys> {
+    let handshake_start = Instant::now();
     let psk_bytes = get_psk().map_err(ProtocolError::from)?; // Автоматическая конвертация
 
     let (client_auth_key, server_auth_key) = derive_psk_keys(&psk_bytes)
         .map_err(|_e| ProtocolError::Crypto { source: CryptoError::KeyDerivationFailed })?;
 
     // Читаем ClientHello
+    let read_start = Instant::now();
     let hello = read_frame(stream).await?; // Конвертируем anyhow::Error
+    let read_time = read_start.elapsed();
 
     if hello.len() != 82 || hello[0] != CLIENT_HELLO {
         let error = ProtocolError::HandshakeFailed {
@@ -192,10 +195,14 @@ async fn server_handshake(stream: &mut tokio::net::TcpStream) -> ProtocolResult<
         return Err(error);
     }
 
+    // Проверка аутентификации клиента
+    let auth_start = Instant::now();
     verify_client_authentication(&client_pub_bytes, &client_nonce, &client_hmac, &client_auth_key)
         .map_err(|e| ProtocolError::AuthenticationFailed { reason: e.to_string() })?;
+    let auth_time = auth_start.elapsed();
 
     // Генерируем серверные ключи
+    let keygen_start = Instant::now();
     let mut rng = OsRng;
     let server_secret = EphemeralSecret::random_from_rng(&mut rng);
     let server_pub = PublicKey::from(&server_secret);
@@ -206,7 +213,9 @@ async fn server_handshake(stream: &mut tokio::net::TcpStream) -> ProtocolResult<
     let shared = server_secret.diffie_hellman(&client_pub);
     let salt = create_salt(&client_pub_bytes, server_pub.as_bytes(), &client_nonce, &server_nonce);
     let server_hmac = compute_server_hmac(server_pub.as_bytes(), &server_nonce, &server_auth_key);
+    let keygen_time = keygen_start.elapsed();
 
+    let write_start = Instant::now();
     let mut server_hello = Vec::with_capacity(82);
     server_hello.push(SERVER_HELLO);
     server_hello.push(PROTOCOL_VERSION);
@@ -215,10 +224,16 @@ async fn server_handshake(stream: &mut tokio::net::TcpStream) -> ProtocolResult<
     server_hello.extend_from_slice(&server_hmac);
 
     write_frame(stream, &server_hello).await?;
+    let write_time = write_start.elapsed();
 
-    info!("Server handshake completed successfully");
+    let session_keys = SessionKeys::from_dh_shared_with_psk(shared.as_bytes(), &salt, &psk_bytes);
+    let total_handshake_time = handshake_start.elapsed();
 
-    Ok(SessionKeys::from_dh_shared_with_psk(shared.as_bytes(), &salt, &psk_bytes))
+    info!("Server handshake completed successfully in {:?} (read: {:?}, auth: {:?}, keygen: {:?}, write: {:?})",
+          total_handshake_time, read_time, auth_time, keygen_time, write_time);
+    info!("Session ID: {}", hex::encode(&session_keys.session_id));
+
+    Ok(session_keys)
 }
 
 /// Вычисляет HMAC для клиента (аналогично серверной версии)

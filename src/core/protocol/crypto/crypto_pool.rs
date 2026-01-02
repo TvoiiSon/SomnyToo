@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::{Instant, Duration};
-use tracing::{info, error, warn};
+use tracing::{info, error, warn, debug};
 use aes_gcm::{
     aead::{Aead},
 };
@@ -87,20 +87,33 @@ impl CryptoPool {
     }
 
     pub async fn encrypt(&self, ctx: Arc<SessionKeys>, plaintext: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        info!("Encrypting payload of {} bytes", plaintext.len());
+        let start = Instant::now();
+        info!("Encrypting payload of {} bytes for session {:?}", plaintext.len(), ctx.session_id);
 
         // Генерируем nonce
+        let nonce_start = Instant::now();
         let nonce = self.generate_nonce();
+        let nonce_time = nonce_start.elapsed();
 
         // Шифруем используя AEAD cipher из SessionKeys
+        let encrypt_start = Instant::now();
         let ciphertext = ctx.aead_cipher
             .encrypt(&nonce.into(), plaintext.as_ref())
             .map_err(|e| format!("Encryption failed: {}", e))?;
+        let encrypt_time = encrypt_start.elapsed();
 
         // Объединяем nonce и ciphertext
         let mut result = Vec::with_capacity(nonce.len() + ciphertext.len());
         result.extend_from_slice(&nonce);
         result.extend_from_slice(&ciphertext);
+
+        let total_time = start.elapsed();
+        debug!("Encryption complete - nonce: {:?}, encrypt: {:?}, total: {:?}, output: {} bytes",
+               nonce_time, encrypt_time, total_time, result.len());
+
+        if total_time > Duration::from_millis(2) {
+            info!("Slow encryption: {:?} for {} bytes", total_time, plaintext.len());
+        }
 
         Ok(result)
     }
@@ -214,12 +227,15 @@ impl CryptoWorker {
         resp: oneshot::Sender<Result<Vec<u8>, String>>
     ) {
         let start = Instant::now();
+        let payload_size = payload.len();
 
-        info!("Decrypting packet for session {:?}, length: {}", ctx.session_id, payload.len());
+        debug!("Decrypting packet for session {:?}, length: {}", ctx.session_id, payload_size);
 
         let result = match PacketParser::decode_packet(&ctx, &payload) {
             Ok((packet_type, data)) => {
-                info!("Successfully decrypted packet type: {:?}, data length: {}", packet_type, data.len());
+                let decrypt_time = start.elapsed();
+                info!("Successfully decrypted packet type: {:?}, data length: {}, time: {:?}",
+                      packet_type, data.len(), decrypt_time);
                 Ok(data)
             }
             Err(e) => {
@@ -230,7 +246,9 @@ impl CryptoWorker {
 
         let elapsed = start.elapsed();
         if elapsed > Duration::from_millis(5) {
-            info!("Slow decryption: {:?} for {} bytes", elapsed, payload.len());
+            warn!("Slow decryption: {:?} for {} bytes", elapsed, payload_size);
+        } else if elapsed > Duration::from_millis(1) {
+            debug!("Decryption took {:?} for {} bytes", elapsed, payload_size);
         }
 
         let _ = resp.send(result);
@@ -240,21 +258,35 @@ impl CryptoWorker {
         tasks: Vec<(Arc<SessionKeys>, Vec<u8>)>,
         resp: oneshot::Sender<Result<Vec<Vec<u8>>, String>>
     ) {
+        let batch_start = Instant::now();
+        let batch_size = tasks.len();
         let mut results = Vec::new();
         let mut errors = Vec::new();
 
+        info!("Processing batch of {} packets", batch_size);
+
         for (i, (ctx, payload)) in tasks.into_iter().enumerate() {
+            let packet_start = Instant::now();
             match PacketParser::decode_packet(&ctx, &payload) {
                 Ok((_packet_type, decrypted_data)) => {
+                    let packet_time = packet_start.elapsed();
+                    if packet_time > Duration::from_millis(5) {
+                        debug!("Slow batch decryption [{}]: {:?} for {} bytes", i, packet_time, payload.len());
+                    }
                     results.push(decrypted_data);
                 }
                 Err(e) => {
-                    error!("Batch decryption failed for session {:?}: {}", ctx.session_id, e);
+                    let packet_time = packet_start.elapsed();
+                    error!("Batch decryption failed for session {:?} [{}]: {} (took {:?})",
+                          ctx.session_id, i, e, packet_time);
                     errors.push(format!("Packet {}: {}", i, e));
                     results.push(Vec::new());
                 }
             }
         }
+
+        let batch_time = batch_start.elapsed();
+        info!("Batch processing completed in {:?} for {} packets", batch_time, batch_size);
 
         let result = if errors.is_empty() {
             Ok(results)

@@ -5,14 +5,14 @@ use anyhow::Result;
 use tracing_subscriber::{FmtSubscriber, EnvFilter};
 use tracing::{info, error, warn};
 
-use somny_too::core::protocol::server::tcp_server::handle_connection;
-use somny_too::core::protocol::packets::processor::dispatcher::Dispatcher;
-use somny_too::core::protocol::packets::processor::packet_service::PacketService;
-use somny_too::core::protocol::server::session_manager::SessionManager;
-use somny_too::core::protocol::server::heartbeat::sender::HeartbeatSender;
-use somny_too::core::monitoring::monitor_registry::MonitorRegistry;
-use somny_too::core::protocol::server::connection_manager::ConnectionManager;
-use somny_too::config::{AppConfig, ServerConfig, DatabaseConfig as ConfigDatabaseConfig};
+use somnytoo::core::protocol::server::tcp_server::handle_connection;
+use somnytoo::core::protocol::packets::processor::dispatcher::Dispatcher;
+use somnytoo::core::protocol::packets::processor::packet_service::PacketService;
+use somnytoo::core::protocol::server::session_manager::SessionManager;
+use somnytoo::core::protocol::server::heartbeat::sender::HeartbeatSender;
+use somnytoo::core::monitoring::monitor_registry::MonitorRegistry;
+use somnytoo::core::protocol::server::connection_manager::ConnectionManager;
+use somnytoo::config::{AppConfig, ServerConfig, DatabaseConfig as ConfigDatabaseConfig};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -121,9 +121,9 @@ async fn start_tcp_server(server_config: ServerConfig) -> Result<()> {
 }
 
 async fn initialize_database(db_config: ConfigDatabaseConfig) {
-    use somny_too::core::sql_server::server::SqlServer;
-    use somny_too::core::sql_server::config::{SecurityConfig, DatabaseConfig as SqlDatabaseConfig};
-    use somny_too::core::sql_server::executor::QUERY_EXECUTOR;
+    use somnytoo::core::sql_server::server::SqlServer;
+    use somnytoo::core::sql_server::config::{SecurityConfig, DatabaseConfig as SqlDatabaseConfig};
+    use somnytoo::core::sql_server::executor::QUERY_EXECUTOR;
 
     if QUERY_EXECUTOR.is_initialized().await {
         info!("Database already initialized");

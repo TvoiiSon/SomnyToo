@@ -1,7 +1,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::TcpStream;
-use tokio::time::{timeout, Duration};
+use tokio::time::{timeout, Duration, Instant};
 use tracing::{info, warn, error};
 use prometheus::Registry;
 
@@ -19,28 +19,34 @@ pub async fn handle_connection(
     session_manager: Arc<SessionManager>,
     connection_manager: Arc<ConnectionManager>,
 ) -> anyhow::Result<()> {
+    let connection_start = Instant::now();
     info!(target: "server", "{} connected", peer);
     SecurityMetrics::active_connections().inc();
 
     // Проверка rate limiting
+    let rate_limit_start = Instant::now();
     if !RATE_LIMITER.check_packet(&peer.ip().to_string(), &[]) {
         warn!(target: "server", "Rate limit exceeded for {}, closing connection", peer);
         SecurityMetrics::active_connections().dec();
         return Ok(());
     }
+    let rate_limit_time = rate_limit_start.elapsed();
 
     // Handshake с таймаутом
+    let handshake_start = Instant::now();
     let handshake_result = match timeout(
         Duration::from_secs(30),
         perform_handshake(&mut stream, HandshakeRole::Server)
     ).await {
         Ok(Ok(result)) => {
-            // SecurityAudit::log_handshake_success(peer, result.session_keys.session_id).await;
+            let handshake_time = handshake_start.elapsed();
+            info!(target: "server", "Handshake successful for {} in {:?}, session: {}",
+                  peer, handshake_time, hex::encode(&result.session_keys.session_id));
             result
         },
         Ok(Err(e)) => {
-            warn!(target: "server", "Handshake failed for {}: {}", peer, e);
-            // SecurityAudit::log_handshake_failure(peer, e.to_string()).await;
+            let handshake_time = handshake_start.elapsed();
+            warn!(target: "server", "Handshake failed for {} after {:?}: {}", peer, handshake_time, e);
             SecurityMetrics::active_connections().dec();
             return Ok(());
         }
@@ -54,13 +60,15 @@ pub async fn handle_connection(
     // Проверяем сессию на повторное использование
     if SessionManager::check_session_reuse(&handshake_result.session_keys.session_id).await {
         warn!(target: "server", "Session reuse detected for {}: {}", peer, hex::encode(handshake_result.session_keys.session_id));
-        // SecurityAudit::log_session_reuse(peer, handshake_result.session_keys.session_id).await;
         SecurityMetrics::active_connections().dec();
         return Ok(());
     }
 
     // Получаем heartbeat_manager из session_manager
     let heartbeat_manager = session_manager.get_heartbeat_manager();
+
+    info!("Connection setup completed in {:?} (rate limit: {:?}, handshake: {:?})",
+          connection_start.elapsed(), rate_limit_time, handshake_start.elapsed());
 
     // Основная обработка соединения
     let result = super::connection_manager::handle_client_connection(
@@ -72,6 +80,9 @@ pub async fn handle_connection(
         heartbeat_manager,
         connection_manager,
     ).await;
+
+    let total_connection_time = connection_start.elapsed();
+    info!(target: "server", "{} connection closed after {:?}", peer, total_connection_time);
 
     SecurityMetrics::active_connections().dec();
     result
