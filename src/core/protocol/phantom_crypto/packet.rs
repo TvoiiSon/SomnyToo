@@ -88,6 +88,11 @@ impl PhantomPacket {
         let sequence = operation_key.sequence;
 
         let elapsed = start.elapsed();
+
+        // Замер времени создания пакета
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.packet.creation_time", elapsed.as_micros() as f64);
+
         debug!(
             "Phantom packet created in {:?}: type=0x{:02X}, size={} bytes",
             elapsed, packet_type, full_ciphertext.len()
@@ -339,6 +344,11 @@ impl PhantomPacket {
                plaintext.len(), hex::encode(&plaintext));
 
         let elapsed = start.elapsed();
+
+        // Замер времени расшифрования
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.packet.decryption_time", elapsed.as_micros() as f64);
+
         debug!(
             "Phantom packet decrypted in {:?}: {} bytes plaintext",
             elapsed,

@@ -2,6 +2,7 @@ use zeroize::Zeroize;
 use aes_gcm::{Aes256Gcm, KeyInit, aead::Aead};
 use generic_array::GenericArray;
 use rand_core::{OsRng, RngCore};
+use std::time::{Instant};
 
 /// Рассеянные части ключа, хранящиеся в разных уровнях памяти
 #[derive(Clone)]
@@ -65,6 +66,7 @@ impl MemoryScatterer {
 
     /// Рассеивает мастер-ключ на части
     pub fn scatter(&self, master_key: &[u8; 32]) -> ScatteredParts {
+        let start = Instant::now();
         let mut rng = OsRng;
 
         // 1. Генерируем случайные части
@@ -109,6 +111,12 @@ impl MemoryScatterer {
 
         // 4. Немедленно уничтожаем промежуточные данные
         ram_part.zeroize();
+
+        let elapsed = start.elapsed();
+
+        // Замер времени рассеивания
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.scatterer.scatter_time", elapsed.as_nanos() as f64);
 
         ScatteredParts {
             l1_part,

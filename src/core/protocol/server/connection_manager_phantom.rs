@@ -293,6 +293,8 @@ async fn handle_phantom_packet(
     session_manager: &Arc<PhantomSessionManager>,
     heartbeat_manager: &Arc<ConnectionHeartbeatManager>, // Добавляем параметр
 ) -> anyhow::Result<()> {
+    let start = Instant::now();
+
     let ip_str = peer.ip().to_string();
     let session_id = session.session_id();
 
@@ -336,6 +338,12 @@ async fn handle_phantom_packet(
     // Декодируем и обрабатываем пакет через фантомный криптопул
     match crypto_pool.decrypt(session.clone(), data.to_vec()).await {
         Ok((packet_type, plaintext)) => {
+            let elapsed = start.elapsed();
+
+            // Замер времени обработки пакета
+            #[cfg(feature = "metrics")]
+            metrics::histogram!("phantom.connection.packet_process_time", elapsed.as_micros() as f64);
+
             debug!(
                 "👻 Successfully decrypted phantom packet from {}: type=0x{:02X}, size={} bytes",
                 peer, packet_type, plaintext.len()

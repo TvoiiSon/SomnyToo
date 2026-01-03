@@ -31,10 +31,26 @@ pub async fn perform_phantom_handshake(
 ) -> ProtocolResult<PhantomHandshakeResult> {
     let handshake_start = Instant::now();
 
-    match role {
+    let result = match role {
         HandshakeRole::Client => client_phantom_handshake(stream, handshake_start).await,
         HandshakeRole::Server => server_phantom_handshake(stream, handshake_start).await,
+    };
+
+    if let Ok(ref res) = result {
+        let handshake_time = handshake_start.elapsed();
+
+        // Замер времени handshake
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.handshake.complete_time", handshake_time.as_millis() as f64);
+
+        info!(
+            "Phantom handshake completed in {:?}, session_id: {}",
+            handshake_time,
+            hex::encode(res.session.session_id())
+        );
     }
+
+    result
 }
 
 /// Клиентская часть handshake

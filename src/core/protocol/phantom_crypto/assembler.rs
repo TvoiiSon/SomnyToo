@@ -1,5 +1,6 @@
 use std::time::{Instant, Duration};
 use zeroize::Zeroize;
+use tracing::{info, warn};
 
 use super::scatterer::ScatteredParts;
 
@@ -87,6 +88,19 @@ impl KeyAssembler for GenericAssembler {
 
         // Проверка времени выполнения (защита от timing attacks)
         let elapsed = start.elapsed();
+
+        // ЗАМЕР СБОРКИ КЛЮЧА
+        if elapsed.as_nanos() > 200 {
+            warn!("⚠️  SLOW KEY ASSEMBLY: {:?} ({:?} ns) - ТРЕБОВАНИЕ: 20-200ns",
+                  elapsed, elapsed.as_nanos());
+        } else if elapsed.as_nanos() < 20 {
+            warn!("⚠️  SUSPICIOUSLY FAST KEY ASSEMBLY: {:?} ({:?} ns)",
+                  elapsed, elapsed.as_nanos());
+        } else {
+            info!("✅ Key assembly: {:?} ({:?} ns) - В НОРМЕ",
+                  elapsed, elapsed.as_nanos());
+        }
+
         assert!(elapsed < Duration::from_micros(100),
                 "Timing anomaly detected: {:?}", elapsed);
 

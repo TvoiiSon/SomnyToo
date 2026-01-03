@@ -4,7 +4,7 @@ use zeroize::Zeroize;
 use hkdf::Hkdf;
 use sha2::Sha256;
 use rand_core::{OsRng, RngCore};
-use tracing::{info, debug};
+use tracing::{info, debug, warn};
 
 use super::scatterer::{ScatteredParts, MemoryScatterer};
 
@@ -140,6 +140,8 @@ impl PhantomSession {
         client_pub_key: &[u8; 32],
         server_pub_key: &[u8; 32],
     ) -> Self {
+        let start = Instant::now();
+
         info!("Creating phantom session from DH shared secret");
 
         // 1. Создаем соль для HKDF
@@ -184,7 +186,13 @@ impl PhantomSession {
 
         let master_key = PhantomMasterKey::new(scattered_parts, session_id, operation_seed);
 
-        info!("Phantom session created: {}", hex::encode(master_key.session_id));
+        let elapsed = start.elapsed();
+
+        // Замер времени создания сессии
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.session.creation_time", elapsed.as_micros() as f64);
+
+        info!("Phantom session created in {:?}: {}", elapsed, hex::encode(master_key.session_id));
 
         Self {
             master_key,
@@ -194,17 +202,29 @@ impl PhantomSession {
 
     /// Генерирует операционный ключ для конкретной операции
     pub fn generate_operation_key(&self, operation_type: &str) -> PhantomOperationKey {
+        let start = Instant::now();
+
         // Увеличиваем счетчик операций
         let sequence = self.master_key.sequence_number.fetch_add(1, Ordering::SeqCst);
 
         // Увеличиваем счетчик всех операций
         self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
 
-        self.generate_operation_key_for_sequence(sequence, operation_type)
+        let result = self.generate_operation_key_for_sequence(sequence, operation_type);
+
+        let elapsed = start.elapsed();
+
+        // Замер времени генерации операционного ключа
+        #[cfg(feature = "metrics")]
+        metrics::histogram!("phantom.keys.operation_key_gen_time", elapsed.as_nanos() as f64);
+
+        result
     }
 
     /// Генерирует операционный ключ для конкретной последовательности
     pub fn generate_operation_key_for_sequence(&self, sequence: u64, operation_type: &str) -> PhantomOperationKey {
+        let start = std::time::Instant::now();
+
         // Увеличиваем счетчик всех операций
         self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
 
@@ -230,6 +250,20 @@ impl PhantomSession {
         let mut operation_key_bytes = [0u8; 32];
         hk.expand(b"phantom-operation-key", &mut operation_key_bytes)
             .expect("HKDF expansion failed");
+
+        let elapsed = start.elapsed();
+
+        // КРИТИЧЕСКИЙ ЗАМЕР: время генерации операционного ключа
+        if elapsed.as_nanos() > 200 {
+            warn!("⚠️  SLOW KEY GENERATION: {:?} ({:?} ns) for sequence {} - ТРЕБОВАНИЕ: 20-200ns",
+                  elapsed, elapsed.as_nanos(), sequence);
+        } else if elapsed.as_nanos() < 20 {
+            warn!("⚠️  SUSPICIOUSLY FAST KEY GENERATION: {:?} ({:?} ns) for sequence {}",
+                  elapsed, elapsed.as_nanos(), sequence);
+        } else {
+            info!("✅ Key generation: {:?} ({:?} ns) for sequence {} - В НОРМЕ",
+                  elapsed, elapsed.as_nanos(), sequence);
+        }
 
         // Создаем операционный ключ
         PhantomOperationKey::new(operation_key_bytes, sequence)

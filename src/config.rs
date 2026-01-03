@@ -154,9 +154,6 @@ impl PhantomConfig {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
-    pub hmac_secret_key: String,
-    pub aes_secret_key: String,
-    pub psk_secret: String,
 }
 
 impl ServerConfig {
@@ -170,19 +167,16 @@ impl ServerConfig {
         let port_str = env::var("SERVER_PORT").unwrap_or_else(|_| "8000".to_string());
         let port = port_str.parse::<u16>().unwrap_or(8000);
 
-        let hmac_secret_key = env::var("HMAC_SECRET_KEY")
-            .expect("Переменная HMAC_SECRET_KEY не установлена в .env файле");
-        let aes_secret_key = env::var("AES_SECRET_KEY")
-            .expect("Переменная AES_SECRET_KEY не установлена в .env файле");
-        let psk_secret = env::var("PSK_SECRET")
-            .expect("Переменная PSK_SECRET не установлена в .env файле");
+        // let hmac_secret_key = env::var("HMAC_SECRET_KEY")
+        //     .expect("Переменная HMAC_SECRET_KEY не установлена в .env файле");
+        // let aes_secret_key = env::var("AES_SECRET_KEY")
+        //     .expect("Переменная AES_SECRET_KEY не установлена в .env файле");
+        // let psk_secret = env::var("PSK_SECRET")
+        //     .expect("Переменная PSK_SECRET не установлена в .env файле");
 
         ServerConfig {
             host,
             port,
-            hmac_secret_key,
-            aes_secret_key,
-            psk_secret,
         }
     }
 
@@ -329,9 +323,6 @@ pub struct SecurityConfig {
     pub blocked_ips: Vec<IpAddr>,
     pub enable_sql_injection_protection: bool,
     pub enable_rate_limiting: bool,
-    pub hmac_secret_key: String,
-    pub aes_secret_key: String,
-    pub psk_secret: String,
 }
 
 impl Default for SecurityConfig {
@@ -361,12 +352,6 @@ impl Default for SecurityConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(true),
-            hmac_secret_key: env::var("HMAC_SECRET_KEY")
-                .expect("HMAC_SECRET_KEY must be set in .env file"),
-            aes_secret_key: env::var("AES_SECRET_KEY")
-                .expect("AES_SECRET_KEY must be set in .env file"),
-            psk_secret: env::var("PSK_SECRET")
-                .expect("PSK_SECRET must be set in .env file"),
         }
     }
 }
@@ -387,18 +372,6 @@ impl SecurityConfig {
 
         if self.max_requests_per_minute > 1_000_000 {
             return Err(ConfigError::RateLimitTooHigh);
-        }
-
-        if self.hmac_secret_key.is_empty() {
-            return Err(ConfigError::MissingSecretKey("HMAC_SECRET_KEY".to_string()));
-        }
-
-        if self.aes_secret_key.is_empty() {
-            return Err(ConfigError::MissingSecretKey("AES_SECRET_KEY".to_string()));
-        }
-
-        if self.psk_secret.is_empty() {
-            return Err(ConfigError::MissingSecretKey("PSK_SECRET".to_string()));
         }
 
         Ok(())

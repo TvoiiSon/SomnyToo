@@ -4,8 +4,8 @@ pub mod config;
 pub mod core {
     pub mod protocol {
         pub mod error;
-        pub mod buffer;
-        pub mod telemetry;
+        // pub mod buffer;
+        // pub mod telemetry;
         pub mod phantom_crypto {
             pub mod scatterer;
             pub mod assembler;
@@ -21,11 +21,9 @@ pub mod core {
         pub mod packets {
             pub mod decoder {
                 pub mod frame_reader;
-                pub mod packet_parser_phantom;
             }
             pub mod encoder {
                 pub mod frame_writer;
-                pub mod packet_builder_phantom;
             }
             pub mod processor {
                 pub mod dispatcher;
@@ -89,9 +87,6 @@ pub mod core {
                     pub mod instance;
                 }
             }
-        }
-        pub mod utils {
-
         }
     }
     pub mod monitoring {

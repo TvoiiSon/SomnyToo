@@ -131,9 +131,6 @@ pub struct SecurityConfig {
     pub blocked_ips: Vec<IpAddr>,
     pub enable_sql_injection_protection: bool,
     pub enable_rate_limiting: bool,
-    pub hmac_secret_key: String,
-    pub aes_secret_key: String,
-    pub psk_secret: String,
 }
 
 impl SecurityConfig {
@@ -147,9 +144,6 @@ impl SecurityConfig {
             blocked_ips: global_config.blocked_ips.clone(),
             enable_sql_injection_protection: global_config.enable_sql_injection_protection,
             enable_rate_limiting: global_config.enable_rate_limiting,
-            hmac_secret_key: global_config.hmac_secret_key.clone(),
-            aes_secret_key: global_config.aes_secret_key.clone(),
-            psk_secret: global_config.psk_secret.clone(),
         }
     }
 
@@ -176,18 +170,6 @@ impl SecurityConfig {
 
         if self.max_requests_per_minute > 1_000_000 {
             return Err(ConfigError::RateLimitTooHigh);
-        }
-
-        if self.hmac_secret_key.is_empty() {
-            return Err(ConfigError::MissingSecretKey("HMAC_SECRET_KEY".to_string()));
-        }
-
-        if self.aes_secret_key.is_empty() {
-            return Err(ConfigError::MissingSecretKey("AES_SECRET_KEY".to_string()));
-        }
-
-        if self.psk_secret.is_empty() {
-            return Err(ConfigError::MissingSecretKey("PSK_SECRET".to_string()));
         }
 
         Ok(())
@@ -218,9 +200,6 @@ impl SecurityConfig {
             blocked_ips: Vec::new(),
             enable_sql_injection_protection: false,
             enable_rate_limiting: false,
-            hmac_secret_key: "test_hmac_key".to_string(),
-            aes_secret_key: "test_aes_key".to_string(),
-            psk_secret: "test_psk".to_string(),
         }
     }
 }

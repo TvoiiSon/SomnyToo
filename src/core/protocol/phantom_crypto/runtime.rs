@@ -98,6 +98,14 @@ impl PhantomRuntime {
         let elapsed_time = start_instant.elapsed();
         let cycles = end_cycles.wrapping_sub(start_cycles);
 
+        // Замер времени выполнения
+        #[cfg(feature = "metrics")]
+        {
+            metrics::histogram!("phantom.runtime.operation_time", elapsed_time.as_nanos() as f64);
+            #[cfg(target_arch = "x86_64")]
+            metrics::histogram!("phantom.runtime.operation_cycles", cycles as f64);
+        }
+
         // Обновляем статистику
         self.update_stats(cycles, elapsed_time);
 
