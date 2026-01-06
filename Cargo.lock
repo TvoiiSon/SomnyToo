@@ -1534,12 +1534,11 @@ dependencies = [
 
 [[package]]
 name = "somnytoo"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "aes-gcm",
  "anyhow",
  "async-trait",
- "bytes",
  "chrono",
  "constant_time_eq",
  "dashmap",

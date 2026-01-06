@@ -1,6 +1,6 @@
 [package]
 name = "somnytoo"
-version = "1.0.0"
+version = "1.1.0"
 authors = ["TvoiiSon tvoiison.dev@gmail.com"]
 license = "AGPL-3.0-only"
 description = "Binary protocol server for secure communications"
@@ -9,6 +9,10 @@ readme = "README.md"
 keywords = ["server", "tcp", "binary", "protocol", "network"]
 categories = ["network-programming", "command-line-utilities"]
 edition = "2024"
+
+[features]
+default = []
+metrics = []
 
 [dependencies]
 sqlx = { version = "0.7", features = ["postgres", "runtime-tokio"] }
@@ -44,4 +48,4 @@ num_cpus = "1.0"
 md5 = "0.7"
 lazy_static = "1.5.0"
 sys-info = "0.9"
-bytes = "1.10.1"
+#bytes = "1.10.1"

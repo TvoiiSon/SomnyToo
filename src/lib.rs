@@ -4,8 +4,6 @@ pub mod config;
 pub mod core {
     pub mod protocol {
         pub mod error;
-        // pub mod buffer;
-        // pub mod telemetry;
         pub mod phantom_crypto {
             pub mod scatterer;
             pub mod assembler;

@@ -14,6 +14,7 @@ use crate::core::protocol::packets::processor::pipeline::stages::common::{Pipeli
 use crate::core::protocol::packets::processor::pipeline::stages::decryption::PhantomDecryptionStage;
 use crate::core::protocol::packets::processor::pipeline::stages::processing::PhantomProcessingStage;
 use crate::core::protocol::packets::processor::pipeline::stages::encryption::PhantomEncryptionStage;
+use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;
 use super::priority::Priority;
 use super::packet_service::PhantomPacketService;
 
@@ -29,13 +30,13 @@ pub struct Work {
 
 pub struct Dispatcher {
     tx: mpsc::Sender<Work>,
-    phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+    phantom_crypto_pool: Arc<PhantomCryptoPool>,
 }
 
 impl Dispatcher {
     pub fn spawn(
         num_workers: usize,
-        phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+        phantom_crypto_pool: Arc<PhantomCryptoPool>,
         phantom_packet_service: Arc<PhantomPacketService>,  // Добавляем сервис
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Work>(65536);
@@ -75,14 +76,14 @@ impl Dispatcher {
 
 struct DispatcherWorker {
     rx: Arc<Mutex<mpsc::Receiver<Work>>>,
-    phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+    phantom_crypto_pool: Arc<PhantomCryptoPool>,
     phantom_packet_service: Arc<PhantomPacketService>,
 }
 
 impl DispatcherWorker {
     fn new(
         rx: Arc<Mutex<mpsc::Receiver<Work>>>,
-        phantom_crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
+        phantom_crypto_pool: Arc<PhantomCryptoPool>,
         phantom_packet_service: Arc<PhantomPacketService>
     ) -> Self {
         Self { rx, phantom_crypto_pool, phantom_packet_service }
