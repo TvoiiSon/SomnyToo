@@ -3,10 +3,14 @@ use rand_core::{OsRng, RngCore};
 use constant_time_eq::constant_time_eq;
 use tracing::debug;
 
-use super::keys::{PhantomSession, PhantomOperationKey};
 use crate::core::protocol::error::{ProtocolResult, ProtocolError};
-use super::chacha20_accel::ChaCha20Accelerator;
-use super::blake3_accel::Blake3Accelerator;
+use crate::core::protocol::phantom_crypto::{
+    core::keys::{PhantomSession, PhantomOperationKey},
+    acceleration::{
+        chacha20_accel::ChaCha20Accelerator,
+        blake3_accel::Blake3Accelerator,
+    },
+};
 
 /// Константы пакетов
 pub const HEADER_MAGIC: [u8; 2] = [0xAB, 0xCE];

@@ -3,11 +3,13 @@ use std::time::{Instant, Duration};
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{warn, debug, info};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
-use crate::core::protocol::phantom_crypto::runtime::PhantomRuntime;
-use crate::core::protocol::phantom_crypto::batch_processor::{PhantomBatch, PhantomBatchProcessor};
+use crate::core::protocol::phantom_crypto::{
+    core::keys::PhantomSession,
+    runtime::runtime::PhantomRuntime,
+    optimization::batch_processor::{PhantomBatch, PhantomBatchProcessor},
+};
 
 /// Полностью оптимизированный криптографический пул
 pub struct PhantomCryptoPool {

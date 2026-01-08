@@ -5,7 +5,7 @@ use blake3::Hasher;
 use rand_core::{OsRng, RngCore};
 use tracing::{info, debug, warn};
 
-use super::scatterer::{ScatteredParts, MemoryScatterer};
+use crate::core::protocol::phantom_crypto::memory::scatterer::{ScatteredParts, MemoryScatterer};
 
 /// Фантомный мастер-ключ сессии
 pub struct PhantomMasterKey {

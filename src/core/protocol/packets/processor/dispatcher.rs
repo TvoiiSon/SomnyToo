@@ -4,7 +4,7 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tracing::{info, error, warn, trace, debug};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 
 // Импорты для pipeline
 use crate::core::protocol::packets::processor::pipeline::orchestrator::PipelineOrchestrator;

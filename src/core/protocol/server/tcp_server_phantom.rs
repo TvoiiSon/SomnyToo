@@ -5,7 +5,7 @@ use tokio::sync::mpsc;
 use tokio::time::{timeout, Duration, Instant};
 use tracing::{info, warn, error, debug};
 
-use crate::core::protocol::phantom_crypto::handshake::{perform_phantom_handshake, HandshakeRole};
+use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::security::rate_limiter::instance::RATE_LIMITER;
 use crate::config::PhantomConfig;
 use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;

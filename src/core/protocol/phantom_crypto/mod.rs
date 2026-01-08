@@ -1,15 +1,10 @@
 //! Фантомная криптографическая система
 //! Ключи никогда не хранятся целиком, а рассеиваются по памяти и собираются на лету
 
-pub mod scatterer;
-pub mod assembler;
-pub mod keys;
-pub mod runtime;
-pub mod handshake;
 pub mod packet;
-pub mod instance;
-pub mod chacha20_accel;
-pub mod blake3_accel;
-pub mod batch_processor;
-pub mod buffer_pool;
-pub mod packet_batch;
+
+pub mod acceleration;
+pub mod core;
+pub mod memory;
+pub mod optimization;
+pub mod runtime;

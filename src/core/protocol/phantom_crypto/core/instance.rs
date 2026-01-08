@@ -1,7 +1,7 @@
-use super::{
-    scatterer::MemoryScatterer,
-    keys::PhantomSession,
-    runtime::PhantomRuntime,
+use crate::core::protocol::phantom_crypto::{
+    memory::scatterer::{MemoryScatterer, ScatteredParts},
+    runtime::runtime::PhantomRuntime,
+    core::keys::PhantomSession,
 };
 
 /// Главный интерфейс фантомной криптосистемы
@@ -31,7 +31,7 @@ impl PhantomCrypto {
     }
 
     /// Рассеивание мастер-ключа
-    pub fn scatter_master_key(&self, master_key: &[u8; 32]) -> super::scatterer::ScatteredParts {
+    pub fn scatter_master_key(&self, master_key: &[u8; 32]) -> ScatteredParts {
         self.scatterer.scatter(master_key)
     }
 

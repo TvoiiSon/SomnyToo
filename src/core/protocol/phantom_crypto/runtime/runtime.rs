@@ -3,9 +3,13 @@ use std::sync::Arc;
 use tracing::{warn, info, debug};
 use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use super::chacha20_accel::{ChaCha20Accelerator, CpuCapabilities};
-use super::blake3_accel::Blake3Accelerator;
-use super::batch_processor::PhantomBatchProcessor;
+use crate::core::protocol::phantom_crypto::{
+    acceleration::{
+        chacha20_accel::{ChaCha20Accelerator, CpuCapabilities},
+        blake3_accel::Blake3Accelerator,
+    },
+    optimization::batch_processor::PhantomBatchProcessor
+};
 
 /// Время выполнения в тактах процессора
 #[derive(Debug, Clone, Copy)]

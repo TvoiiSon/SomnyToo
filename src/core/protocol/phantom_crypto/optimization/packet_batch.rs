@@ -3,8 +3,10 @@ use std::time::Instant;
 use rayon::iter::IntoParallelIterator;
 use rayon::prelude::*;
 
-use super::keys::PhantomSession;
-use super::packet::{PhantomPacketProcessor, MAX_PAYLOAD_SIZE};
+use crate::core::protocol::phantom_crypto::{
+    core::keys::PhantomSession,
+    packet::{PhantomPacketProcessor, MAX_PAYLOAD_SIZE}
+};
 use crate::core::protocol::error::ProtocolResult;
 
 /// Пакетный обработчик с предвыделенной памятью

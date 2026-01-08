@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::{RwLock, Mutex};
 use tracing::{info};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::heartbeat::manager::{HeartbeatManager, HeartbeatConfig};
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
 

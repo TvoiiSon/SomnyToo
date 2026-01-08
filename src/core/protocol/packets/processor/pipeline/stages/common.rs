@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 // Заменяем SessionKeys на PhantomSession
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 
 pub struct PipelineContext {
     pub phantom_session: Arc<PhantomSession>,  // Изменяем поле

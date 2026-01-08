@@ -7,7 +7,7 @@ use std::net::SocketAddr;
 
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::monitoring::unified_monitor::{UnifiedMonitor, AlertLevel};
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 
 pub enum HeartbeatCommand {
     StartHeartbeat {

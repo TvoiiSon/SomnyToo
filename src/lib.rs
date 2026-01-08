@@ -5,18 +5,28 @@ pub mod core {
     pub mod protocol {
         pub mod error;
         pub mod phantom_crypto {
-            pub mod scatterer;
-            pub mod assembler;
-            pub mod keys;
-            pub mod runtime;
-            pub mod instance;
-            pub mod handshake;
             pub mod packet;
-            pub mod chacha20_accel;
-            pub mod blake3_accel;
-            pub mod batch_processor;
-            pub mod buffer_pool;
-            pub mod packet_batch;
+            pub mod core {
+                pub mod instance;
+                pub mod keys;
+                pub mod handshake;
+            }
+            pub mod memory {
+                pub mod scatterer;
+                pub mod assembler;
+            }
+            pub mod acceleration {
+                pub mod chacha20_accel;
+                pub mod blake3_accel;
+            }
+            pub mod optimization {
+                pub mod batch_processor;
+                pub mod buffer_pool;
+                pub mod packet_batch;
+            }
+            pub mod runtime {
+                pub mod runtime;
+            }
         }
         pub mod crypto {
             pub mod crypto_pool_phantom;

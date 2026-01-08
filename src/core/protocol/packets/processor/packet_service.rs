@@ -4,7 +4,7 @@ use tracing::{info, error, warn, debug};
 use std::time::{Instant, Duration};
 
 // Заменяем SessionKeys на PhantomSession
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
 

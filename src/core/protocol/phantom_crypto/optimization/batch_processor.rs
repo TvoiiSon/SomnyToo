@@ -4,7 +4,7 @@ use rayon::prelude::*;
 use tracing::{info, debug};
 use crossbeam::channel::{unbounded, Receiver, Sender};
 
-use crate::core::protocol::phantom_crypto::keys::PhantomSession;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::phantom_crypto::packet::{
     PhantomPacketProcessor, MAX_PAYLOAD_SIZE
 };
