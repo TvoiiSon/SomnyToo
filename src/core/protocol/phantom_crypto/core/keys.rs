@@ -46,9 +46,11 @@ impl PhantomMasterKey {
         client_pub_key: &[u8; 32],
         server_pub_key: &[u8; 32],
     ) -> (ScatteredParts, [u8; 16], [u8; 32]) {
-        let start = Instant::now();
+        let total_start = Instant::now();
+        let mut stages_time = Vec::new();
 
-        // Blake3 для деривации ключей (проще и быстрее HKDF)
+        // Blake3 для деривации ключей
+        let hashing_start = Instant::now();
         let mut hasher = Hasher::new();
         hasher.update(shared_secret);
         hasher.update(client_nonce);
@@ -63,17 +65,33 @@ impl PhantomMasterKey {
         let master_key: [u8; 32] = output[0..32].try_into().unwrap();
         let session_id: [u8; 16] = output[32..48].try_into().unwrap();
         let operation_seed: [u8; 32] = output[48..80].try_into().unwrap();
+        let hashing_time = hashing_start.elapsed();
+        stages_time.push(("key_hashing", hashing_time));
 
         // Рассеиваем мастер-ключ
+        let scattering_start = Instant::now();
         let scatterer = MemoryScatterer::new();
         let scattered_parts = scatterer.scatter(&master_key);
+        let scattering_time = scattering_start.elapsed();
+        stages_time.push(("memory_scattering", scattering_time));
 
         // Немедленно уничтожаем сырые байты мастер-ключа
         let mut zero_master = master_key;
         zero_master.zeroize();
 
-        let elapsed = start.elapsed();
-        info!("Blake3 key derivation complete in {:?}", elapsed);
+        let total_time = total_start.elapsed();
+
+        // Логируем время выполнения каждого этапа
+        info!("MASTER KEY GENERATION PERFORMANCE:");
+        info!("  Total time: {:?} ({:.2} ms)", total_time, total_time.as_micros() as f64 / 1000.0);
+
+        for (stage_name, duration) in &stages_time {
+            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
+                  stage_name,
+                  duration,
+                  duration.as_nanos() as f64 / 1000.0,
+                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
+        }
 
         (scattered_parts, session_id, operation_seed)
     }
@@ -198,48 +216,76 @@ impl PhantomSession {
 
     /// Генерирует операционный ключ для конкретной операции
     pub fn generate_operation_key(&self, operation_type: &str) -> PhantomOperationKey {
-        let start = Instant::now();
+        let total_start = Instant::now();
+        let mut stages_time = Vec::new();
 
         let sequence = self.master_key.sequence_number.fetch_add(1, Ordering::SeqCst);
         self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
 
-        let result = self.generate_operation_key_for_sequence(sequence, operation_type);
-
-        let elapsed = start.elapsed();
-
-        // КРИТИЧЕСКИЙ ЗАМЕР: время генерации операционного ключа
-        if elapsed.as_nanos() > 100_000 { // 100 µs
-            warn!("⚠️  SLOW KEY GENERATION: {:?} ({:?} ns) for sequence {} - ТРЕБОВАНИЕ: 20-100µs",
-                  elapsed, elapsed.as_nanos(), sequence);
-        } else if elapsed.as_nanos() < 10_000 { // 10 µs
-            warn!("⚠️  SUSPICIOUSLY FAST KEY GENERATION: {:?} ({:?} ns) for sequence {}",
-                  elapsed, elapsed.as_nanos(), sequence);
+        let actual_operation_type = if operation_type == "encrypt" {
+            "encrypt"
         } else {
-            debug!("✅ Key generation: {:?} ({:?} ns) for sequence {} - В НОРМЕ",
-                  elapsed, elapsed.as_nanos(), sequence);
+            operation_type
+        };
+
+        // Blake3 для деривации операционного ключа
+        let hashing_start = Instant::now();
+        let mut hasher = Hasher::new();
+        hasher.update(&self.master_key.session_id);
+        hasher.update(&sequence.to_be_bytes());
+        hasher.update(actual_operation_type.as_bytes());
+        hasher.update(&self.master_key.operation_seed);
+
+        let mut operation_key_bytes = [0u8; 32];
+        hasher.finalize_xof().fill(&mut operation_key_bytes);
+        let hashing_time = hashing_start.elapsed();
+        stages_time.push(("key_hashing", hashing_time));
+
+        // Создаем операционный ключ
+        let creation_start = Instant::now();
+        let key = PhantomOperationKey::new(operation_key_bytes, sequence);
+        let creation_time = creation_start.elapsed();
+        stages_time.push(("key_object_creation", creation_time));
+
+        let total_time = total_start.elapsed();
+
+        // Логируем время выполнения каждого этапа
+        info!("OPERATION KEY GENERATION PERFORMANCE:");
+        info!("  Total time: {:?} ({:.2} µs)", total_time, total_time.as_nanos() as f64 / 1000.0);
+        info!("  Sequence: {}", sequence);
+
+        for (stage_name, duration) in &stages_time {
+            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
+                  stage_name,
+                  duration,
+                  duration.as_nanos() as f64 / 1000.0,
+                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
         }
 
-        result
+        // КРИТИЧЕСКИЙ ЗАМЕР: время генерации операционного ключа
+        if total_time.as_nanos() > 100_000 { // 100 µs
+            warn!("⚠️  SLOW KEY GENERATION: {:?} ({:?} ns) for sequence {} - ТРЕБОВАНИЕ: 20-100µs",
+                  total_time, total_time.as_nanos(), sequence);
+        } else if total_time.as_nanos() < 10_000 { // 10 µs
+            warn!("⚠️  SUSPICIOUSLY FAST KEY GENERATION: {:?} ({:?} ns) for sequence {}",
+                  total_time, total_time.as_nanos(), sequence);
+        } else {
+            info!("✅ Key generation: {:?} ({:?} ns) for sequence {} - В НОРМЕ",
+                  total_time, total_time.as_nanos(), sequence);
+        }
+
+        key
     }
 
     /// Генерирует операционный ключ для конкретной последовательности
     pub fn generate_operation_key_for_sequence(&self, sequence: u64, operation_type: &str) -> PhantomOperationKey {
         let start = Instant::now();
 
-        // Убедимся, что используем правильную операцию
         let actual_operation_type = if operation_type == "encrypt" {
-            "encrypt" // Клиент использует "encrypt" для подписи
+            "encrypt"
         } else {
             operation_type
         };
-
-        debug!(
-            "Generating phantom operation key for sequence: session={}, sequence={}, type={} (original: {})",
-            hex::encode(self.master_key.session_id),
-            sequence,
-            actual_operation_type,
-            operation_type
-        );
 
         // Blake3 для деривации операционного ключа
         let mut hasher = Hasher::new();
@@ -251,9 +297,10 @@ impl PhantomSession {
         let mut operation_key_bytes = [0u8; 32];
         hasher.finalize_xof().fill(&mut operation_key_bytes);
 
-        let _elapsed = start.elapsed();
+        let elapsed = start.elapsed();
+        debug!("Key generation for sequence {}: {:?} ({:.2} µs)",
+               sequence, elapsed, elapsed.as_nanos() as f64 / 1000.0);
 
-        // Создаем операционный ключ
         PhantomOperationKey::new(operation_key_bytes, sequence)
     }
 
