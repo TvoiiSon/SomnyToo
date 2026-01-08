@@ -226,12 +226,18 @@ impl PhantomSession {
     pub fn generate_operation_key_for_sequence(&self, sequence: u64, operation_type: &str) -> PhantomOperationKey {
         let start = Instant::now();
 
-        self.master_key.operation_count.fetch_add(1, Ordering::SeqCst);
+        // Убедимся, что используем правильную операцию
+        let actual_operation_type = if operation_type == "encrypt" {
+            "encrypt" // Клиент использует "encrypt" для подписи
+        } else {
+            operation_type
+        };
 
         debug!(
-            "Generating phantom operation key for sequence: session={}, sequence={}, type={}",
+            "Generating phantom operation key for sequence: session={}, sequence={}, type={} (original: {})",
             hex::encode(self.master_key.session_id),
             sequence,
+            actual_operation_type,
             operation_type
         );
 
@@ -239,7 +245,7 @@ impl PhantomSession {
         let mut hasher = Hasher::new();
         hasher.update(&self.master_key.session_id);
         hasher.update(&sequence.to_be_bytes());
-        hasher.update(operation_type.as_bytes());
+        hasher.update(actual_operation_type.as_bytes());
         hasher.update(&self.master_key.operation_seed);
 
         let mut operation_key_bytes = [0u8; 32];
