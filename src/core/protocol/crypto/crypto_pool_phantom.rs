@@ -13,7 +13,7 @@ use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
 pub struct PhantomCryptoPool {
     tx: mpsc::Sender<PhantomCryptoTask>,
     batch_tx: mpsc::Sender<PhantomBatchTask>,
-    packet_processor: Arc<PhantomPacketProcessor>,
+    packet_processor: Arc<Mutex<PhantomPacketProcessor>>, // Теперь с Mutex для внутренних буферов
 }
 
 pub enum PhantomCryptoTask {
@@ -37,7 +37,9 @@ impl PhantomCryptoPool {
     pub fn spawn(threads: usize) -> Self {
         let (tx, rx) = mpsc::channel::<PhantomCryptoTask>(4096);
         let (batch_tx, batch_rx) = mpsc::channel::<PhantomBatchTask>(1024);
-        let packet_processor = Arc::new(PhantomPacketProcessor::new());
+
+        // Создаем процессоры с предвыделенными буферами для каждого воркера
+        let packet_processor = Arc::new(Mutex::new(PhantomPacketProcessor::new()));
 
         let rx = Arc::new(Mutex::new(rx));
         let batch_rx = Arc::new(Mutex::new(batch_rx));
@@ -47,8 +49,8 @@ impl PhantomCryptoPool {
             let rx = Arc::clone(&rx);
             let packet_processor = Arc::clone(&packet_processor);
             tokio::spawn(async move {
-                let worker = PhantomCryptoWorker::new(packet_processor);
-                worker.run(rx).await;
+                let worker = PhantomCryptoWorker::new();
+                worker.run(rx, packet_processor).await;
             });
         }
 
@@ -57,8 +59,8 @@ impl PhantomCryptoPool {
             let batch_rx = Arc::clone(&batch_rx);
             let packet_processor = Arc::clone(&packet_processor);
             tokio::spawn(async move {
-                let worker = PhantomCryptoWorker::new(packet_processor);
-                worker.run_batch(batch_rx).await;
+                let worker = PhantomCryptoWorker::new();
+                worker.run_batch(batch_rx, packet_processor).await;
             });
         }
 
@@ -117,7 +119,9 @@ impl PhantomCryptoPool {
             packet_type
         );
 
-        let result = self.packet_processor.create_outgoing(
+        // Используем общий packet processor
+        let mut processor = self.packet_processor.lock().await;
+        let result = processor.create_outgoing(
             &session,
             packet_type,
             &plaintext,
@@ -133,7 +137,7 @@ impl PhantomCryptoPool {
             info!("Slow phantom encryption: {:?} for {} bytes", total_time, plaintext.len());
         }
 
-        result
+        result.map(|slice| slice.to_vec()) // Копируем в Vec для совместимости
     }
 
     pub async fn encrypt_batch(
@@ -194,7 +198,6 @@ impl PhantomCryptoPool {
             Ok(Ok(Ok(results))) => results,
             Ok(Ok(Err(e))) => {
                 error!("Batch decryption failed: {}", e);
-                // Создаем вектор с той же ошибкой для всех задач
                 create_error_results(tasks_len, e)
             }
             Ok(Err(_)) => {
@@ -228,21 +231,20 @@ fn create_error_results(
 ) -> Vec<ProtocolResult<(u8, Vec<u8>)>> {
     let mut results = Vec::with_capacity(count);
     for _ in 0..count {
-        results.push(Err(error.clone())); // Теперь clone доступен
+        results.push(Err(error.clone()));
     }
     results
 }
 
-struct PhantomCryptoWorker {
-    packet_processor: Arc<PhantomPacketProcessor>,
-}
+struct PhantomCryptoWorker;
 
 impl PhantomCryptoWorker {
-    fn new(packet_processor: Arc<PhantomPacketProcessor>) -> Self {
-        Self { packet_processor }
+    fn new() -> Self {
+        Self
     }
 
-    async fn run(self, rx: Arc<Mutex<mpsc::Receiver<PhantomCryptoTask>>>) {
+    async fn run(self, rx: Arc<Mutex<mpsc::Receiver<PhantomCryptoTask>>>,
+                 packet_processor: Arc<Mutex<PhantomPacketProcessor>>) {
         loop {
             let task = {
                 let mut guard = rx.lock().await;
@@ -252,10 +254,10 @@ impl PhantomCryptoWorker {
             if let Some(task) = task {
                 match task {
                     PhantomCryptoTask::Single { session, payload, resp } => {
-                        Self::process_single(&self.packet_processor, session, payload, resp).await;
+                        Self::process_single(&packet_processor, session, payload, resp).await;
                     }
                     PhantomCryptoTask::Batch { tasks, resp } => {
-                        Self::process_batch(&self.packet_processor, tasks, resp).await;
+                        Self::process_batch(&packet_processor, tasks, resp).await;
                     }
                 }
             } else {
@@ -264,7 +266,8 @@ impl PhantomCryptoWorker {
         }
     }
 
-    async fn run_batch(self, batch_rx: Arc<Mutex<mpsc::Receiver<PhantomBatchTask>>>) {
+    async fn run_batch(self, batch_rx: Arc<Mutex<mpsc::Receiver<PhantomBatchTask>>>,
+                       packet_processor: Arc<Mutex<PhantomPacketProcessor>>) {
         loop {
             let batch_task = {
                 let mut guard = batch_rx.lock().await;
@@ -272,7 +275,7 @@ impl PhantomCryptoWorker {
             };
 
             if let Some(batch_task) = batch_task {
-                Self::process_batch_task(&self.packet_processor, batch_task.tasks, batch_task.resp).await;
+                Self::process_batch_task(&packet_processor, batch_task.tasks, batch_task.resp).await;
             } else {
                 break;
             }
@@ -280,7 +283,7 @@ impl PhantomCryptoWorker {
     }
 
     async fn process_single(
-        packet_processor: &PhantomPacketProcessor,
+        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
         session: Arc<PhantomSession>,
         payload: Vec<u8>,
         resp: oneshot::Sender<ProtocolResult<(u8, Vec<u8>)>>
@@ -294,7 +297,8 @@ impl PhantomCryptoWorker {
             payload_size
         );
 
-        let result = packet_processor.process_incoming(&payload, &session);
+        let mut processor = packet_processor.lock().await;
+        let result = processor.process_incoming(&payload, &session);
 
         let elapsed = start.elapsed();
         match &result {
@@ -305,6 +309,7 @@ impl PhantomCryptoWorker {
                     data.len(),
                     elapsed
                 );
+                let _ = resp.send(Ok((*packet_type, data.to_vec())));
             }
             Err(e) => {
                 error!(
@@ -312,6 +317,7 @@ impl PhantomCryptoWorker {
                     hex::encode(session.session_id()),
                     e
                 );
+                let _ = resp.send(Err(e.clone()));
             }
         };
 
@@ -320,12 +326,10 @@ impl PhantomCryptoWorker {
         } else if elapsed > Duration::from_millis(1) {
             debug!("Phantom decryption took {:?} for {} bytes", elapsed, payload_size);
         }
-
-        let _ = resp.send(result);
     }
 
     async fn process_batch(
-        packet_processor: &PhantomPacketProcessor,
+        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
         tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
         resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>
     ) {
@@ -335,10 +339,13 @@ impl PhantomCryptoWorker {
 
         info!("Processing phantom batch of {} packets", batch_size);
 
+        let mut processor = packet_processor.lock().await;
+
         for (i, (session, payload)) in tasks.into_iter().enumerate() {
             let packet_start = Instant::now();
 
-            let result = packet_processor.process_incoming(&payload, &session);
+            let result = processor.process_incoming(&payload, &session)
+                .map(|(packet_type, data)| (packet_type, data.to_vec()));
 
             let packet_time = packet_start.elapsed();
             if packet_time > Duration::from_millis(5) {
@@ -360,7 +367,7 @@ impl PhantomCryptoWorker {
     }
 
     async fn process_batch_task(
-        packet_processor: &PhantomPacketProcessor,
+        packet_processor: &Arc<Mutex<PhantomPacketProcessor>>,
         tasks: Vec<(Arc<PhantomSession>, Vec<u8>)>,
         resp: oneshot::Sender<ProtocolResult<Vec<ProtocolResult<(u8, Vec<u8>)>>>>
     ) {

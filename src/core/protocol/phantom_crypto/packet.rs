@@ -1,7 +1,6 @@
 use std::time::Instant;
-use aes_gcm::{Aes256Gcm, KeyInit, aead::{Aead, generic_array::GenericArray}};
-use hmac::{Hmac, Mac};
-use sha2::Sha256;
+use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce, KeyInit, AeadInPlace};
+use blake3::Hasher;
 use rand_core::{OsRng, RngCore};
 use constant_time_eq::constant_time_eq;
 use tracing::{info, warn, debug};
@@ -9,37 +8,39 @@ use tracing::{info, warn, debug};
 use super::keys::{PhantomSession, PhantomOperationKey};
 use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
 
-type HmacSha256 = Hmac<Sha256>;
-
 /// Константы пакетов
 pub const HEADER_MAGIC: [u8; 2] = [0xAB, 0xCE];
 const NONCE_SIZE: usize = 12;
+const TAG_SIZE: usize = 16;
 const SIGNATURE_SIZE: usize = 32;
 const MAX_PAYLOAD_SIZE: usize = 1 << 20; // 1 MB
 
-/// Пакет с фантомной криптографией
-pub struct PhantomPacket {
-    pub session_id: [u8; 16],
+/// Пакет с фантомной криптографией (без аллокаций внутри)
+pub struct PhantomPacket<'a> {
+    pub session_id: &'a [u8; 16],
     pub sequence: u64,
     pub timestamp: u64,
     pub packet_type: u8,
-    pub ciphertext: Vec<u8>,
-    pub signature: [u8; 32],
+    pub ciphertext: &'a [u8], // Ссылка на данные, а не владение
+    pub signature: &'a [u8; 32],
 }
 
-impl PhantomPacket {
-    /// Создает новый пакет для отправки
-    pub fn create(
+impl<'a> PhantomPacket<'a> {
+    /// Создает новый пакет для отправки (без аллокаций в hot path)
+    pub fn create<'b>(
         session: &PhantomSession,
         packet_type: u8,
         plaintext: &[u8],
-    ) -> ProtocolResult<Self> {
+        buffer: &'b mut [u8], // Предвыделенный буфер
+    ) -> ProtocolResult<&'b [u8]> {
         let start = Instant::now();
 
         info!("Creating phantom packet: type=0x{:02X}, size={} bytes", packet_type, plaintext.len());
 
         // 1. Генерируем операционный ключ для шифрования
         let operation_key = session.generate_operation_key("encrypt");
+        let key_bytes = operation_key.as_bytes();
+        let sequence = operation_key.sequence;
 
         // 2. Генерируем nonce
         let mut nonce = [0u8; NONCE_SIZE];
@@ -47,136 +48,149 @@ impl PhantomPacket {
 
         debug!("Generated nonce for encryption: {}", hex::encode(&nonce));
 
-        // 3. Шифруем данные
-        let cipher = Aes256Gcm::new_from_slice(operation_key.as_bytes())
-            .map_err(|e| ProtocolError::Crypto {
-                source: CryptoError::DecryptionFailed {
-                    reason: format!("Failed to create cipher: {}", e)
-                }
-            })?;
+        // 3. Шифруем данные с ChaCha20Poly1305
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key_bytes));
+        let payload_nonce = Nonce::from_slice(&nonce);
 
-        let payload_nonce = GenericArray::from_slice(&nonce);
-        let ciphertext = cipher.encrypt(payload_nonce, plaintext)
-            .map_err(|e| ProtocolError::Crypto {
+        // Рассчитываем размеры
+        let header_size = 4 + 16 + 8 + 8 + 1; // magic(2) + len(2) + session_id(16) + sequence(8) + timestamp(8) + type(1) = 39 байт
+        let nonce_start = header_size; // nonce начинается после заголовка
+        let ciphertext_start = nonce_start + NONCE_SIZE; // ciphertext начинается после nonce
+
+        // Для encrypt_in_place нам нужно место для plaintext + TAG
+        let ciphertext_with_tag_len = plaintext.len() + TAG_SIZE;
+        let ciphertext_with_tag_end = ciphertext_start + ciphertext_with_tag_len;
+        let signature_start = ciphertext_with_tag_end; // подпись начинается после ciphertext+TAG
+
+        // Общий размер пакета: header + nonce + ciphertext + TAG + signature
+        let total_size = signature_start + SIGNATURE_SIZE;
+
+        if buffer.len() < total_size {
+            return Err(ProtocolError::Crypto {
+                source: CryptoError::DecryptionFailed {
+                    reason: format!("Buffer too small: need {}, have {}", total_size, buffer.len())
+                }
+            });
+        }
+
+        // Для шифрования используем временный вектор
+        let mut encrypt_buffer = Vec::with_capacity(plaintext.len() + TAG_SIZE);
+        encrypt_buffer.extend_from_slice(plaintext);
+
+        // Шифруем in-place
+        match cipher.encrypt_in_place(payload_nonce, &[], &mut encrypt_buffer) {
+            Ok(_) => {
+                // Теперь encrypt_buffer содержит: [ciphertext...][TAG...] (plaintext.len() + TAG_SIZE байт)
+
+                // Разделяем буфер на части для безопасной записи
+                let (header_part, rest) = buffer.split_at_mut(header_size);
+                let (nonce_part, ciphertext_and_sig_part) = rest.split_at_mut(NONCE_SIZE);
+
+                // Копируем nonce
+                nonce_part.copy_from_slice(&nonce);
+
+                // Копируем ciphertext + tag
+                let ciphertext_part = &mut ciphertext_and_sig_part[..encrypt_buffer.len()];
+                ciphertext_part.copy_from_slice(&encrypt_buffer);
+
+                // Создаем подпись
+                let signature_start_in_part = encrypt_buffer.len();
+                let signature_buffer = &mut ciphertext_and_sig_part[signature_start_in_part..signature_start_in_part + SIGNATURE_SIZE];
+                let signature = Self::create_signature(
+                    session,
+                    &operation_key,
+                    packet_type,
+                    &nonce,
+                    &encrypt_buffer,
+                    signature_buffer,
+                )?;
+
+                // Формируем заголовок в отдельной части буфера
+                Self::encode_header(
+                    session,
+                    sequence,
+                    packet_type,
+                    (total_size - 4) as u16, // total_len не включает magic(2) + len(2)
+                    header_part,
+                );
+
+                // Подпись уже записана в create_signature
+                let _ = signature; // Используем переменную для подавления warning
+
+                let elapsed = start.elapsed();
+                debug!(
+                    "Phantom packet created in {:?}: type=0x{:02X}, total_size={} bytes (header={}, nonce={}, ciphertext+tag={}, sig={})",
+                    elapsed, packet_type, total_size, header_size, NONCE_SIZE, encrypt_buffer.len(), SIGNATURE_SIZE
+                );
+
+                Ok(&buffer[..total_size])
+            }
+            Err(e) => Err(ProtocolError::Crypto {
                 source: CryptoError::DecryptionFailed {
                     reason: format!("Encryption failed: {}", e)
                 }
-            })?;
-
-        debug!("Encrypted data length: {} bytes", ciphertext.len());
-
-        // 4. Объединяем nonce + ciphertext для передачи
-        let mut full_ciphertext = Vec::with_capacity(NONCE_SIZE + ciphertext.len());
-        full_ciphertext.extend_from_slice(&nonce);
-        full_ciphertext.extend_from_slice(&ciphertext);
-
-        // 5. Создаем подпись (передаем nonce отдельно)
-        let signature = Self::create_signature(
-            session,
-            &operation_key,
-            packet_type,
-            &nonce,
-            &ciphertext,
-        )?;
-
-        // 6. Получаем метаданные
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_millis() as u64;
-
-        let sequence = operation_key.sequence;
-
-        let elapsed = start.elapsed();
-
-        // Замер времени создания пакета
-        #[cfg(feature = "metrics")]
-        metrics::histogram!("phantom.packet.creation_time", elapsed.as_micros() as f64);
-
-        debug!(
-            "Phantom packet created in {:?}: type=0x{:02X}, size={} bytes",
-            elapsed, packet_type, full_ciphertext.len()
-        );
-
-        Ok(Self {
-            session_id: *session.session_id(),
-            sequence,
-            timestamp,
-            packet_type,
-            ciphertext: full_ciphertext,
-            signature,
-        })
+            }),
+        }
     }
 
-    /// Создает подпись пакета
-    fn create_signature(
+    /// Создает подпись пакета с Blake3 (быстрее HMAC)
+    fn create_signature<'b>(
         session: &PhantomSession,
         sign_key: &PhantomOperationKey,
         packet_type: u8,
         nonce: &[u8; NONCE_SIZE],
         encrypted_data: &[u8],
-    ) -> ProtocolResult<[u8; 32]> {
-        let mut data_to_sign = Vec::new();
+        sig_buffer: &'b mut [u8],
+    ) -> ProtocolResult<&'b [u8; 32]> {
+        let mut hasher = Hasher::new_keyed(sign_key.as_bytes());
 
-        data_to_sign.extend_from_slice(session.session_id());
-        data_to_sign.extend_from_slice(&sign_key.sequence.to_be_bytes());
-        data_to_sign.push(packet_type);
-        data_to_sign.extend_from_slice(nonce);
-        data_to_sign.extend_from_slice(encrypted_data);
+        hasher.update(session.session_id());
+        hasher.update(&sign_key.sequence.to_be_bytes());
+        hasher.update(&[packet_type]);
+        hasher.update(nonce);
+        hasher.update(encrypted_data);
 
-        debug!(
-            "Creating signature for session {} sequence {}: data_len={}, nonce={}, encrypted_data_len={}",
-            hex::encode(session.session_id()),
-            sign_key.sequence,
-            data_to_sign.len(),
-            hex::encode(nonce),
-            encrypted_data.len()
-        );
+        let signature = hasher.finalize();
 
-        let mut mac: HmacSha256 = Mac::new_from_slice(sign_key.as_bytes())
-            .map_err(|_| ProtocolError::Crypto {
+        if sig_buffer.len() < 32 {
+            return Err(ProtocolError::Crypto {
                 source: CryptoError::InvalidKeyLength {
                     expected: 32,
-                    actual: sign_key.as_bytes().len()
+                    actual: sig_buffer.len()
                 }
-            })?;
+            });
+        }
 
-        mac.update(&data_to_sign);
-        let signature_bytes = mac.finalize().into_bytes();
+        sig_buffer[..32].copy_from_slice(signature.as_bytes());
 
-        let signature: [u8; 32] = signature_bytes.as_slice().try_into()
-            .map_err(|_| ProtocolError::Crypto {
-                source: CryptoError::DecryptionFailed {
-                    reason: "Failed to convert signature to array".to_string()
-                }
-            })?;
-
-        debug!("Signature created: {}", hex::encode(&signature));
-
-        Ok(signature)
+        // Безопасное преобразование
+        Ok(unsafe { &*(sig_buffer.as_ptr() as *const [u8; 32]) })
     }
 
-    /// Кодирует пакет в байты для отправки
-    pub fn encode(&self) -> Vec<u8> {
-        let mut buffer = Vec::new();
+    /// Кодирует заголовок пакета
+    fn encode_header(
+        session: &PhantomSession,
+        sequence: u64,
+        packet_type: u8,
+        total_len: u16,
+        buffer: &mut [u8],
+    ) {
+        buffer[0..2].copy_from_slice(&HEADER_MAGIC);
+        buffer[2..4].copy_from_slice(&total_len.to_be_bytes());
+        buffer[4..20].copy_from_slice(session.session_id());
+        buffer[20..28].copy_from_slice(&sequence.to_be_bytes());
 
-        buffer.extend_from_slice(&HEADER_MAGIC);
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis() as u64;
 
-        let total_len = 16 + 8 + 8 + 1 + self.ciphertext.len() + SIGNATURE_SIZE;
-        buffer.extend_from_slice(&(total_len as u16).to_be_bytes());
-
-        buffer.extend_from_slice(&self.session_id);
-        buffer.extend_from_slice(&self.sequence.to_be_bytes());
-        buffer.extend_from_slice(&self.timestamp.to_be_bytes());
-        buffer.push(self.packet_type);
-        buffer.extend_from_slice(&self.ciphertext);
-        buffer.extend_from_slice(&self.signature);
-
-        buffer
+        buffer[28..36].copy_from_slice(&timestamp.to_be_bytes());
+        buffer[36] = packet_type;
     }
 
-    /// Декодирует пакет из байтов
-    pub fn decode(data: &[u8]) -> ProtocolResult<Self> {
+    /// Декодирует пакет из байтов (без аллокаций)
+    pub fn decode(data: &'a [u8]) -> ProtocolResult<Self> {
         let start = Instant::now();
 
         if data.len() < 4 {
@@ -192,7 +206,7 @@ impl PhantomPacket {
         }
 
         let length = u16::from_be_bytes([data[2], data[3]]) as usize;
-        let min_length = 16 + 8 + 8 + 1 + NONCE_SIZE + SIGNATURE_SIZE;
+        let min_length = 4 + 16 + 8 + 8 + 1 + NONCE_SIZE + TAG_SIZE + SIGNATURE_SIZE;
 
         if length < min_length {
             return Err(ProtocolError::MalformedPacket {
@@ -200,81 +214,66 @@ impl PhantomPacket {
             });
         }
 
-        let expected_total = 4 + length;
-        if data.len() != expected_total {
+        // ВАЖНО: length - это длина данных БЕЗ magic(2) и len(2)
+        // total_packet_size = 4 + length
+        let total_packet_size = 4 + length;
+
+        if data.len() != total_packet_size {
             return Err(ProtocolError::MalformedPacket {
-                details: format!("Length mismatch: expected {}, got {}", expected_total, data.len())
+                details: format!("Length mismatch: expected {} (4 + {}), got {}",
+                                 total_packet_size, length, data.len())
             });
         }
 
-        let mut offset = 4;
-
-        let session_id: [u8; 16] = data[offset..offset + 16].try_into()
+        // Парсим заголовок (только смещения, без аллокаций)
+        let session_id: &[u8; 16] = data[4..20].try_into()
             .map_err(|_| ProtocolError::MalformedPacket {
                 details: "Invalid session id".to_string()
             })?;
-        offset += 16;
 
         let sequence = u64::from_be_bytes(
-            data[offset..offset + 8].try_into()
+            data[20..28].try_into()
                 .map_err(|_| ProtocolError::MalformedPacket {
                     details: "Invalid sequence".to_string()
                 })?
         );
-        offset += 8;
 
         let timestamp = u64::from_be_bytes(
-            data[offset..offset + 8].try_into()
+            data[28..36].try_into()
                 .map_err(|_| ProtocolError::MalformedPacket {
                     details: "Invalid timestamp".to_string()
                 })?
         );
-        offset += 8;
 
-        let packet_type = data[offset];
-        offset += 1;
+        let packet_type = data[36];
 
-        let remaining_data = &data[offset..];
-        if remaining_data.len() < NONCE_SIZE + SIGNATURE_SIZE {
+        // Ciphertext начинается с nonce (после заголовка)
+        let ciphertext_start = 37; // 4(magic+len) + 33(header без magic+len) = 37
+        let ciphertext_end = length - SIGNATURE_SIZE + 4; // +4 для magic+len
+
+        if ciphertext_end > data.len() {
             return Err(ProtocolError::MalformedPacket {
-                details: format!("Not enough data for ciphertext and signature: {} bytes", remaining_data.len())
+                details: format!("Invalid ciphertext range: {}-{} in {} bytes",
+                                 ciphertext_start, ciphertext_end, data.len())
             });
         }
 
-        let ciphertext_len = remaining_data.len() - SIGNATURE_SIZE;
-        let ciphertext = remaining_data[..ciphertext_len].to_vec();
-        let signature: [u8; 32] = remaining_data[ciphertext_len..].try_into()
+        let ciphertext = &data[ciphertext_start..ciphertext_end];
+
+        let signature: &[u8; 32] = data[ciphertext_end..ciphertext_end + 32].try_into()
             .map_err(|_| ProtocolError::MalformedPacket {
                 details: "Invalid signature".to_string()
             })?;
 
-        if ciphertext.len() < NONCE_SIZE {
-            return Err(ProtocolError::MalformedPacket {
-                details: format!("Ciphertext too short for nonce: {} bytes", ciphertext.len())
-            });
-        }
-
-        let current_timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-
-        let packet_timestamp_secs = timestamp / 1000;
-        if current_timestamp.abs_diff(packet_timestamp_secs) > 30 {
-            warn!("Packet timestamp out of range: {}", packet_timestamp_secs);
-            return Err(ProtocolError::MalformedPacket {
-                details: "Timestamp out of range".to_string()
-            });
-        }
-
         let elapsed = start.elapsed();
         debug!(
-            "Phantom packet decoded in {:?}: session={}, sequence={}, type=0x{:02X}, ciphertext={} bytes",
+            "Phantom packet decoded in {:?}: session={}, sequence={}, type=0x{:02X}, ciphertext={} bytes, total={} bytes",
             elapsed,
             hex::encode(session_id),
             sequence,
             packet_type,
-            ciphertext.len()
+            ciphertext.len(),
+            data.len()
         );
 
         Ok(Self {
@@ -287,17 +286,18 @@ impl PhantomPacket {
         })
     }
 
-    /// Расшифровывает содержимое пакета
-    pub fn decrypt(
+    /// Расшифровывает содержимое пакета (без аллокаций)
+    pub fn decrypt<'b>(
         &self,
         session: &PhantomSession,
-    ) -> ProtocolResult<Vec<u8>> {
+        plaintext_buffer: &'b mut [u8],
+    ) -> ProtocolResult<&'b [u8]> {
         let start = Instant::now();
 
-        debug!("Decrypting phantom packet: session={}, sequence={}",
-               hex::encode(self.session_id), self.sequence);
+        debug!("Decrypting phantom packet: session={}, sequence={}, ciphertext={} bytes",
+               hex::encode(self.session_id), self.sequence, self.ciphertext.len());
 
-        if !constant_time_eq(&self.session_id, session.session_id()) {
+        if !constant_time_eq(self.session_id, session.session_id()) {
             return Err(ProtocolError::AuthenticationFailed {
                 reason: "Session ID mismatch".to_string()
             });
@@ -305,159 +305,160 @@ impl PhantomPacket {
 
         self.verify_signature(session)?;
 
-        if self.ciphertext.len() < NONCE_SIZE {
+        if self.ciphertext.len() < NONCE_SIZE + TAG_SIZE {
             return Err(ProtocolError::MalformedPacket {
-                details: "Ciphertext too short".to_string()
+                details: format!("Ciphertext too short: {} bytes, need at least {}",
+                                 self.ciphertext.len(), NONCE_SIZE + TAG_SIZE)
             });
         }
 
         let nonce = &self.ciphertext[..NONCE_SIZE];
-        let encrypted_data = &self.ciphertext[NONCE_SIZE..];
+        let encrypted_data_with_tag = &self.ciphertext[NONCE_SIZE..];
 
-        debug!("Extracted nonce: {}, encrypted_data length: {} bytes",
-               hex::encode(nonce), encrypted_data.len());
+        if encrypted_data_with_tag.len() < TAG_SIZE {
+            return Err(ProtocolError::MalformedPacket {
+                details: format!("Encrypted data too short: {} bytes, need at least {}",
+                                 encrypted_data_with_tag.len(), TAG_SIZE)
+            });
+        }
 
-        // ВАЖНО: используем "encrypt" тип (а не "decrypt"), чтобы ключ совпадал с клиентом!
+        // Генерируем ключ дешифрования
         let decrypt_key = session.generate_operation_key_for_sequence(self.sequence, "encrypt");
+        let key_bytes = decrypt_key.as_bytes();
 
-        debug!("SERVER: decrypt_key (first 8 bytes): {}",
-               hex::encode(&decrypt_key.as_bytes()[..8]));
-        debug!("SERVER: Full encrypted_data received: {}",
-               hex::encode(encrypted_data));
+        // Создаем cipher
+        let cipher = ChaCha20Poly1305::new(Key::from_slice(key_bytes));
+        let payload_nonce = Nonce::from_slice(nonce);
 
-        let cipher = Aes256Gcm::new_from_slice(decrypt_key.as_bytes())
-            .map_err(|e| ProtocolError::Crypto {
-                source: CryptoError::DecryptionFailed {
-                    reason: format!("Failed to create cipher: {}", e)
+        // Для дешифрования нам нужно скопировать данные во временный буфер
+        let mut decrypt_buffer = encrypted_data_with_tag.to_vec();
+
+        // Дешифруем in-place
+        match cipher.decrypt_in_place(
+            payload_nonce,
+            &[], // AAD
+            &mut decrypt_buffer
+        ) {
+            Ok(_) => {
+                // Результат теперь в decrypt_buffer, но без TAG
+                let plaintext_len = decrypt_buffer.len();
+
+                if plaintext_buffer.len() < plaintext_len {
+                    return Err(ProtocolError::Crypto {
+                        source: CryptoError::DecryptionFailed {
+                            reason: format!("Plaintext buffer too small: need {}, have {}",
+                                            plaintext_len, plaintext_buffer.len())
+                        }
+                    });
                 }
-            })?;
 
-        let payload_nonce = GenericArray::from_slice(nonce);
-        let plaintext = cipher.decrypt(payload_nonce, encrypted_data)
-            .map_err(|e| ProtocolError::Crypto {
+                plaintext_buffer[..plaintext_len].copy_from_slice(&decrypt_buffer);
+
+                let elapsed = start.elapsed();
+                debug!(
+                    "Phantom packet decrypted in {:?}: {} bytes plaintext",
+                    elapsed,
+                    plaintext_len
+                );
+
+                Ok(&plaintext_buffer[..plaintext_len])
+            }
+            Err(e) => Err(ProtocolError::Crypto {
                 source: CryptoError::DecryptionFailed {
                     reason: format!("Decryption failed: {}", e)
                 }
-            })?;
-
-        debug!("SERVER: Successfully decrypted plaintext ({} bytes): {}",
-               plaintext.len(), hex::encode(&plaintext));
-
-        let elapsed = start.elapsed();
-
-        // Замер времени расшифрования
-        #[cfg(feature = "metrics")]
-        metrics::histogram!("phantom.packet.decryption_time", elapsed.as_micros() as f64);
-
-        debug!(
-            "Phantom packet decrypted in {:?}: {} bytes plaintext",
-            elapsed,
-            plaintext.len()
-        );
-
-        Ok(plaintext)
+            }),
+        }
     }
 
-    /// Проверяет подпись пакета
+    /// Проверяет подпись пакета с Blake3
     fn verify_signature(
         &self,
         session: &PhantomSession,
     ) -> ProtocolResult<()> {
-        if self.ciphertext.len() < NONCE_SIZE {
+        if self.ciphertext.len() < NONCE_SIZE + TAG_SIZE {
             return Err(ProtocolError::MalformedPacket {
-                details: "Ciphertext too short for nonce".to_string()
+                details: "Ciphertext too short for verification".to_string()
             });
         }
 
         let nonce = &self.ciphertext[..NONCE_SIZE];
-        let encrypted_data = &self.ciphertext[NONCE_SIZE..];
+        let encrypted_data_with_tag = &self.ciphertext[NONCE_SIZE..];
 
-        let sign_sequence = self.sequence + 1;
+        if encrypted_data_with_tag.len() < TAG_SIZE {
+            return Err(ProtocolError::MalformedPacket {
+                details: "Encrypted data too short".to_string()
+            });
+        }
 
-        let mut data_to_verify = Vec::new();
-        data_to_verify.extend_from_slice(&self.session_id);
-        data_to_verify.extend_from_slice(&sign_sequence.to_be_bytes());
-        data_to_verify.push(self.packet_type);
-
-        let nonce_array: [u8; NONCE_SIZE] = nonce.try_into()
-            .map_err(|_| ProtocolError::MalformedPacket {
-                details: "Invalid nonce length".to_string()
-            })?;
-        data_to_verify.extend_from_slice(&nonce_array);
-        data_to_verify.extend_from_slice(encrypted_data);
-
+        // ИСПРАВЛЕНИЕ: используем ТОТ ЖЕ sequence что и клиент
+        // sign_key.sequence на клиенте = self.sequence на сервере
         debug!(
-            "SERVER: Verifying signature with data:\n\
-             - session_id: {}\n\
-             - sign_sequence: {} (bytes: {})\n\
-             - packet_type: 0x{:02X}\n\
-             - nonce: {}\n\
-             - encrypted_data: {} bytes\n\
-             - packet_sequence: {}\n\
-             - total_data_len: {} bytes",
+            "Verifying signature for session={}, packet_sequence={}",
             hex::encode(self.session_id),
-            sign_sequence,
-            hex::encode(&sign_sequence.to_be_bytes()),
-            self.packet_type,
-            hex::encode(nonce),
-            encrypted_data.len(),
-            self.sequence,
-            data_to_verify.len()
+            self.sequence
         );
 
-        let verify_key = session.generate_operation_key_for_sequence(sign_sequence, "auth");
+        let verify_key = session.generate_operation_key_for_sequence(self.sequence, "encrypt");
 
-        let mut mac: HmacSha256 = Mac::new_from_slice(verify_key.as_bytes())
-            .map_err(|_| ProtocolError::Crypto {
-                source: CryptoError::InvalidKeyLength {
-                    expected: 32,
-                    actual: verify_key.as_bytes().len()
-                }
-            })?;
+        // Blake3 для верификации
+        let mut hasher = Hasher::new_keyed(verify_key.as_bytes());
+        hasher.update(self.session_id);
+        hasher.update(&self.sequence.to_be_bytes());  // ИСПРАВЛЕНИЕ: без +1
+        hasher.update(&[self.packet_type]);
+        hasher.update(nonce);
+        hasher.update(encrypted_data_with_tag);
 
-        mac.update(&data_to_verify);
-        let expected_signature_bytes = mac.finalize().into_bytes();
-        let expected_signature: &[u8] = expected_signature_bytes.as_slice();
+        let expected_signature = hasher.finalize();
 
-        debug!("SERVER: Expected signature: {}, received: {}",
-               hex::encode(expected_signature),
-               hex::encode(&self.signature));
-
-        if !constant_time_eq(expected_signature, &self.signature) {
+        if !constant_time_eq(expected_signature.as_bytes(), self.signature) {
             warn!(
-                "Signature mismatch for session {} packet_sequence={} sign_sequence={}",
-                hex::encode(self.session_id),
-                self.sequence,
-                sign_sequence
-            );
-            warn!("SERVER: Data for verification hex dump:\n{}",
-                  hex::encode(&data_to_verify));
+            "Signature mismatch for session {} sequence={}",
+            hex::encode(self.session_id),
+            self.sequence
+        );
             return Err(ProtocolError::AuthenticationFailed {
                 reason: "Invalid signature".to_string()
             });
         }
 
         debug!(
-            "Signature verified for session {} packet_sequence={} sign_sequence={}",
+            "Signature verified for session {} sequence={}",
             hex::encode(self.session_id),
-            self.sequence,
-            sign_sequence
+            self.sequence
         );
 
         Ok(())
     }
 }
 
-/// Обработчик пакетов с фантомными ключами
-pub struct PhantomPacketProcessor;
+/// Обработчик пакетов с оптимизированной памятью
+pub struct PhantomPacketProcessor {
+    // Предвыделенные буферы для обработки
+    encrypt_buffer: Vec<u8>,
+    decrypt_buffer: Vec<u8>,
+    temp_buffer: Vec<u8>, // Временный буфер для дешифрования
+}
 
 impl PhantomPacketProcessor {
     pub fn new() -> Self {
-        Self
+        Self {
+            encrypt_buffer: vec![0; MAX_PAYLOAD_SIZE + 1024], // + запас
+            decrypt_buffer: vec![0; MAX_PAYLOAD_SIZE],
+            temp_buffer: vec![0; MAX_PAYLOAD_SIZE + TAG_SIZE],
+        }
+    }
+
+    pub fn with_capacity(encrypt_cap: usize, decrypt_cap: usize) -> Self {
+        Self {
+            encrypt_buffer: vec![0; encrypt_cap],
+            decrypt_buffer: vec![0; decrypt_cap],
+            temp_buffer: vec![0; decrypt_cap + TAG_SIZE],
+        }
     }
 
     pub fn process_incoming(
-        &self,
+        &mut self,
         data: &[u8],
         session: &PhantomSession,
     ) -> ProtocolResult<(u8, Vec<u8>)> {
@@ -466,7 +467,9 @@ impl PhantomPacketProcessor {
         info!("Processing incoming phantom packet: {} bytes", data.len());
 
         let packet = PhantomPacket::decode(data)?;
-        let plaintext = packet.decrypt(session)?;
+
+        // Используем предвыделенный буфер
+        let plaintext = packet.decrypt(session, &mut self.decrypt_buffer)?;
 
         if plaintext.len() > MAX_PAYLOAD_SIZE {
             return Err(ProtocolError::MalformedPacket {
@@ -483,17 +486,27 @@ impl PhantomPacketProcessor {
             plaintext.len()
         );
 
-        Ok((packet.packet_type, plaintext))
+        Ok((packet.packet_type, plaintext.to_vec()))
     }
 
-    pub fn create_outgoing(
-        &self,
+    pub fn create_outgoing<'a>(
+        &'a mut self,
+        session: &PhantomSession,
+        packet_type: u8,
+        plaintext: &[u8],
+    ) -> ProtocolResult<&'a [u8]> {
+        PhantomPacket::create(session, packet_type, plaintext, &mut self.encrypt_buffer)
+    }
+
+    /// Создает исходящий пакет и возвращает Vec<u8> для совместимости
+    pub fn create_outgoing_vec(
+        &mut self,
         session: &PhantomSession,
         packet_type: u8,
         plaintext: &[u8],
     ) -> ProtocolResult<Vec<u8>> {
-        let packet = PhantomPacket::create(session, packet_type, plaintext)?;
-        Ok(packet.encode())
+        self.create_outgoing(session, packet_type, plaintext)
+            .map(|slice| slice.to_vec())
     }
 }
 

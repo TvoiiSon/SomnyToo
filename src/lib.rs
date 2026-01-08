@@ -119,7 +119,6 @@ pub mod core {
         pub mod init;
         pub mod utils;
         pub mod metrics {
-            pub mod instance;
             pub mod metrics;
             pub mod monitoring;
         }

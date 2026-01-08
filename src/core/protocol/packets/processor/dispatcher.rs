@@ -64,8 +64,8 @@ impl Dispatcher {
         _client_ip: SocketAddr
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
         // Используем фантомный пакетный процессор напрямую
-        let processor = PhantomPacketProcessor::new();
-        let result = processor.create_outgoing(&ctx, packet_type, &payload)?;
+        let mut processor = PhantomPacketProcessor::new();
+        let result = processor.create_outgoing_vec(&ctx, packet_type, &payload)?;
         Ok(result)
     }
 
@@ -159,9 +159,9 @@ impl DispatcherWorker {
                 if let Err(e) = work.reply.send(encrypted_response) {
                     info!("Failed to send phantom response: {:?}", e);
                 }
-                let send_time = send_start.elapsed();
+                let _send_time = send_start.elapsed();
 
-                trace!("Phantom response send time: {:?}", send_time);
+                trace!("Phantom response sent");
             }
             Err(e) => {
                 error!("Phantom pipeline processing failed: {}", e);
