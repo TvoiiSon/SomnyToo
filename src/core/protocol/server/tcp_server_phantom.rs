@@ -9,6 +9,8 @@ use crate::core::protocol::phantom_crypto::handshake::{perform_phantom_handshake
 use crate::core::protocol::server::security::rate_limiter::instance::RATE_LIMITER;
 use crate::config::PhantomConfig;
 use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
+// Добавляем импорт PhantomPacketService
+use crate::core::protocol::packets::processor::packet_service::PhantomPacketService;
 
 pub async fn handle_phantom_connection(
     mut stream: TcpStream,
@@ -17,7 +19,9 @@ pub async fn handle_phantom_connection(
     session_manager: Arc<crate::core::protocol::server::session_manager_phantom::PhantomSessionManager>,
     connection_manager: Arc<crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager>,
     crypto_pool: Arc<crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool>,
-    heartbeat_manager: Arc<ConnectionHeartbeatManager>, // Добавляем heartbeat_manager
+    heartbeat_manager: Arc<ConnectionHeartbeatManager>,
+    // Добавляем PhantomPacketService в параметры
+    packet_service: Arc<PhantomPacketService>,
 ) -> anyhow::Result<()> {
     let connection_start = Instant::now();
     info!(target: "server", "👻 {} attempting phantom connection", peer);
@@ -92,7 +96,8 @@ pub async fn handle_phantom_connection(
         crypto_pool,
         session_manager.clone(),
         connection_manager.clone(),
-        heartbeat_manager.clone(), // Передаем heartbeat_manager
+        heartbeat_manager.clone(),
+        packet_service.clone(), // Передаем packet_service
     ).await;
 
     // Запускаем задачу для обработки heartbeat сообщений

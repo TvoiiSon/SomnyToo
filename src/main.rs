@@ -15,6 +15,9 @@ use somnytoo::core::protocol::server::heartbeat::manager::{HeartbeatManager, Hea
 use somnytoo::core::protocol::server::heartbeat::sender::HeartbeatSender;
 use somnytoo::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
 
+// Импортируем PhantomPacketService
+use somnytoo::core::protocol::packets::processor::packet_service::PhantomPacketService;
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let app_config = AppConfig::from_env();
@@ -76,6 +79,14 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
 
     info!("💓 Heartbeat system initialized successfully");
 
+    // Создаем PhantomPacketService
+    info!("📦 Initializing PhantomPacketService...");
+    let packet_service = Arc::new(PhantomPacketService::new(
+        phantom_session_manager.clone(),
+        heartbeat_system.clone(),
+    ));
+    info!("✅ PhantomPacketService initialized");
+
     info!("🎯 Server is ready and accepting phantom connections");
 
     // Запуск сервера
@@ -85,7 +96,8 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         phantom_session_manager,
         phantom_connection_manager,
         phantom_crypto_pool,
-        heartbeat_system, // Передаем heartbeat систему
+        heartbeat_system,
+        packet_service, // Добавляем packet_service
     ).await
 }
 
@@ -138,7 +150,8 @@ async fn start_phantom_server(
     session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
     crypto_pool: Arc<PhantomCryptoPool>,
-    heartbeat_manager: Arc<ConnectionHeartbeatManager>, // Добавляем параметр
+    heartbeat_manager: Arc<ConnectionHeartbeatManager>,
+    packet_service: Arc<PhantomPacketService>, // Добавляем packet_service
 ) -> Result<()> {
     let addr = server_config.get_addr();
     let listener = TcpListener::bind(&addr).await?;
@@ -157,6 +170,9 @@ async fn start_phantom_server(
     info!("  - Active sessions: {}", stats.active_sessions);
     info!("  - Monitor alerts: {}", stats.monitor_alerts);
 
+    // Выводим информацию о packet service
+    info!("📦 Packet Service initialized");
+
     loop {
         let (stream, _) = listener.accept().await?;
         let peer = stream.peer_addr().unwrap_or_else(|_| "0.0.0.0:0".parse().unwrap());
@@ -165,7 +181,8 @@ async fn start_phantom_server(
         let connection_manager = connection_manager.clone();
         let crypto_pool = crypto_pool.clone();
         let phantom_config = phantom_config.clone();
-        let heartbeat_manager = heartbeat_manager.clone(); // Клонируем heartbeat manager
+        let heartbeat_manager = heartbeat_manager.clone();
+        let packet_service = packet_service.clone(); // Клонируем packet_service
 
         tokio::spawn(async move {
             info!(target: "server", "👻 New phantom connection from {}", peer);
@@ -177,7 +194,8 @@ async fn start_phantom_server(
                 session_manager,
                 connection_manager,
                 crypto_pool,
-                heartbeat_manager, // Передаем в обработчик соединения
+                heartbeat_manager,
+                packet_service, // Передаем packet_service
             ).await {
                 Ok(()) => {
                     info!(target: "server", "👻 Phantom connection with {} closed cleanly", peer);

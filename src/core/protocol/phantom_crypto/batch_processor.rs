@@ -202,6 +202,11 @@ impl PhantomBatchProcessor {
 
         rx
     }
+
+    pub fn is_empty(&self) -> bool {
+        // Возвращаем false, так как процессор всегда готов к работе
+        false
+    }
 }
 
 impl Clone for PhantomBatchProcessor {

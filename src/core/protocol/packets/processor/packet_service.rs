@@ -6,6 +6,7 @@ use std::time::{Instant, Duration};
 // Заменяем SessionKeys на PhantomSession
 use crate::core::protocol::phantom_crypto::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
+use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
 
 pub struct PacketProcessingResult {
     pub response: Vec<u8>,
@@ -14,22 +15,27 @@ pub struct PacketProcessingResult {
 
 pub struct PhantomPacketService {
     phantom_session_manager: Arc<PhantomSessionManager>,
+    heartbeat_manager: Arc<ConnectionHeartbeatManager>,
 }
 
 impl PhantomPacketService {
-    pub fn new(phantom_session_manager: Arc<PhantomSessionManager>) -> Self {
+    pub fn new(
+        phantom_session_manager: Arc<PhantomSessionManager>,
+        heartbeat_manager: Arc<ConnectionHeartbeatManager>,
+    ) -> Self {
         Self {
             phantom_session_manager,
+            heartbeat_manager,
         }
     }
 
     pub async fn process_packet(
         &self,
-        session: Arc<PhantomSession>,  // PhantomSession вместо SessionKeys
-        packet_type: u8,  // Просто u8 вместо PacketType enum
+        session: Arc<PhantomSession>,
+        packet_type: u8,
         payload: Vec<u8>,
         client_ip: SocketAddr,
-    ) -> Result<PacketProcessingResult, Box<dyn std::error::Error>> {
+    ) -> Result<PacketProcessingResult, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
         let process_start = Instant::now();
         info!("Processing phantom packet type: 0x{:02X} from {}, session: {}",
               packet_type, client_ip, hex::encode(session.session_id()));
@@ -39,12 +45,13 @@ impl PhantomPacketService {
         let response_data = match packet_type {
             0x01 => { // Ping packet
                 let ping_start = Instant::now();
-                let result = self.handle_ping(payload).await?;
+                let result = self.handle_ping(payload, session.clone(), client_ip).await?;
                 let ping_time = ping_start.elapsed();
                 debug!("Ping processing took {:?}", ping_time);
                 result
             }
             0x10 => { // Heartbeat packet
+                // Heartbeat уже обрабатывается в connection_manager_phantom
                 let heartbeat_start = Instant::now();
                 let result = self.handle_heartbeat(session.session_id(), client_ip).await?;
                 let heartbeat_time = heartbeat_start.elapsed();
@@ -53,7 +60,7 @@ impl PhantomPacketService {
             }
             _ => {
                 let unknown_start = Instant::now();
-                let result = self.handle_unknown_packet(packet_type).await?;
+                let result = self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?;
                 let unknown_time = unknown_start.elapsed();
                 warn!("Unknown packet processing took {:?}", unknown_time);
                 result
@@ -72,9 +79,24 @@ impl PhantomPacketService {
         })
     }
 
-    async fn handle_ping(&self, _payload: Vec<u8>) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    async fn handle_ping(
+        &self,
+        payload: Vec<u8>,
+        session: Arc<PhantomSession>,
+        client_ip: SocketAddr,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
         let start = Instant::now();
-        info!("Processing Ping packet");
+        info!("👻 Ping packet received from {}: {} ({} bytes)",
+              client_ip, String::from_utf8_lossy(&payload), payload.len());
+
+        // Отправляем алерт в heartbeat_manager
+        self.heartbeat_manager.send_custom_alert(
+            crate::core::monitoring::unified_monitor::AlertLevel::Info,
+            "phantom_packet",
+            &format!("Ping packet received from {} for session {}",
+                     client_ip, hex::encode(session.session_id()))
+        ).await;
+
         let result = b"PONG".to_vec();
         let elapsed = start.elapsed();
 
@@ -89,7 +111,7 @@ impl PhantomPacketService {
         &self,
         session_id: &[u8],
         client_ip: SocketAddr,
-    ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
         let start = Instant::now();
         info!("Processing phantom heartbeat from {} session: {}",
               client_ip, hex::encode(session_id));
@@ -112,8 +134,24 @@ impl PhantomPacketService {
         Ok(heartbeat_result)
     }
 
-    async fn handle_unknown_packet(&self, packet_type: u8) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        error!("Unknown phantom packet type: 0x{:02X}", packet_type);
+    async fn handle_unknown_packet(
+        &self,
+        packet_type: u8,
+        _payload: Vec<u8>,
+        session: Arc<PhantomSession>,
+        client_ip: SocketAddr,
+    ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> { // Добавляем Send + Sync
+        error!("Unknown phantom packet type: 0x{:02X} from {}, session: {}",
+               packet_type, client_ip, hex::encode(session.session_id()));
+
+        // Отправляем алерт о неизвестном пакете
+        self.heartbeat_manager.send_custom_alert(
+            crate::core::monitoring::unified_monitor::AlertLevel::Warning,
+            "unknown_packet",
+            &format!("Unknown packet type 0x{:02X} from {} for session {}",
+                     packet_type, client_ip, hex::encode(session.session_id()))
+        ).await;
+
         Ok(format!("Unknown phantom packet type: 0x{:02X}", packet_type).into_bytes())
     }
 }
@@ -123,6 +161,7 @@ impl Clone for PhantomPacketService {
     fn clone(&self) -> Self {
         Self {
             phantom_session_manager: Arc::clone(&self.phantom_session_manager),
+            heartbeat_manager: Arc::clone(&self.heartbeat_manager),
         }
     }
 }
