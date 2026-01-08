@@ -4,7 +4,6 @@ use tokio::sync::{mpsc, oneshot, Mutex};
 use tokio::time::Instant;
 use tracing::{info, error, warn, trace};
 
-// Заменяем старые импорты на фантомные
 use crate::core::protocol::phantom_crypto::keys::PhantomSession;
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
@@ -19,7 +18,7 @@ use super::priority::Priority;
 use super::packet_service::PhantomPacketService;
 
 pub struct Work {
-    pub ctx: Arc<PhantomSession>,  // Заменяем SessionKeys на PhantomSession
+    pub ctx: Arc<PhantomSession>,
     pub raw_payload: Vec<u8>,
     pub client_ip: SocketAddr,
     pub reply: oneshot::Sender<Vec<u8>>,
@@ -37,15 +36,15 @@ impl Dispatcher {
     pub fn spawn(
         num_workers: usize,
         phantom_crypto_pool: Arc<PhantomCryptoPool>,
-        phantom_packet_service: Arc<PhantomPacketService>,  // Добавляем сервис
+        phantom_packet_service: Arc<PhantomPacketService>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Work>(65536);
         let rx = Arc::new(Mutex::new(rx));
 
         for _ in 0..num_workers {
             let rx = Arc::clone(&rx);
-            let phantom_crypto_pool = phantom_crypto_pool.clone();
-            let phantom_packet_service = phantom_packet_service.clone();  // Клонируем сервис
+            let phantom_crypto_pool = Arc::clone(&phantom_crypto_pool);
+            let phantom_packet_service = Arc::clone(&phantom_packet_service);
 
             tokio::spawn(async move {
                 let mut worker = DispatcherWorker::new(rx, phantom_crypto_pool, phantom_packet_service);
@@ -63,8 +62,7 @@ impl Dispatcher {
         payload: Vec<u8>,
         _client_ip: SocketAddr
     ) -> Result<Vec<u8>, Box<dyn std::error::Error>> {
-        // Используем фантомный пакетный процессор напрямую
-        let mut processor = PhantomPacketProcessor::new();
+        let processor = PhantomPacketProcessor::new();
         let result = processor.create_outgoing_vec(&ctx, packet_type, &payload)?;
         Ok(result)
     }
@@ -125,7 +123,7 @@ impl DispatcherWorker {
 
         // Создаем pipeline для обработки фантомного пакета
         let pipeline_start = Instant::now();
-        // Создаем pipeline с PhantomPacketService
+
         let pipeline = PipelineOrchestrator::new()
             .add_stage(PhantomDecryptionStage::new(self.phantom_crypto_pool.clone()))
             .add_stage(PhantomProcessingStage::new(

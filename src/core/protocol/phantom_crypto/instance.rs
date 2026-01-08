@@ -12,7 +12,11 @@ pub struct PhantomCrypto {
 
 impl PhantomCrypto {
     pub fn new() -> Self {
-        let runtime = PhantomRuntime::new();
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        let runtime = PhantomRuntime::new(num_workers);
         let scatterer = MemoryScatterer::new();
 
         Self {
@@ -35,6 +39,11 @@ impl PhantomCrypto {
     pub fn runtime(&self) -> &PhantomRuntime {
         &self.runtime
     }
+
+    /// Получает scatterer
+    pub fn scatterer(&self) -> &MemoryScatterer {
+        &self.scatterer
+    }
 }
 
 /// Конфигурация фантомной системы
@@ -53,5 +62,11 @@ impl Default for PhantomConfig {
             enable_hardware_acceleration: true,
             constant_time_enforced: true,
         }
+    }
+}
+
+impl Default for PhantomCrypto {
+    fn default() -> Self {
+        Self::new()
     }
 }

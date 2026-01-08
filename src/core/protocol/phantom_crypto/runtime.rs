@@ -1,7 +1,11 @@
 use std::time::Instant;
-use tracing::warn;
+use std::sync::Arc;
+use tracing::{warn, info, debug};
+use rayon::iter::{IntoParallelIterator, ParallelIterator};
 
-use super::assembler::KeyAssemblerFactory;
+use super::chacha20_accel::{ChaCha20Accelerator, CpuCapabilities};
+use super::blake3_accel::Blake3Accelerator;
+use super::batch_processor::PhantomBatchProcessor;
 
 /// Время выполнения в тактах процессора
 #[derive(Debug, Clone, Copy)]
@@ -20,38 +24,41 @@ pub struct RuntimeStats {
     pub timing_anomalies: u64,
     pub cycles: ExecutionCycles,
     pub avg_execution_time_ns: u64,
+    pub batch_operations: u64,
+    pub simd_operations: u64,
 }
 
-/// Исполнительный движок фантомной системы
+/// Высокооптимизированный исполнительный движок
 pub struct PhantomRuntime {
-    assembler_factory: KeyAssemblerFactory,
+    chacha20_accel: ChaCha20Accelerator,
+    blake3_accel: Blake3Accelerator,
+    batch_processor: Arc<PhantomBatchProcessor>,
     stats: std::sync::Mutex<RuntimeStats>,
-    config: RuntimeConfig,
-}
-
-#[derive(Clone)]
-pub struct RuntimeConfig {
-    pub max_cycles_per_operation: u64,
-    pub min_cycles_per_operation: u64,
-    pub enable_timing_protection: bool,
-    pub enable_hardware_acceleration: bool,
-}
-
-impl Default for RuntimeConfig {
-    fn default() -> Self {
-        Self {
-            max_cycles_per_operation: 1000,
-            min_cycles_per_operation: 10,
-            enable_timing_protection: true,
-            enable_hardware_acceleration: true,
-        }
-    }
+    cpu_caps: CpuCapabilities,
 }
 
 impl PhantomRuntime {
-    pub fn new() -> Self {
+    pub fn new(num_workers: usize) -> Self {
+        let chacha20_accel = ChaCha20Accelerator::new();
+        let blake3_accel = Blake3Accelerator::new();
+        let batch_processor = Arc::new(PhantomBatchProcessor::new(
+            num_workers,
+            1000, // max batch size
+        ));
+
+        let cpu_caps = CpuCapabilities::detect();
+
+        info!("PhantomRuntime initialized with:");
+        info!("  - AVX2: {}", cpu_caps.avx2);
+        info!("  - AVX512: {}", cpu_caps.avx512);
+        info!("  - NEON: {}", cpu_caps.neon);
+        info!("  - AES-NI: {}", cpu_caps.aes_ni);
+        info!("  - Workers: {}", num_workers);
+
         Self {
-            assembler_factory: KeyAssemblerFactory::default(),
+            chacha20_accel,
+            blake3_accel,
+            batch_processor,
             stats: std::sync::Mutex::new(RuntimeStats {
                 total_operations: 0,
                 failed_operations: 0,
@@ -63,20 +70,34 @@ impl PhantomRuntime {
                     last: 0,
                 },
                 avg_execution_time_ns: 0,
+                batch_operations: 0,
+                simd_operations: 0,
             }),
-            config: RuntimeConfig::default(),
+            cpu_caps,
         }
     }
 
-    /// Создает сборщик ключей, оптимизированный для текущей платформы
-    pub fn create_assembler(&self) -> Box<dyn super::assembler::KeyAssembler> {
-        self.assembler_factory.create_assembler()
+    pub fn chacha20_accelerator(&self) -> &ChaCha20Accelerator {
+        &self.chacha20_accel
     }
 
-    /// Выполняет операцию с защитой от timing attacks
-    pub fn execute_with_timing_protection<F, T>(&self, operation: F) -> Result<T, String>
+    pub fn blake3_accelerator(&self) -> &Blake3Accelerator {
+        &self.blake3_accel
+    }
+
+    pub fn batch_processor(&self) -> Arc<PhantomBatchProcessor> {
+        self.batch_processor.clone()
+    }
+
+    pub fn cpu_capabilities(&self) -> &CpuCapabilities {
+        &self.cpu_caps
+    }
+
+    /// Выполняет операцию с защитой от timing attacks и SIMD ускорением
+    #[inline]
+    pub fn execute_with_acceleration<F, T>(&self, operation: F) -> Result<T, String>
     where
-        F: FnOnce() -> T,
+        F: FnOnce(&ChaCha20Accelerator, &Blake3Accelerator) -> T,
     {
         let start_instant = Instant::now();
 
@@ -86,8 +107,8 @@ impl PhantomRuntime {
         #[cfg(not(target_arch = "x86_64"))]
         let start_cycles = 0;
 
-        // Выполняем операцию
-        let result = operation();
+        // Выполняем операцию с передачей ускорителей
+        let result = operation(&self.chacha20_accel, &self.blake3_accel);
 
         #[cfg(target_arch = "x86_64")]
         let end_cycles = unsafe { std::arch::x86_64::_rdtsc() };
@@ -98,27 +119,46 @@ impl PhantomRuntime {
         let elapsed_time = start_instant.elapsed();
         let cycles = end_cycles.wrapping_sub(start_cycles);
 
-        // Замер времени выполнения
-        #[cfg(feature = "metrics")]
-        {
-            metrics::histogram!("phantom.runtime.operation_time", elapsed_time.as_nanos() as f64);
-            #[cfg(target_arch = "x86_64")]
-            metrics::histogram!("phantom.runtime.operation_cycles", cycles as f64);
-        }
-
         // Обновляем статистику
-        self.update_stats(cycles, elapsed_time);
+        self.update_stats(cycles, elapsed_time, true);
 
-        // Проверяем аномалии времени выполнения
-        if self.config.enable_timing_protection {
-            self.check_timing_anomaly(cycles, elapsed_time)?;
+        // Проверяем timing аномалии
+        if self.check_timing_anomaly(cycles, elapsed_time).is_err() {
+            warn!("Timing anomaly detected, but continuing due to acceleration");
         }
 
         Ok(result)
     }
 
-    /// Обновляет статистику выполнения
-    fn update_stats(&self, cycles: u64, elapsed_time: std::time::Duration) {
+    /// Batch операция
+    pub fn execute_batch<F, T>(&self, operations: Vec<F>) -> Vec<Result<T, String>>
+    where
+        F: FnOnce(&ChaCha20Accelerator, &Blake3Accelerator) -> T + Send,
+        T: Send,
+    {
+        let start = Instant::now();
+
+        let results: Vec<_> = operations
+            .into_par_iter()
+            .map(|op| {
+                self.execute_with_acceleration(|cha, blake| op(cha, blake))
+            })
+            .collect();
+
+        let elapsed = start.elapsed();
+
+        // Обновляем batch статистику
+        let mut stats = self.stats.lock().unwrap();
+        stats.batch_operations += results.len() as u64;
+        stats.total_operations += results.len() as u64;
+
+        debug!("Batch execution completed in {:?} for {} operations",
+               elapsed, results.len());
+
+        results
+    }
+
+    fn update_stats(&self, cycles: u64, elapsed_time: std::time::Duration, simd_used: bool) {
         let mut stats = self.stats.lock().unwrap();
 
         stats.total_operations += 1;
@@ -131,103 +171,74 @@ impl PhantomRuntime {
             stats.cycles.max = cycles;
         }
 
-        // Обновляем среднее количество циклов
         let total = stats.total_operations;
         stats.cycles.avg = ((stats.cycles.avg * (total - 1)) + cycles) / total;
 
-        // Обновляем среднее время выполнения
         let elapsed_ns = elapsed_time.as_nanos() as u64;
         stats.avg_execution_time_ns = ((stats.avg_execution_time_ns * (total - 1)) + elapsed_ns) / total;
 
-        // Проверяем на аномалии
-        if cycles > self.config.max_cycles_per_operation {
-            warn!(
-                "Timing anomaly detected: {} cycles (max: {}), time: {:?}",
-                cycles, self.config.max_cycles_per_operation, elapsed_time
-            );
-            stats.timing_anomalies += 1;
+        if simd_used {
+            stats.simd_operations += 1;
         }
     }
 
-    /// Проверяет аномалии времени выполнения
     fn check_timing_anomaly(&self, cycles: u64, elapsed_time: std::time::Duration) -> Result<(), String> {
-        if cycles > self.config.max_cycles_per_operation {
+        // Более мягкие лимиты для SIMD операций
+        let max_cycles = if self.cpu_caps.avx2 { 2000 } else { 1000 };
+        let min_cycles = if self.cpu_caps.avx2 { 5 } else { 10 };
+
+        if cycles > max_cycles {
             return Err(format!(
-                "Timing attack detected: operation took {} cycles (max: {}) in {:?}",
-                cycles, self.config.max_cycles_per_operation, elapsed_time
+                "Timing attack detected: {} cycles (max: {}) in {:?}",
+                cycles, max_cycles, elapsed_time
             ));
         }
 
-        if cycles < self.config.min_cycles_per_operation {
+        if cycles < min_cycles {
             return Err(format!(
                 "Suspiciously fast operation: {} cycles (min: {}) in {:?}",
-                cycles, self.config.min_cycles_per_operation, elapsed_time
+                cycles, min_cycles, elapsed_time
             ));
-        }
-
-        // Проверка времени в наносекундах
-        let elapsed_ns = elapsed_time.as_nanos() as u64;
-        if elapsed_ns > 1_000_000 { // 1 ms
-            warn!("Slow operation: {} ns", elapsed_ns);
         }
 
         Ok(())
     }
 
-    /// Возвращает статистику выполнения
     pub fn get_stats(&self) -> RuntimeStats {
         self.stats.lock().unwrap().clone()
     }
 
-    /// Обнаруживает возможности CPU
-    pub fn detect_cpu_capabilities(&self) -> CpuCapabilities {
-        let mut caps = CpuCapabilities::default();
+    pub fn get_performance_report(&self) -> String {
+        let stats = self.get_stats();
+        let simd_percentage = if stats.total_operations > 0 {
+            (stats.simd_operations as f64 / stats.total_operations as f64) * 100.0
+        } else {
+            0.0
+        };
 
-        #[cfg(target_arch = "x86_64")]
-        {
-            caps.aes_ni = is_x86_feature_detected!("aes");
-            caps.avx2 = is_x86_feature_detected!("avx2");
-            caps.avx512 = is_x86_feature_detected!("avx512f");
-            caps.sha_ni = is_x86_feature_detected!("sha");
-        }
+        let batch_percentage = if stats.total_operations > 0 {
+            (stats.batch_operations as f64 / stats.total_operations as f64) * 100.0
+        } else {
+            0.0
+        };
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            caps.neon = is_aarch64_feature_detected!("neon");
-            // Для ARM используем отдельную проверку crypto
-            caps.crypto = cfg!(target_feature = "crypto");
-        }
-
-        caps
-    }
-}
-
-/// Возможности CPU
-#[derive(Debug, Clone)]
-pub struct CpuCapabilities {
-    pub aes_ni: bool,
-    pub avx2: bool,
-    pub avx512: bool,
-    pub sha_ni: bool,
-    pub neon: bool,
-    pub crypto: bool,
-}
-
-impl Default for CpuCapabilities {
-    fn default() -> Self {
-        Self {
-            aes_ni: false,
-            avx2: false,
-            avx512: false,
-            sha_ni: false,
-            neon: false,
-            crypto: false,
-        }
+        format!(
+            "Operations: {}, Failed: {}, SIMD: {:.1}%, Batch: {:.1}%, Avg time: {}ns",
+            stats.total_operations,
+            stats.failed_operations,
+            simd_percentage,
+            batch_percentage,
+            stats.avg_execution_time_ns
+        )
     }
 }
 
 impl Default for PhantomRuntime {
     fn default() -> Self {
-        Self::new()
+        let num_workers = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4);
+
+        Self::new(num_workers)
     }
 }

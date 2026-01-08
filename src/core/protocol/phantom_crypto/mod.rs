@@ -8,3 +8,8 @@ pub mod runtime;
 pub mod handshake;
 pub mod packet;
 pub mod instance;
+pub mod chacha20_accel;
+pub mod blake3_accel;
+pub mod batch_processor;
+pub mod buffer_pool;
+pub mod packet_batch;
