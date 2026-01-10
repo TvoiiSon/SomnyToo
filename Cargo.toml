@@ -1,6 +1,6 @@
 [package]
 name = "somnytoo"
-version = "1.1.1"
+version = "1.1.2"
 authors = ["TvoiiSon tvoiison.dev@gmail.com"]
 license = "AGPL-3.0-only"
 description = "Binary protocol server for secure communications"

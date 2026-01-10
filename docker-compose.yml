@@ -1,0 +1,110 @@
+version: '3.8'
+
+x-app-defaults: &app-defaults
+  build:
+    context: .
+    dockerfile: Dockerfile
+    target: runtime
+  restart: unless-stopped
+  stop_grace_period: 30s
+  logging:
+    driver: "json-file"
+    options:
+      max-size: "10m"
+      max-file: "3"
+
+services:
+  # PostgreSQL база данных
+  postgres:
+    image: postgres:15-alpine
+    container_name: somnytoo-postgres
+    environment:
+      POSTGRES_USER: root
+      POSTGRES_PASSWORD: 1234
+      POSTGRES_DB: tvoiisonsecrets
+      POSTGRES_INITDB_ARGS: "--data-checksums"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - "5432:5432"
+    networks:
+      - somnytoo-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U root -d tvoiisonsecrets"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+    # Оптимизация безопасности
+    security_opt:
+      - no-new-privileges:true
+
+  # Основное приложение
+  app:
+    <<: *app-defaults
+    container_name: somnytoo-app
+    ports:
+      - "8000:8000"
+    environment:
+      # Основные настройки (из вашего .env)
+      DATABASE_URL: postgres://root:1234@postgres:5432/tvoiisonsecrets?options=-c%20search_path=tvoiisonsecrets
+      SERVER_HOST: 0.0.0.0
+      SERVER_PORT: 8000
+      LOG_LEVEL: info
+
+      # Настройки базы данных
+      DB_MAX_CONNECTIONS: 50
+      DB_MIN_CONNECTIONS: 10
+      DB_CONNECTION_TIMEOUT: 30
+      DB_ACQUIRE_TIMEOUT: 5
+      DB_IDLE_TIMEOUT: 300
+      DB_MAX_LIFETIME: 1800
+      DB_STATEMENT_CACHE_SIZE: 1000
+      DB_CONNECT_RETRIES: 3
+
+      # Настройки безопасности
+      MAX_REQUESTS_PER_MINUTE: 1000
+      QUERY_TIMEOUT_MS: 5000
+      MAX_QUERY_LENGTH: 1048576
+      ENABLE_SQL_INJECTION_PROTECTION: true
+      ENABLE_RATE_LIMITING: true
+
+      # Настройки скейлинга
+      ENABLE_AUTO_SCALING: true
+      MAX_REPLICAS: 10
+      MIN_REPLICAS: 1
+      SCALE_UP_CPU_THRESHOLD: 80.0
+      SCALE_DOWN_CPU_THRESHOLD: 30.0
+      SCALE_UP_CONNECTIONS_THRESHOLD: 1000
+      SCALE_CHECK_INTERVAL_SECONDS: 60
+
+      # Настройки кэширования
+      ENABLE_QUERY_CACHE: true
+      QUERY_CACHE_SIZE: 10000
+      QUERY_CACHE_TTL_SECONDS: 300
+      ENABLE_PREPARED_STATEMENTS: true
+      PREPARED_STATEMENTS_CACHE_SIZE: 1000
+
+      # Оптимизация Rust runtime
+      RUST_BACKTRACE: 0
+      MALLOC_ARENA_MAX: 2
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - somnytoo-network
+    # Оптимизация безопасности
+    security_opt:
+      - no-new-privileges:true
+    read_only: true
+    tmpfs:
+      - /tmp
+
+networks:
+  somnytoo-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+    driver: local
