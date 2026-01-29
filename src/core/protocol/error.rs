@@ -10,6 +10,12 @@ pub enum ProtocolError {
         source: CryptoError,
     },
 
+    // Добавьте этот вариант:
+    #[error("IO error: {details}")]
+    IoError {
+        details: String,
+    },
+
     #[error("👻 IO error: {0}")]
     Io(String),
 

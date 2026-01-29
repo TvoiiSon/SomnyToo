@@ -1,15 +1,52 @@
-use tokio::io::{AsyncWrite, AsyncWriteExt};
+use std::time::Duration;
+use tokio::io::AsyncWriteExt;
+use tokio::time::timeout;
+use tracing::debug;
 
-/// Функция для записи «кадра» (frame) в поток
-/// Кадр имеет формат: 4 байта длины (big-endian) + payload
-pub async fn write_frame<W>(writer: &mut W, data: &[u8]) -> anyhow::Result<()>
-where
-    W: AsyncWrite + Unpin, // writer должен поддерживать асинхронную запись и быть «развёртываемым»
-{
-    // переводим длину данных в 4 байта big-endian
-    let len = (data.len() as u32).to_be_bytes();
-    writer.write_all(&len).await?; // записываем длину
-    writer.write_all(data).await?; // записываем сам payload
-    writer.flush().await?;         // убеждаемся, что данные реально ушли в поток
-    Ok(())                                // возвращаем успех
+use crate::core::protocol::error::{ProtocolResult, ProtocolError};
+
+pub async fn write_frame<W: AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    data: &[u8],
+) -> ProtocolResult<()> {
+    let header = (data.len() as u32).to_be_bytes();
+
+    match timeout(Duration::from_secs(5), writer.write_all(&header)).await {
+        Ok(result) => match result {
+            Ok(_) => {},
+            Err(e) => return Err(ProtocolError::MalformedPacket {
+                details: format!("IO error: {}", e)
+            }),
+        },
+        Err(_) => return Err(ProtocolError::Timeout {
+            duration: Duration::from_secs(5)
+        }),
+    }
+
+    match timeout(Duration::from_secs(5), writer.write_all(data)).await {
+        Ok(result) => match result {
+            Ok(_) => {},
+            Err(e) => return Err(ProtocolError::MalformedPacket {
+                details: format!("IO error: {}", e)
+            }),
+        },
+        Err(_) => return Err(ProtocolError::Timeout {
+            duration: Duration::from_secs(5)
+        }),
+    }
+
+    match timeout(Duration::from_secs(5), writer.flush()).await {
+        Ok(result) => match result {
+            Ok(_) => {},
+            Err(e) => return Err(ProtocolError::MalformedPacket {
+                details: format!("IO error: {}", e)
+            }),
+        },
+        Err(_) => return Err(ProtocolError::Timeout {
+            duration: Duration::from_secs(5)
+        }),
+    }
+
+    debug!("Wrote frame of {} bytes", data.len());
+    Ok(())
 }

@@ -3,6 +3,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::sync::{RwLock, Mutex};
 use tracing::{info};
+use std::time::{Instant};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::heartbeat::manager::{HeartbeatManager, HeartbeatConfig};
@@ -11,8 +12,8 @@ use crate::core::protocol::server::connection_manager_phantom::PhantomConnection
 pub struct PhantomSessionEntry {
     pub session: Arc<PhantomSession>,
     pub addr: SocketAddr,
-    pub created_at: std::time::Instant,
-    pub last_activity: std::time::Instant,
+    pub created_at: Instant,
+    pub last_activity: Instant,
     pub operation_count: u64,
 }
 
@@ -34,6 +35,40 @@ impl PhantomSessionManager {
             connection_manager,
             cleanup_lock: Arc::new(Mutex::new(())),
         }
+    }
+
+    pub async fn add_session(&self, session_id: &[u8], session: Arc<PhantomSession>) {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(
+            session_id.to_vec(),
+            PhantomSessionEntry {
+                session,
+                addr: "0.0.0.0:0".parse().unwrap(), // Добавляем значение по умолчанию
+                created_at: Instant::now(), // Добавляем текущее время
+                last_activity: Instant::now(),
+                operation_count: 0, // Инициализируем счетчик операций
+            },
+        );
+    }
+
+    pub async fn add_session_with_addr(
+        &self,
+        session_id: &[u8],
+        session: Arc<PhantomSession>,
+        addr: SocketAddr,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut sessions = self.sessions.write().await;
+        sessions.insert(
+            session_id.to_vec(),
+            PhantomSessionEntry {
+                session,
+                addr,
+                created_at: Instant::now(),
+                last_activity: Instant::now(),
+                operation_count: 0,
+            },
+        );
+        Ok(())
     }
 
     pub fn get_heartbeat_manager(&self) -> Arc<HeartbeatManager> {
