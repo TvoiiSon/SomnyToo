@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 use super::common::{PipelineStage, PipelineContext, StageError};
-use crate::core::protocol::packets::processor::packet_service::PhantomPacketService;
+use crate::core::protocol::packets::packet_service::PhantomPacketService;
 
 pub struct PhantomProcessingStage {
     packet_service: Arc<PhantomPacketService>,  // Используем PhantomPacketService

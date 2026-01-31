@@ -82,7 +82,7 @@ async fn client_phantom_handshake(
     client_hello.extend_from_slice(&client_pub_bytes);
     client_hello.extend_from_slice(&client_nonce);
 
-    crate::core::protocol::packets::encoder::frame_writer::write_frame(
+    crate::core::protocol::packets::frame_writer::write_frame(
         stream,
         &client_hello
     ).await?;
@@ -93,7 +93,7 @@ async fn client_phantom_handshake(
     let receive_start = Instant::now();
     let server_hello = tokio::time::timeout(
         Duration::from_secs(10),
-        crate::core::protocol::packets::decoder::frame_reader::read_frame(stream)
+        crate::core::protocol::packets::frame_reader::read_frame(stream)
     )
         .await
         .map_err(|_| ProtocolError::Timeout { duration: Duration::from_secs(10) })??;
@@ -184,7 +184,7 @@ async fn server_phantom_handshake(
 
     // 1. Читаем ClientHello
     let receive_start = Instant::now();
-    let client_hello = crate::core::protocol::packets::decoder::frame_reader::read_frame(stream)
+    let client_hello = crate::core::protocol::packets::frame_reader::read_frame(stream)
         .await?;
     let receive_time = receive_start.elapsed();
     stages_time.push(("clienthello_receive", receive_time));
@@ -242,7 +242,7 @@ async fn server_phantom_handshake(
     server_hello.extend_from_slice(&server_pub_bytes);
     server_hello.extend_from_slice(&server_nonce);
 
-    crate::core::protocol::packets::encoder::frame_writer::write_frame(
+    crate::core::protocol::packets::frame_writer::write_frame(
         stream,
         &server_hello
     ).await?;

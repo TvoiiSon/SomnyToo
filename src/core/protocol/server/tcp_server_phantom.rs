@@ -2,31 +2,26 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio::time::timeout;
-use tracing::{info, error, debug};
+use tracing::{info, error};
 
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
-use crate::core::protocol::packets::decoder::frame_reader;
-use crate::core::protocol::packets::encoder::frame_writer;
-use crate::core::protocol::packets::processor::dispatcher::Dispatcher;
-use crate::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
-use crate::core::protocol::packets::processor::packet_service::PhantomPacketService;
+use crate::core::protocol::server::batch_integration::PhantomBatchSystem;
 
 pub async fn handle_phantom_connection(
     mut stream: TcpStream,
     peer: std::net::SocketAddr,
     _phantom_config: crate::config::PhantomConfig,
     session_manager: Arc<PhantomSessionManager>,
-    _connection_manager: Arc<PhantomConnectionManager>,
-    crypto_pool: Arc<PhantomCryptoPool>,
-    _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
-    packet_service: Arc<PhantomPacketService>,
+    connection_manager: Arc<PhantomConnectionManager>,
+    _crypto_pool: Arc<crate::core::protocol::phantom_crypto::core::instance::PhantomCrypto>,
+    _heartbeat_manager: Arc<crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager>,
+    _packet_service: Arc<crate::core::protocol::packets::packet_service::PhantomPacketService>,
+    batch_system: Arc<PhantomBatchSystem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("👻 Handling phantom connection from {}", peer);
 
-    // Выполняем handshake с таймаутом
     let handshake_result = match timeout(
         Duration::from_secs(10),
         perform_phantom_handshake(&mut stream, HandshakeRole::Server)
@@ -49,108 +44,60 @@ pub async fn handle_phantom_connection(
     let session = Arc::new(handshake_result.session);
     let session_id = session.session_id().to_vec();
 
-    info!("✅ Phantom handshake completed for {} session: {}", 
+    info!("✅ Phantom handshake completed for {} session: {}",
           peer, hex::encode(&session_id));
 
-    // Используем метод с адресом (если он есть) или обычный
-    // Вариант 1: Если есть метод с адресом
+    // Регистрируем сессию
     if let Ok(_) = session_manager.add_session_with_addr(&session_id, session.clone(), peer).await {
         info!("Session registered with address");
-    }
-    // Вариант 2: Если нужно использовать старый метод
-    else {
+    } else {
         session_manager.add_session(&session_id, session.clone()).await;
     }
 
-    // Создаем диспетчер
-    let dispatcher = Arc::new(Dispatcher::spawn(
-        4,
-        crypto_pool.clone(),
-        packet_service.clone(),
-    ));
+    // Регистрируем соединение в batch системе
+    let (read_half, write_half) = stream.into_split();
 
-    // Основной цикл обработки пакетов
-    loop {
-        let frame_result = match timeout(
-            Duration::from_secs(30),
-            frame_reader::read_frame(&mut stream)
-        ).await {
-            Ok(result) => result,
-            Err(_) => {
-                debug!("Read timeout for {}, closing connection", peer);
-                break;
-            }
-        };
-
-        let frame = match frame_result {
-            Ok(frame) => frame,
-            Err(e) => {
-                error!("Failed to read frame from {}: {}", peer, e);
-                break;
-            }
-        };
-
-        if frame.is_empty() {
-            info!("Connection closed by {} (empty frame)", peer);
-            break;
-        }
-
-        debug!("Received {} bytes from {}", frame.len(), peer);
-
-        // Сохраняем копию для определения приоритета
-        let frame_copy = frame.clone();
-
-        let (tx, rx) = tokio::sync::oneshot::channel();
-
-        let work = crate::core::protocol::packets::processor::dispatcher::Work {
-            ctx: session.clone(),
-            raw_payload: frame,
-            client_ip: peer,
-            reply: tx,
-            received_at: tokio::time::Instant::now(),
-            priority: crate::core::protocol::packets::processor::priority::determine_priority(&frame_copy),
-        };
-
-        if let Err(e) = dispatcher.submit(work).await {
-            error!("Failed to submit work to dispatcher for {}: {}", peer, e);
-            continue;
-        }
-
-        let response = match timeout(Duration::from_secs(5), rx).await {
-            Ok(result) => match result {
-                Ok(response) => response,
-                Err(_) => {
-                    error!("Failed to receive response for {}", peer);
-                    continue;
-                }
-            },
-            Err(_) => {
-                debug!("Response timeout for {}", peer);
-                continue;
-            }
-        };
-
-        match timeout(
-            Duration::from_secs(5),
-            frame_writer::write_frame(&mut stream, &response)
-        ).await {
-            Ok(result) => {
-                if let Err(e) = result {
-                    error!("Failed to write frame to {}: {}", peer, e);
-                    break;
-                }
-            }
-            Err(_) => {
-                debug!("Write timeout for {}", peer);
-                break;
-            }
-        }
-
-        debug!("Sent {} bytes to {}", response.len(), peer);
+    // Регистрируем для batch чтения
+    if let Err(e) = batch_system.batch_reader.register_connection(
+        peer,
+        session_id.clone(),
+        Box::new(read_half),
+    ).await {
+        error!("Failed to register connection with batch reader: {}", e);
+        session_manager.force_remove_session(&session_id).await;
+        return Ok(());
     }
 
-    // Очистка - используем существующие методы
+    // Регистрируем для batch записи
+    if let Err(e) = batch_system.batch_writer.register_connection(
+        peer,
+        session_id.clone(),
+        Box::new(write_half),
+    ).await {
+        error!("Failed to register connection with batch writer: {}", e);
+        session_manager.force_remove_session(&session_id).await;
+        return Ok(());
+    }
+
+    // Регистрируем в connection manager для управления соединением
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
+    connection_manager.register_connection(session_id.clone(), shutdown_tx).await;
+
+    info!("✅ Phantom connection fully registered with batch system: {}", peer);
+
+    // Ждем команду на отключение или таймаут
+    tokio::select! {
+        _ = shutdown_rx.recv() => {
+            info!("Connection {} closed by manager", peer);
+        }
+        _ = tokio::time::sleep(Duration::from_secs(300)) => {
+            info!("Connection {} timeout", peer);
+        }
+    }
+
+    // Удаляем сессию
     session_manager.force_remove_session(&session_id).await;
+    connection_manager.unregister_connection(&session_id).await;
 
     info!("👻 Phantom connection with {} closed", peer);
     Ok(())

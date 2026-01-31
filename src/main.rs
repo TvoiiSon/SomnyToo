@@ -9,7 +9,9 @@ use somnytoo::config::{AppConfig, ServerConfig, PhantomConfig};
 use somnytoo::core::protocol::server::tcp_server_phantom::handle_phantom_connection;
 use somnytoo::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use somnytoo::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use somnytoo::core::protocol::crypto::crypto_pool_phantom::PhantomCryptoPool;
+// Исправляем импорт криптопулла
+use somnytoo::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
+use somnytoo::core::protocol::phantom_crypto::pool::PhantomCryptoPool;
 
 // Импортируем heartbeat компоненты
 use somnytoo::core::protocol::server::heartbeat::manager::{HeartbeatManager, HeartbeatConfig};
@@ -17,7 +19,10 @@ use somnytoo::core::protocol::server::heartbeat::sender::HeartbeatSender;
 use somnytoo::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
 
 // Импортируем PhantomPacketService
-use somnytoo::core::protocol::packets::processor::packet_service::PhantomPacketService;
+use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
+
+// Импортируем batch систему
+use somnytoo::core::protocol::server::batch_integration::PhantomBatchSystem;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -66,10 +71,16 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         phantom_connection_manager.clone()
     ));
 
-    // Инициализация криптопулла
-    let phantom_crypto_pool = Arc::new(PhantomCryptoPool::spawn(
-        num_cpus::get() // Используем количество ядер CPU
-    ));
+    // Инициализация криптопулла - исправление двойного Arc
+    let phantom_crypto = Arc::new(PhantomCrypto::new());
+    let phantom_crypto_pool = PhantomCryptoPool::spawn(
+        num_cpus::get(), // Используем количество ядер CPU
+        phantom_crypto.clone(),
+    );
+
+    // Получаем PhantomCrypto из пула для использования
+    let phantom_crypto_instance = phantom_crypto_pool.get_instance(0)
+        .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
 
     // Инициализация Heartbeat системы
     info!("💓 Initializing heartbeat system...");
@@ -88,6 +99,24 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
     ));
     info!("✅ PhantomPacketService initialized");
 
+    // Инициализация batch системы
+    info!("🚀 Initializing Batch System...");
+
+    // Создаем монитор для batch системы
+    use somnytoo::core::monitoring::unified_monitor::UnifiedMonitor;
+    use somnytoo::core::monitoring::config::MonitoringConfig;
+
+    let monitoring_config = MonitoringConfig::default();
+    let monitor = Arc::new(UnifiedMonitor::new(monitoring_config));
+
+    let batch_system = Arc::new(PhantomBatchSystem::new(
+        monitor.clone(), // Передаем монитор напрямую
+        phantom_session_manager.clone(),
+        phantom_crypto_instance.clone(),
+    ).await);
+
+    info!("✅ Batch System initialized");
+
     info!("🎯 Server is ready and accepting phantom connections");
 
     // Запуск сервера
@@ -95,10 +124,11 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         app_config.server,
         app_config.phantom,
         phantom_session_manager,
-        phantom_connection_manager,
+        phantom_connection_manager, // Исправлено: используем правильную переменную
         phantom_crypto_pool,
         heartbeat_system,
-        packet_service, // Добавляем packet_service
+        packet_service,
+        batch_system,
     ).await
 }
 
@@ -116,7 +146,7 @@ async fn initialize_heartbeat_system(
     // Создаем менеджер heartbeat для соединений
     let connection_heartbeat_manager = Arc::new(ConnectionHeartbeatManager::new(
         session_manager,
-        monitor,
+        monitor.clone(),
     ));
 
     // Создаем конфигурацию heartbeat
@@ -141,7 +171,7 @@ async fn initialize_heartbeat_system(
     heartbeat_sender.clone().start().await;
     info!("✅ Heartbeat sender started");
 
-    // Можно вернуть connection heartbeat manager для использования в других частях системы
+    // Возвращаем connection heartbeat manager
     connection_heartbeat_manager
 }
 
@@ -153,6 +183,7 @@ async fn start_phantom_server(
     crypto_pool: Arc<PhantomCryptoPool>,
     heartbeat_manager: Arc<ConnectionHeartbeatManager>,
     packet_service: Arc<PhantomPacketService>,
+    batch_system: Arc<PhantomBatchSystem>,
 ) -> Result<()> {
     let addr = server_config.get_addr();
     let listener = TcpListener::bind(&addr).await?;
@@ -176,6 +207,11 @@ async fn start_phantom_server(
         let phantom_config = phantom_config.clone();
         let heartbeat_manager = heartbeat_manager.clone();
         let packet_service = packet_service.clone();
+        let batch_system = batch_system.clone();
+
+        // Получаем PhantomCrypto из пула
+        let crypto_instance = crypto_pool.get_instance(0)
+            .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
 
         tokio::spawn(async move {
             info!(target: "server", "👻 New phantom connection from {}", peer);
@@ -186,9 +222,10 @@ async fn start_phantom_server(
                 phantom_config,
                 session_manager,
                 connection_manager,
-                crypto_pool,
+                crypto_instance, // Используем PhantomCrypto, а не PhantomCryptoPool
                 heartbeat_manager,
                 packet_service,
+                batch_system,
             ).await {
                 Ok(()) => {
                     info!(target: "server", "👻 Phantom connection with {} closed cleanly", peer);

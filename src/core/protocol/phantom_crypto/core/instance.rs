@@ -1,67 +1,41 @@
-use crate::core::protocol::phantom_crypto::{
-    memory::scatterer::{MemoryScatterer, ScatteredParts},
-    runtime::runtime::PhantomRuntime,
-    core::keys::PhantomSession,
-};
+use std::sync::Arc;
+use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
+use crate::core::protocol::error::{ProtocolResult};
 
-/// Главный интерфейс фантомной криптосистемы
 pub struct PhantomCrypto {
-    runtime: PhantomRuntime,
-    scatterer: MemoryScatterer,
+    // Поля структуры
 }
 
 impl PhantomCrypto {
     pub fn new() -> Self {
-        let num_workers = std::thread::available_parallelism()
-            .map(|n| n.get())
-            .unwrap_or(4);
-
-        let runtime = PhantomRuntime::new(num_workers);
-        let scatterer = MemoryScatterer::new();
-
         Self {
-            runtime,
-            scatterer,
+            // Инициализация
         }
     }
 
-    /// Создание новой сессии
-    pub fn create_session(&self) -> PhantomSession {
-        PhantomSession::new()
+    pub async fn process_packet(
+        &self,
+        session: Arc<PhantomSession>,
+        data: Vec<u8>,
+    ) -> ProtocolResult<(u8, Vec<u8>)> {
+        // Используем PhantomPacketProcessor
+        use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
+
+        let processor = PhantomPacketProcessor::new();
+        processor.process_incoming(&data, &session)
     }
 
-    /// Рассеивание мастер-ключа
-    pub fn scatter_master_key(&self, master_key: &[u8; 32]) -> ScatteredParts {
-        self.scatterer.scatter(master_key)
-    }
+    pub async fn encrypt(
+        &self,
+        session: Arc<PhantomSession>,
+        packet_type: u8,
+        data: Vec<u8>,
+    ) -> ProtocolResult<Vec<u8>> {
+        // Используем PhantomPacketProcessor
+        use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
-    /// Получает runtime
-    pub fn runtime(&self) -> &PhantomRuntime {
-        &self.runtime
-    }
-
-    /// Получает scatterer
-    pub fn scatterer(&self) -> &MemoryScatterer {
-        &self.scatterer
-    }
-}
-
-/// Конфигурация фантомной системы
-pub struct PhantomConfig {
-    pub session_timeout_ms: u64,
-    pub max_sessions: usize,
-    pub enable_hardware_acceleration: bool,
-    pub constant_time_enforced: bool,
-}
-
-impl Default for PhantomConfig {
-    fn default() -> Self {
-        Self {
-            session_timeout_ms: 90_000, // 90 секунд
-            max_sessions: 100_000,
-            enable_hardware_acceleration: true,
-            constant_time_enforced: true,
-        }
+        let processor = PhantomPacketProcessor::new();
+        processor.create_outgoing(&session, packet_type, &data)
     }
 }
 

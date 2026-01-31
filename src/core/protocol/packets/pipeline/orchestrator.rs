@@ -1,6 +1,6 @@
 use tracing::info;
 
-use crate::core::protocol::packets::processor::pipeline::stages::common::{PipelineStage, PipelineContext, StageError};
+use crate::core::protocol::packets::pipeline::stages::common::{PipelineStage, PipelineContext, StageError};
 
 pub struct PipelineOrchestrator {
     stages: Vec<Box<dyn PipelineStage>>,
