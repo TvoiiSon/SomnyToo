@@ -8,7 +8,7 @@ use crate::core::protocol::phantom_crypto::{
         chacha20_accel::{ChaCha20Accelerator, CpuCapabilities},
         blake3_accel::Blake3Accelerator,
     },
-    batch::crypto_batch_processor::CryptoBatchProcessor
+    batch::processor::crypto_batch_processor::CryptoBatchProcessor
 };
 
 /// Время выполнения в тактах процессора
@@ -46,7 +46,7 @@ impl PhantomRuntime {
         let chacha20_accel = ChaCha20Accelerator::new();
         let blake3_accel = Blake3Accelerator::new();
         let batch_processor = Arc::new(CryptoBatchProcessor::new(
-            crate::core::protocol::phantom_crypto::batch::crypto_batch_processor::BatchCryptoConfig::default()
+            crate::core::protocol::phantom_crypto::batch::processor::crypto_batch_processor::BatchCryptoConfig::default()
         ));
 
         let cpu_caps = CpuCapabilities::detect();

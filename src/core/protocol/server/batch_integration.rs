@@ -6,13 +6,13 @@ use crate::core::monitoring::unified_monitor::UnifiedMonitor;
 use crate::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 
-// Импортируем batch компоненты
+// Импортируем batch компоненты через правильные пути
 use crate::core::protocol::phantom_crypto::batch::{
-    batch_reader::{BatchReader, BatchReaderConfig, BatchReaderEvent},
-    batch_writer::{BatchWriter, BatchWriterConfig, BatchWriterEvent},
-    crypto_batch_processor::{CryptoBatchProcessor, BatchCryptoConfig},
-    packet_batch_dispatcher::{PacketBatchDispatcher, PacketBatchDispatcherConfig},
-    unified_buffer_pool::{UnifiedBufferPool, BufferPoolConfig},
+    io::reader::batch_reader::{BatchReader, BatchReaderConfig, BatchReaderEvent},
+    io::writer::batch_writer::{BatchWriter, BatchWriterConfig, BatchWriterEvent},
+    processor::crypto_batch_processor::{CryptoBatchProcessor, BatchCryptoConfig},
+    dispatcher::packet_batch_dispatcher::{PacketBatchDispatcher, PacketBatchDispatcherConfig},
+    buffer::unified_buffer_pool::{UnifiedBufferPool, BufferPoolConfig},
 };
 
 /// Интеграционная структура, объединяющая все batch компоненты
@@ -69,8 +69,8 @@ impl PhantomBatchSystem {
         // Создаем crypto batch processor
         let crypto_batch_processor = Arc::new(CryptoBatchProcessor::new(crypto_config));
 
-        // Создаем packet dispatcher
-        let packet_dispatcher = Arc::new(PacketBatchDispatcher::new(
+        // Создаем packet dispatcher - явно указываем тип
+        let packet_dispatcher: Arc<PacketBatchDispatcher> = Arc::new(PacketBatchDispatcher::new(
             dispatcher_config,
             crypto_batch_processor.clone(),
             batch_writer.clone(),
