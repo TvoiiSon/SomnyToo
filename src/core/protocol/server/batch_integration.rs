@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tracing::{info, debug, warn, error};
 
@@ -14,6 +15,8 @@ use crate::core::protocol::phantom_crypto::batch::{
     dispatcher::packet_batch_dispatcher::{PacketBatchDispatcher, PacketBatchDispatcherConfig},
     buffer::unified_buffer_pool::{UnifiedBufferPool, BufferPoolConfig},
 };
+use crate::core::protocol::phantom_crypto::batch::dispatcher::task::DispatchTask;
+use crate::core::protocol::phantom_crypto::batch::types::error::BatchError;
 
 /// Интеграционная структура, объединяющая все batch компоненты
 pub struct PhantomBatchSystem {
@@ -101,6 +104,18 @@ impl PhantomBatchSystem {
             session_manager: session_manager_clone,
             crypto: crypto_clone,
         }
+    }
+
+    pub async fn submit_to_dispatcher(&self, task: DispatchTask) -> Result<(), BatchError> {
+        self.packet_dispatcher.submit_task(task).await
+    }
+
+    pub async fn cleanup_buffers(&self, max_age: Duration) {
+        self.buffer_pool.cleanup_old_buffers(max_age);
+    }
+
+    pub fn log_buffer_stats(&self) {
+        self.buffer_pool.log_pool_stats();
     }
 
     fn start_event_handlers(

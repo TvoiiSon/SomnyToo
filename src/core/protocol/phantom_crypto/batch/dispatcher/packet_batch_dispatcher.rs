@@ -13,6 +13,7 @@ use crate::core::protocol::phantom_crypto::batch::processor::crypto_batch_proces
 use crate::core::protocol::phantom_crypto::batch::io::writer::batch_writer::BatchWriter;
 use crate::core::protocol::phantom_crypto::batch::io::reader::batch_reader::{BatchReaderEvent, BatchFrame};
 use crate::core::monitoring::unified_monitor::{UnifiedMonitor};
+use crate::core::protocol::phantom_crypto::batch::types::error::BatchError;
 
 /// Пакетный диспетчер пакетов
 pub struct PacketBatchDispatcher {
@@ -76,15 +77,15 @@ impl PacketBatchDispatcher {
             task_registry: Arc::new(RwLock::new(HashMap::new())),
             workers: Arc::new(RwLock::new(HashMap::new())),
             worker_states: Arc::new(RwLock::new(HashMap::new())),
-            task_tx: task_tx.clone(),
-            task_rx: Mutex::new(task_rx),
+            task_tx: task_tx.clone(), // Сохраняем
+            task_rx: Mutex::new(task_rx), // Сохраняем
             result_tx: result_tx.clone(),
             result_rx: Mutex::new(result_rx),
             shutdown_notify: Arc::new(Notify::new()),
             backpressure_semaphore: Arc::new(Semaphore::new(config.max_queue_size)),
             stats: Mutex::new(DispatcherStats::new()),
             task_counter: std::sync::atomic::AtomicU64::new(0),
-            batch_counter: std::sync::atomic::AtomicU64::new(0),
+            batch_counter: std::sync::atomic::AtomicU64::new(0), // Сохраняем
             work_stealing_enabled: config.enable_work_stealing,
             steal_attempts: std::sync::atomic::AtomicUsize::new(0),
         };
@@ -161,6 +162,14 @@ impl PacketBatchDispatcher {
 
         // Ставим задачу в очередь
         self.enqueue_task(task).await;
+    }
+
+    pub fn get_batch_count(&self) -> u64 {
+        self.batch_counter.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn increment_batch_counter(&self) -> u64 {
+        self.batch_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Определение типа задачи на основе данных
@@ -246,10 +255,35 @@ impl PacketBatchDispatcher {
         self.shutdown_notify.notify_one();
     }
 
+    /// Метод для внешней отправки задач в диспетчер
+    pub async fn submit_task(&self, task: DispatchTask) -> Result<(), BatchError> {
+        // Используем task_tx для отправки задачи
+        match self.task_tx.send(task).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                error!("Failed to submit task to dispatcher: {}", e);
+                Err(BatchError::ChannelError(e.to_string()))
+            }
+        }
+    }
+
+    /// Метод для получения задач напрямую (для тестирования)
+    pub async fn receive_task(&self) -> Option<DispatchTask> {
+        let mut task_rx = self.task_rx.lock().await;
+        task_rx.recv().await
+    }
+
+    /// Метод для проверки размера очереди задач
+    pub async fn task_queue_size(&self) -> usize {
+        // Можно добавить дополнительную логику для мониторинга
+        let stats = self.stats.lock().await;
+        stats.total_tasks_received as usize - stats.total_tasks_processed as usize
+    }
+
     /// Запуск worker-а
     async fn spawn_worker(&self, worker_id: usize) {
         let dispatcher = self.clone();
-        let (task_tx, mut task_rx) = mpsc::channel::<DispatchTask>(100);
+        let (worker_task_tx, mut worker_task_rx) = mpsc::channel::<DispatchTask>(100);
 
         let join_handle = tokio::spawn(async move {
             info!("👷 Dispatcher worker #{} started", worker_id);
@@ -257,7 +291,7 @@ impl PacketBatchDispatcher {
             let mut processed_count = 0;
             let mut current_batch: HashMap<DispatchPriority, Vec<DispatchTask>> = HashMap::new();
 
-            while let Some(task) = task_rx.recv().await {
+            while let Some(task) = worker_task_rx.recv().await {
                 // Добавляем задачу в текущий батч
                 let priority = task.priority;
                 current_batch.entry(priority)
@@ -299,7 +333,7 @@ impl PacketBatchDispatcher {
         let worker_handle = WorkerHandle::new(
             worker_id,
             join_handle,
-            task_tx,
+            worker_task_tx,
             self.shutdown_notify.clone(),
         );
 
@@ -332,6 +366,9 @@ impl PacketBatchDispatcher {
             }
 
             let batch_size = tasks.len();
+
+            self.increment_batch_counter();
+
             debug!("Worker #{} processing {:?} batch of {} tasks",
                    worker_id, priority, batch_size);
 

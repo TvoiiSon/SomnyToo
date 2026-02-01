@@ -78,11 +78,11 @@ impl AdaptiveBatchTuner {
         // Адаптивная настройка
         if avg_latency > self.target_latency * 2 {
             // Слишком большая задержка - уменьшаем размер батча
-            self.current_batch_size = (self.current_batch_size as f64 * 0.8)
+            self.current_batch_size = (self.current_batch_size as f64 * (1.0 - self.learning_rate))
                 .max(self.min_batch_size as f64) as usize;
         } else if avg_latency < self.target_latency / 2 && avg_fps > 1000.0 {
             // Хорошая производительность, можно увеличить
-            self.current_batch_size = (self.current_batch_size as f64 * 1.2)
+            self.current_batch_size = (self.current_batch_size as f64 * (1.0 + self.learning_rate))
                 .min(self.max_batch_size as f64) as usize;
         }
 

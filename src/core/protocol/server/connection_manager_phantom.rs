@@ -74,8 +74,6 @@ pub async fn handle_phantom_client_connection(
     info!(target: "server", "💓 Starting heartbeat-integrated phantom connection for session: {} from {}",
         hex::encode(session_id), peer);
 
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
-
     // Используем старый метод, пока batch система не доработана
     return handle_connection_without_batch(
         stream,
@@ -138,30 +136,6 @@ async fn handle_connection_without_batch(
     connection_manager.unregister_connection(session.session_id()).await;
 
     process_result
-}
-
-async fn batch_write_task(
-    _batch_system: Arc<PhantomBatchSystem>,
-    _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
-    _session_id: Vec<u8>,
-    _peer: SocketAddr,
-) {
-    // TODO: Реализовать batch write task
-    info!("Batch write task not implemented yet");
-}
-
-async fn batch_process_loop(
-    _batch_system: Arc<PhantomBatchSystem>,
-    _peer: SocketAddr,
-    _session: Arc<PhantomSession>,
-    _crypto_pool: Arc<PhantomCrypto>,
-    _session_manager: Arc<PhantomSessionManager>,
-    _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
-    _packet_service: Arc<PhantomPacketService>,
-) -> anyhow::Result<()> {
-    // TODO: Реализовать batch process loop
-    info!("Batch process loop not implemented yet");
-    Ok(())
 }
 
 async fn phantom_write_task(
@@ -420,17 +394,5 @@ async fn process_decrypted_phantom_payload(
         }
     }
 
-    Ok(())
-}
-
-async fn check_heartbeat_health(
-    heartbeat_manager: &Arc<ConnectionHeartbeatManager>
-) -> anyhow::Result<()> {
-    let health = heartbeat_manager.health_check().await;
-    if !health {
-        return Err(anyhow::anyhow!("Heartbeat system health check failed"));
-    }
-
-    debug!("💓 Heartbeat system health check passed");
     Ok(())
 }

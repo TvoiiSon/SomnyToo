@@ -201,6 +201,19 @@ impl UnifiedBufferPool {
             total_buffers.max(1) as f64;
     }
 
+    pub fn log_pool_stats(&self) {
+        self.log_stats();
+    }
+
+    pub fn cleanup_old_buffers(&self, max_age: Duration) {
+        let mut pools = self.pools.write();
+
+        for (buffer_type, pool) in pools.iter_mut() {
+            self.cleanup_old_buffers_internal(pool, max_age);
+            info!("Cleaned {:?} buffer pool", buffer_type);
+        }
+    }
+
     /// Проверка давления памяти
     fn check_memory_pressure(&self, buffer_type: BufferType, requested_size: usize) -> bool {
         let _pools = self.pools.read(); // Добавляем префикс _
@@ -235,14 +248,33 @@ impl UnifiedBufferPool {
     /// Запуск мониторинга
     fn start_monitoring(&self) {
         let pool = self.clone();
+        let shrink_interval = self.config.shrink_interval;
 
+        // Запускаем асинхронную задачу для мониторинга
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
+            let mut monitoring_interval = tokio::time::interval(Duration::from_secs(10));
+            let mut shrink_interval_timer = tokio::time::interval(shrink_interval);
+
+            monitoring_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            shrink_interval_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+            // Сохраняем клон таймера в структуре
+            {
+                let mut shrink_timer = pool.shrink_timer.lock();
+                *shrink_timer = Some(tokio::time::interval(shrink_interval));
+            }
 
             loop {
-                interval.tick().await;
-                pool.log_stats();
-                pool.auto_shrink();
+                tokio::select! {
+                // Мониторинг каждые 10 секунд
+                _ = monitoring_interval.tick() => {
+                    pool.log_stats();
+                }
+                // Автоматическое сжатие по отдельному таймеру
+                _ = shrink_interval_timer.tick() => {
+                    pool.auto_shrink();
+                }
+            }
             }
         });
     }
@@ -252,11 +284,13 @@ impl UnifiedBufferPool {
         let mut global_stats = self.global_stats.lock();
         let now = Instant::now();
 
+        // Проверяем, прошло ли достаточно времени с последнего сжатия
         if now.duration_since(global_stats.last_shrink_time) < self.config.shrink_interval {
             return;
         }
 
         global_stats.last_shrink_time = now;
+        drop(global_stats); // Освобождаем блокировку раньше
 
         let mut pools = self.pools.write();
         let mut stats = self.stats.write();
@@ -264,17 +298,8 @@ impl UnifiedBufferPool {
         for (buffer_type, pool) in pools.iter_mut() {
             let buffer_stats = stats.entry(*buffer_type).or_insert_with(BufferStats::default);
 
-            // Создаем новый список с только используемыми или недавно использованными буферами
-            let five_minutes_ago = now - Duration::from_secs(300);
-            let mut new_pool = Vec::new();
-
-            for buffer in pool.drain(..) {
-                if buffer.is_used || buffer.last_used > five_minutes_ago {
-                    new_pool.push(buffer);
-                }
-            }
-
-            *pool = new_pool;
+            // ВЫЗЫВАЕМ метод cleanup_old_buffers
+            self.cleanup_old_buffers_internal(pool, Duration::from_secs(300)); // 5 минут
 
             // Обновляем статистику
             buffer_stats.currently_used = pool.iter().filter(|b| b.is_used).count();
@@ -288,6 +313,70 @@ impl UnifiedBufferPool {
         }
     }
 
+    /// Запуск немедленного сжатия
+    pub async fn force_shrink(&self) {
+        info!("🔄 Forcing immediate buffer pool shrink");
+        self.auto_shrink();
+    }
+
+    /// Получение информации о следующем сжатии
+    pub fn next_shrink_in(&self) -> Option<Duration> {
+        let global_stats = self.global_stats.lock();
+        let now = Instant::now();
+
+        if global_stats.last_shrink_time == Instant::now() {
+            // Еще не было сжатия
+            return Some(self.config.shrink_interval);
+        }
+
+        let time_since_last_shrink = now.duration_since(global_stats.last_shrink_time);
+        if time_since_last_shrink < self.config.shrink_interval {
+            Some(self.config.shrink_interval - time_since_last_shrink)
+        } else {
+            Some(Duration::from_secs(0))
+        }
+    }
+
+    /// Остановка мониторинга и очистка ресурсов
+    pub async fn shutdown(&self) {
+        info!("Shutting down UnifiedBufferPool");
+
+        // Очищаем таймер
+        {
+            let mut shrink_timer = self.shrink_timer.lock();
+            *shrink_timer = None;
+        }
+
+        // Принудительное сжатие перед выключением
+        self.force_cleanup();
+
+        info!("UnifiedBufferPool shutdown complete");
+    }
+
+    fn cleanup_old_buffers_internal(&self, pool: &mut Vec<PooledBuffer>, max_age: Duration) {
+        let now = Instant::now();
+        let before = pool.len();
+
+        pool.retain(|b| {
+            // Используем поля created_at и buffer_type
+            let age = now.duration_since(b.created_at);
+            let is_old = age > max_age;
+
+            if !b.is_used && is_old {
+                debug!("Removing old {:?} buffer: size={} bytes, age={:?}",
+                       b.buffer_type, b.size, age);
+                false
+            } else {
+                true
+            }
+        });
+
+        let removed = before - pool.len();
+        if removed > 0 {
+            info!("Cleaned up {} old buffers", removed);
+        }
+    }
+
     /// Логирование статистики
     fn log_stats(&self) {
         let pools = self.pools.read();
@@ -296,21 +385,49 @@ impl UnifiedBufferPool {
 
         info!("📊 Buffer Pool Statistics:");
         info!("  Total memory: {:.2} MB",
-              global_stats.total_memory_allocated as f64 / 1024.0 / 1024.0);
+          global_stats.total_memory_allocated as f64 / 1024.0 / 1024.0);
         info!("  Peak memory: {:.2} MB",
-              global_stats.peak_memory_usage as f64 / 1024.0 / 1024.0);
+          global_stats.peak_memory_usage as f64 / 1024.0 / 1024.0);
         info!("  Total allocations: {}", global_stats.total_allocations);
         info!("  Total reuses: {}", global_stats.total_reuses);
         info!("  Memory pressure alerts: {}", global_stats.memory_pressure_alerts);
 
-        for (buffer_type, buffer_stats) in stats.iter() {
-            let pool_size = pools.get(buffer_type).map(|p| p.len()).unwrap_or(0);
-            info!("  {:?}: pool={}, used={}, hit_rate={:.1}%, avg_size={:.1}KB",
-                  buffer_type,
-                  pool_size,
-                  buffer_stats.currently_used,
-                  buffer_stats.hit_rate * 100.0,
-                  buffer_stats.avg_buffer_size / 1024.0);
+        let now = Instant::now();
+
+        // ДОБАВЛЯЕМ: Используем поля PooledBuffer
+        for (buffer_type, pool) in pools.iter() {
+            // ПРОВЕРЯЕМ НАЛИЧИЕ СТАТИСТИКИ
+            let buffer_stats = if let Some(stats) = stats.get(buffer_type) {
+                stats
+            } else {
+                continue; // Пропускаем если нет статистики
+            };
+
+            // Собираем статистику по полям PooledBuffer
+            let total_size: usize = pool.iter().map(|b| b.size).sum();
+
+            let oldest_buffer = pool.iter()
+                .filter(|b| !b.is_used)
+                .min_by_key(|b| b.created_at)
+                .map(|b| now.duration_since(b.created_at).as_secs());
+
+            let avg_age_secs: f64 = if !pool.is_empty() {
+                pool.iter()
+                    .map(|b| now.duration_since(b.created_at).as_secs_f64())
+                    .sum::<f64>() / pool.len() as f64
+            } else {
+                0.0
+            };
+
+            let pool_size = pool.len();
+            info!("  {:?}: pool={}, used={}, total_size={}KB, avg_age={:.1}s, oldest={:?}s, hit_rate={:.1}%",
+              buffer_type,
+              pool_size,
+              buffer_stats.currently_used,
+              total_size / 1024,
+              avg_age_secs,
+              oldest_buffer.unwrap_or(0),
+              buffer_stats.hit_rate * 100.0);
         }
     }
 

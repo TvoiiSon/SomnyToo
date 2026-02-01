@@ -449,6 +449,8 @@ impl BatchOrchestrator {
 
         for (priority, batch) in batches_to_process {
             if !batch.is_empty() {
+                debug!("Worker #{}: Emergency flushing {:?} batch with {} operations",
+                   worker_id, priority, batch.len());
                 self.process_batch_async(worker_id, batch).await;
             }
         }
