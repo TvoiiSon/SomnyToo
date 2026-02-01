@@ -17,7 +17,7 @@ impl Default for BatchReaderConfig {
         Self {
             batch_size: 64,
             buffer_size: 65536,      // 64KB
-            read_timeout: Duration::from_secs(30),
+            read_timeout: Duration::from_secs(30000),
             max_pending_batches: 100,
             enable_adaptive_batching: true,
             min_batch_size: 8,

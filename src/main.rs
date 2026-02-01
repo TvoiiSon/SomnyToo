@@ -177,12 +177,12 @@ async fn initialize_heartbeat_system(
 
 async fn start_phantom_server(
     server_config: ServerConfig,
-    phantom_config: PhantomConfig,
+    _phantom_config: PhantomConfig,
     session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    crypto_pool: Arc<PhantomCryptoPool>,
-    heartbeat_manager: Arc<ConnectionHeartbeatManager>,
-    packet_service: Arc<PhantomPacketService>,
+    _crypto_pool: Arc<PhantomCryptoPool>,
+    _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
+    _packet_service: Arc<PhantomPacketService>,
     batch_system: Arc<PhantomBatchSystem>,
 ) -> Result<()> {
     let addr = server_config.get_addr();
@@ -203,28 +203,25 @@ async fn start_phantom_server(
 
         let session_manager = session_manager.clone();
         let connection_manager = connection_manager.clone();
-        let crypto_pool = crypto_pool.clone();
-        let phantom_config = phantom_config.clone();
-        let heartbeat_manager = heartbeat_manager.clone();
-        let packet_service = packet_service.clone();
+        // УБИРАЕМ НЕНУЖНЫЕ ПЕРЕМЕННЫЕ:
+        // let phantom_config = phantom_config.clone(); // больше не нужен
+        // let heartbeat_manager = heartbeat_manager.clone(); // обрабатывается в batch системе
+        // let packet_service = packet_service.clone(); // обрабатывается в batch системе
         let batch_system = batch_system.clone();
 
-        // Получаем PhantomCrypto из пула
-        let crypto_instance = crypto_pool.get_instance(0)
-            .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
+        // crypto_pool больше не нужен напрямую, batch система сама управляет криптографией
+        // let crypto_instance = crypto_pool.get_instance(0)
+        //     .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
 
         tokio::spawn(async move {
             info!(target: "server", "👻 New phantom connection from {}", peer);
 
+            // ПЕРЕДАЕМ ТОЛЬКО 5 АРГУМЕНТОВ:
             match handle_phantom_connection(
                 stream,
                 peer,
-                phantom_config,
                 session_manager,
                 connection_manager,
-                crypto_instance, // Используем PhantomCrypto, а не PhantomCryptoPool
-                heartbeat_manager,
-                packet_service,
                 batch_system,
             ).await {
                 Ok(()) => {

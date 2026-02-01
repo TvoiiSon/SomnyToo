@@ -11,6 +11,7 @@ pub struct ConnectionReader {
     pub last_read_time: Instant,
     pub frames_read: u64,
     pub is_active: bool,
+    pub is_ready: bool,
 }
 
 impl ConnectionReader {
@@ -29,6 +30,7 @@ impl ConnectionReader {
             last_read_time: Instant::now(),
             frames_read: 0,
             is_active: true,
+            is_ready: true,
         }
     }
 
@@ -62,6 +64,7 @@ impl Clone for ConnectionReader {
             last_read_time: self.last_read_time,
             frames_read: self.frames_read,
             is_active: self.is_active,
+            is_ready: self.is_ready,
         }
     }
 }

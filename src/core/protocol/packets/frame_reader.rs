@@ -13,7 +13,7 @@ pub async fn read_frame<R: AsyncReadExt + Unpin>(
 ) -> ProtocolResult<Vec<u8>> {
     let mut header = [0u8; HEADER_SIZE];
 
-    match timeout(Duration::from_secs(10), reader.read_exact(&mut header)).await {
+    match timeout(Duration::from_secs(30), reader.read_exact(&mut header)).await {
         Ok(result) => match result {
             Ok(_) => {},
             Err(e) => {

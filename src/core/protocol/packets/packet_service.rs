@@ -75,7 +75,7 @@ impl PhantomPacketService {
         let start = Instant::now();
 
         info!("👻 Ping packet received from {}: {} ({} bytes)",
-              client_ip, String::from_utf8_lossy(&payload), payload.len());
+          client_ip, String::from_utf8_lossy(&payload), payload.len());
 
         self.heartbeat_manager.send_custom_alert(
             crate::core::monitoring::unified_monitor::AlertLevel::Info,
@@ -84,6 +84,7 @@ impl PhantomPacketService {
                      client_ip, hex::encode(session.session_id()))
         ).await;
 
+        // ВАЖНОЕ ИЗМЕНЕНИЕ: Возвращаем PONG как payload для пакета типа 0x01
         let result = b"PONG".to_vec();
         let elapsed = start.elapsed();
 
