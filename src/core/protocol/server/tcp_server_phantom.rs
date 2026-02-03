@@ -7,7 +7,7 @@ use tracing::{info, error};
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use crate::core::protocol::server::batch_integration::PhantomBatchSystem;
+use crate::core::protocol::phantom_crypto::batch::integration::BatchSystem;
 
 // Добавляем импорт функции из connection_manager
 use crate::core::protocol::server::connection_manager_phantom::handle_phantom_client_connection;
@@ -17,7 +17,7 @@ pub async fn handle_phantom_connection(
     peer: std::net::SocketAddr,
     session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<PhantomBatchSystem>,
+    batch_system: Arc<BatchSystem>,  // Изменён тип
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     info!("👻 Handling phantom connection from {}", peer);
 

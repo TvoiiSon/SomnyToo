@@ -8,7 +8,7 @@ use crate::core::protocol::phantom_crypto::{
         chacha20_accel::{ChaCha20Accelerator, CpuCapabilities},
         blake3_accel::Blake3Accelerator,
     },
-    batch::processor::crypto_batch_processor::CryptoBatchProcessor
+    batch::core::processor::CryptoProcessor
 };
 
 /// Время выполнения в тактах процессора
@@ -36,7 +36,7 @@ pub struct RuntimeStats {
 pub struct PhantomRuntime {
     chacha20_accel: ChaCha20Accelerator,
     blake3_accel: Blake3Accelerator,
-    batch_processor: Arc<CryptoBatchProcessor>,  // Измененный тип
+    batch_processor: Arc<CryptoProcessor>,  // Измененный тип
     stats: std::sync::Mutex<RuntimeStats>,
     cpu_caps: CpuCapabilities,
 }
@@ -45,8 +45,8 @@ impl PhantomRuntime {
     pub fn new(num_workers: usize) -> Self {
         let chacha20_accel = ChaCha20Accelerator::new();
         let blake3_accel = Blake3Accelerator::new();
-        let batch_processor = Arc::new(CryptoBatchProcessor::new(
-            crate::core::protocol::phantom_crypto::batch::processor::crypto_batch_processor::BatchCryptoConfig::default()
+        let batch_processor = Arc::new(CryptoProcessor::new(
+            crate::core::protocol::phantom_crypto::batch::config::BatchConfig::default()
         ));
 
         let cpu_caps = CpuCapabilities::detect();
@@ -88,7 +88,7 @@ impl PhantomRuntime {
         &self.blake3_accel
     }
 
-    pub fn batch_processor(&self) -> Arc<CryptoBatchProcessor> {
+    pub fn batch_processor(&self) -> Arc<CryptoProcessor> {
         self.batch_processor.clone()
     }
 

@@ -1,64 +1,19 @@
 use std::sync::Arc;
-use std::collections::HashMap;
-use std::net::SocketAddr;
-use std::time::{Duration};
+use std::time::Duration;
 use tokio::net::TcpStream;
-use tokio::sync::{mpsc, RwLock};
 use tracing::{info, error, debug};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
-use crate::core::protocol::server::batch_integration::PhantomBatchSystem;
-
-#[derive(Clone)]
-pub struct PhantomConnectionManager {
-    active_connections: Arc<RwLock<HashMap<Vec<u8>, mpsc::Sender<()>>>>,
-}
-
-impl PhantomConnectionManager {
-    pub fn new() -> Self {
-        Self {
-            active_connections: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    pub async fn connection_exists(&self, session_id: &[u8]) -> bool {
-        let connections = self.active_connections.read().await;
-        connections.contains_key(session_id)
-    }
-
-    pub async fn register_connection(&self, session_id: Vec<u8>, shutdown_tx: mpsc::Sender<()>) {
-        let mut connections = self.active_connections.write().await;
-        connections.insert(session_id.clone(), shutdown_tx);
-        info!("👻 Phantom connection registered for session: {}", hex::encode(session_id));
-    }
-
-    pub async fn unregister_connection(&self, session_id: &[u8]) {
-        let mut connections = self.active_connections.write().await;
-        connections.remove(session_id);
-        info!("👻 Phantom connection unregistered for session: {}", hex::encode(session_id));
-    }
-
-    pub async fn force_disconnect(&self, session_id: &[u8]) {
-        if let Some(shutdown_tx) = self.active_connections.write().await.remove(session_id) {
-            let _ = shutdown_tx.send(()).await;
-            info!("👻 Forced disconnect for phantom session: {}", hex::encode(session_id));
-        }
-    }
-
-    pub async fn get_active_connections_count(&self) -> usize {
-        let connections = self.active_connections.read().await;
-        connections.len()
-    }
-}
+use crate::core::protocol::phantom_crypto::batch::integration::BatchSystem;
 
 pub async fn handle_phantom_client_connection(
     stream: TcpStream,
-    peer: SocketAddr,
+    peer: std::net::SocketAddr,
     session: Arc<PhantomSession>,
     phantom_session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<PhantomBatchSystem>,
+    batch_system: Arc<BatchSystem>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id();
     info!(target: "server", "💓 Starting batch-integrated phantom connection for session: {} from {}",
@@ -76,11 +31,11 @@ pub async fn handle_phantom_client_connection(
 
 async fn handle_connection_with_batch(
     stream: TcpStream,
-    peer: SocketAddr,
+    peer: std::net::SocketAddr,
     session: Arc<PhantomSession>,
     phantom_session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<PhantomBatchSystem>,
+    batch_system: Arc<BatchSystem>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id().to_vec();
 
@@ -88,27 +43,17 @@ async fn handle_connection_with_batch(
     let (read_half, write_half) = stream.into_split();
 
     // Регистрируем соединение в connection manager
-    let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
+    let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     connection_manager.register_connection(session_id.clone(), shutdown_tx).await;
 
-    // Регистрируем соединение в batch reader
-    if let Err(e) = batch_system.batch_reader.register_connection(
+    // Используем новый BatchSystem API вместо прямого доступа к batch_reader
+    if let Err(e) = batch_system.register_connection(
         peer,
         session_id.clone(),
         Box::new(read_half),
-    ).await {
-        error!("Failed to register connection with batch reader: {}", e);
-        cleanup_connection(&session_id, &phantom_session_manager, &connection_manager).await;
-        return Ok(());
-    }
-
-    // Регистрируем соединение в batch writer
-    if let Err(e) = batch_system.batch_writer.register_connection(
-        peer,
-        session_id.clone(),
         Box::new(write_half),
     ).await {
-        error!("Failed to register connection with batch writer: {}", e);
+        error!("Failed to register connection with batch system: {}", e);
         cleanup_connection(&session_id, &phantom_session_manager, &connection_manager).await;
         return Ok(());
     }
@@ -145,4 +90,47 @@ async fn cleanup_connection(
 ) {
     session_manager.force_remove_session(session_id).await;
     connection_manager.unregister_connection(session_id).await;
+}
+
+// Также нужно добавить структуру PhantomConnectionManager если её нет
+#[derive(Clone)]
+pub struct PhantomConnectionManager {
+    active_connections: Arc<tokio::sync::RwLock<std::collections::HashMap<Vec<u8>, tokio::sync::mpsc::Sender<()>>>>,
+}
+
+impl PhantomConnectionManager {
+    pub fn new() -> Self {
+        Self {
+            active_connections: Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new())),
+        }
+    }
+
+    pub async fn connection_exists(&self, session_id: &[u8]) -> bool {
+        let connections = self.active_connections.read().await;
+        connections.contains_key(session_id)
+    }
+
+    pub async fn register_connection(&self, session_id: Vec<u8>, shutdown_tx: tokio::sync::mpsc::Sender<()>) {
+        let mut connections = self.active_connections.write().await;
+        connections.insert(session_id.clone(), shutdown_tx);
+        info!("👻 Phantom connection registered for session: {}", hex::encode(session_id));
+    }
+
+    pub async fn unregister_connection(&self, session_id: &[u8]) {
+        let mut connections = self.active_connections.write().await;
+        connections.remove(session_id);
+        info!("👻 Phantom connection unregistered for session: {}", hex::encode(session_id));
+    }
+
+    pub async fn force_disconnect(&self, session_id: &[u8]) {
+        if let Some(shutdown_tx) = self.active_connections.write().await.remove(session_id) {
+            let _ = shutdown_tx.send(()).await;
+            info!("👻 Forced disconnect for phantom session: {}", hex::encode(session_id));
+        }
+    }
+
+    pub async fn get_active_connections_count(&self) -> usize {
+        let connections = self.active_connections.read().await;
+        connections.len()
+    }
 }

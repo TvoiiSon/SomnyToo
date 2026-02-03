@@ -22,7 +22,8 @@ use somnytoo::core::protocol::server::heartbeat::types::ConnectionHeartbeatManag
 use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
 
 // Импортируем batch систему
-use somnytoo::core::protocol::server::batch_integration::PhantomBatchSystem;
+use somnytoo::core::protocol::phantom_crypto::batch::integration::BatchSystem;
+use somnytoo::core::protocol::phantom_crypto::batch::config::BatchConfig;  // Добавляем импорт конфига
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -109,13 +110,28 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
     let monitoring_config = MonitoringConfig::default();
     let monitor = Arc::new(UnifiedMonitor::new(monitoring_config));
 
-    let batch_system = Arc::new(PhantomBatchSystem::new(
-        monitor.clone(), // Передаем монитор напрямую
+    // Создаем конфигурацию для batch системы
+    let batch_config = BatchConfig::default();  // Используем конфиг по умолчанию
+
+    // Создаем batch систему с обработкой ошибки
+    let batch_system_result = BatchSystem::new(
+        batch_config,  // Первый аргумент: BatchConfig
+        monitor.clone(),
         phantom_session_manager.clone(),
         phantom_crypto_instance.clone(),
-    ).await);
+    ).await;
 
-    info!("✅ Batch System initialized");
+    // Обрабатываем ошибку создания batch системы
+    let batch_system = match batch_system_result {
+        Ok(system) => {
+            info!("✅ Batch System initialized successfully");
+            Arc::new(system)
+        }
+        Err(e) => {
+            error!("❌ Failed to initialize Batch System: {}", e);
+            return Err(anyhow::anyhow!("Batch System initialization failed: {}", e));
+        }
+    };
 
     info!("🎯 Server is ready and accepting phantom connections");
 
@@ -151,8 +167,8 @@ async fn initialize_heartbeat_system(
 
     // Создаем конфигурацию heartbeat
     let heartbeat_config = HeartbeatConfig {
-        ping_interval: std::time::Duration::from_secs(30),
-        timeout: std::time::Duration::from_secs(60),
+        ping_interval: Duration::from_secs(30),
+        timeout: Duration::from_secs(60),
         max_missed_pings: 3,
     };
 
@@ -183,7 +199,7 @@ async fn start_phantom_server(
     _crypto_pool: Arc<PhantomCryptoPool>,
     _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
     _packet_service: Arc<PhantomPacketService>,
-    batch_system: Arc<PhantomBatchSystem>,
+    batch_system: Arc<BatchSystem>,
 ) -> Result<()> {
     let addr = server_config.get_addr();
     let listener = TcpListener::bind(&addr).await?;
@@ -203,15 +219,7 @@ async fn start_phantom_server(
 
         let session_manager = session_manager.clone();
         let connection_manager = connection_manager.clone();
-        // УБИРАЕМ НЕНУЖНЫЕ ПЕРЕМЕННЫЕ:
-        // let phantom_config = phantom_config.clone(); // больше не нужен
-        // let heartbeat_manager = heartbeat_manager.clone(); // обрабатывается в batch системе
-        // let packet_service = packet_service.clone(); // обрабатывается в batch системе
         let batch_system = batch_system.clone();
-
-        // crypto_pool больше не нужен напрямую, batch система сама управляет криптографией
-        // let crypto_instance = crypto_pool.get_instance(0)
-        //     .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
 
         tokio::spawn(async move {
             info!(target: "server", "👻 New phantom connection from {}", peer);

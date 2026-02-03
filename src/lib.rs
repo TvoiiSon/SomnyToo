@@ -29,65 +29,26 @@ pub mod core {
                 pub mod runtime;
             }
             pub mod batch {
-                // pub mod crypto_batch_processor;
-                // pub mod batch_orchestrator;
-                // pub mod unified_buffer_pool;
-                // pub mod batch_reader;
-                // pub mod batch_writer;
-                // pub mod packet_batch_dispatcher;
-
-                pub mod orchestrator {
-                    pub mod batch_orchestrator;
-                    pub mod config;
-                    pub mod stats;
-                }
-                pub mod processor {
-                    pub mod batch;
-                    pub mod config;
-                    pub mod crypto_batch_processor;
-                    pub mod operation;
-                    pub mod stats;
-                }
-                pub mod io {
-                    pub mod reader {
-                        pub mod batch_reader;
-                        pub mod config;
-                        pub mod connection_reader;
-                        pub mod stats;
-                    }
-                    pub mod writer {
-                        pub mod batch_writer;
-                        pub mod config;
-                        pub mod connection_writer;
-                        pub mod stats;
-                    }
-                }
-                pub mod dispatcher {
-                    pub mod config;
-                    pub mod packet_batch_dispatcher;
-                    pub mod priority;
-                    pub mod stats;
-                    pub mod task;
-                    pub mod worker;
-                }
-                pub mod buffer {
-                    pub mod adaptive_tuner;
-                    pub mod buffer_handle;
-                    pub mod buffer_stats;
-                    pub mod buffer_types;
-                    pub mod config;
-                    pub mod unified_buffer_pool;
+                pub mod core {
+                    pub mod reader;
+                    pub mod writer;
+                    pub mod dispatcher;
+                    pub mod processor;
+                    pub mod buffer;
                 }
                 pub mod types {
-                    pub mod error;
                     pub mod priority;
+                    pub mod error;
                     pub mod result;
                     pub mod state;
                 }
+
+                pub mod config;
+                pub mod integration;
             }
         }
         pub mod packets {
-            pub mod priority;
+            // pub mod priority;
             pub mod packet_service;
             pub mod frame_reader;
             pub mod frame_writer;
@@ -96,7 +57,6 @@ pub mod core {
             pub mod connection_manager_phantom;
             pub mod session_manager_phantom;
             pub mod tcp_server_phantom;
-            pub mod batch_integration;
             pub mod heartbeat {
                 pub mod manager;
                 pub mod sender;

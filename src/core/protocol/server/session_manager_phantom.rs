@@ -89,8 +89,8 @@ impl PhantomSessionManager {
         let entry = PhantomSessionEntry {
             session: session.clone(),
             addr,
-            created_at: std::time::Instant::now(),
-            last_activity: std::time::Instant::now(),
+            created_at: Instant::now(),
+            last_activity: Instant::now(),
             operation_count: 0,
         };
 
@@ -111,7 +111,7 @@ impl PhantomSessionManager {
     pub async fn update_activity(&self, session_id: &[u8]) {
         let mut sessions = self.sessions.write().await;
         if let Some(entry) = sessions.get_mut(session_id) {
-            entry.last_activity = std::time::Instant::now();
+            entry.last_activity = Instant::now();
             entry.operation_count += 1;
         }
     }
@@ -173,7 +173,7 @@ impl PhantomSessionManager {
     }
 
     pub async fn cleanup_expired_sessions(&self, max_age_seconds: u64) -> usize {
-        let now = std::time::Instant::now();
+        let now = Instant::now();
         let max_age = std::time::Duration::from_secs(max_age_seconds);
 
         let mut expired_ids = Vec::new();
@@ -215,8 +215,8 @@ impl PhantomSessionManager {
 pub struct SessionStats {
     pub session_id: String,
     pub addr: SocketAddr,
-    pub created_at: std::time::Instant,
-    pub last_activity: std::time::Instant,
+    pub created_at: Instant,
+    pub last_activity: Instant,
     pub operation_count: u64,
     pub is_valid: bool,
 }

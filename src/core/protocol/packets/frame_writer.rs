@@ -5,9 +5,9 @@ use tracing::debug;
 
 use crate::core::protocol::error::{ProtocolResult, ProtocolError};
 
-pub async fn write_frame<W: AsyncWriteExt + Unpin>(
-    writer: &mut W,
-    data: &[u8],
+pub async fn write_frame<W: AsyncWriteExt + Unpin + ?Sized>(  // <-- Добавили ?Sized
+                                                              writer: &mut W,
+                                                              data: &[u8],
 ) -> ProtocolResult<()> {
     let header = (data.len() as u32).to_be_bytes();
 

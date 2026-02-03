@@ -8,8 +8,8 @@ use crate::core::protocol::error::{ProtocolResult, ProtocolError};
 const MAX_FRAME_SIZE: usize = 65536;
 const HEADER_SIZE: usize = 4;
 
-pub async fn read_frame<R: AsyncReadExt + Unpin>(
-    reader: &mut R,
+pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(  // <-- Добавили ?Sized
+                                                            reader: &mut R,
 ) -> ProtocolResult<Vec<u8>> {
     let mut header = [0u8; HEADER_SIZE];
 

@@ -1,41 +1,27 @@
+/// Единые ошибки batch системы
 #[derive(Debug, thiserror::Error)]
 pub enum BatchError {
+    #[error("IO error: {0}")]
+    Io(#[from] std::io::Error),
+
+    #[error("Connection error: {0}")]
+    ConnectionError(String),
+
+    #[error("Processing error: {0}")]
+    ProcessingError(String),
+
+    #[error("Timeout error")]
+    Timeout,
+
     #[error("Backpressure: too many pending operations")]
     Backpressure,
-    #[error("Channel error: {0}")]
-    ChannelError(String),
-    #[error("Processing timeout")]
-    Timeout,
-    #[error("Batch processing failed: {0}")]
-    ProcessingFailed(String),
+
+    #[error("Invalid session: {0}")]
+    InvalidSession(String),
+
+    #[error("Crypto error: {0}")]
+    Crypto(String),
 }
 
-#[derive(Debug, thiserror::Error)]
-pub enum BatchReaderError {
-    #[error("Connection already registered")]
-    ConnectionAlreadyRegistered,
-    #[error("Connection closed")]
-    ConnectionClosed,
-    #[error("Read timeout")]
-    ReadTimeout,
-    #[error("Frame read error: {0}")]
-    FrameReadError(String),
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-}
-
-#[derive(Debug, thiserror::Error)]
-pub enum BatchWriterError {
-    #[error("Connection already registered")]
-    ConnectionAlreadyRegistered,
-    #[error("Connection not found")]
-    ConnectionNotFound,
-    #[error("Write error: {0}")]
-    WriteError(String),
-    #[error("Queue error: {0}")]
-    QueueError(String),
-    #[error("Backpressure: too many pending writes")]
-    Backpressure,
-    #[error("IO error: {0}")]
-    IoError(#[from] std::io::Error),
-}
+/// Результат batch операций
+pub type BatchResult<T> = Result<T, BatchError>;
