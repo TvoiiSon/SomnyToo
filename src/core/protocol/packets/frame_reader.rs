@@ -1,15 +1,14 @@
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
-use tracing::debug;
 
 use crate::core::protocol::error::{ProtocolResult, ProtocolError};
 
 const MAX_FRAME_SIZE: usize = 65536;
 const HEADER_SIZE: usize = 4;
 
-pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(  // <-- Добавили ?Sized
-                                                            reader: &mut R,
+pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(
+    reader: &mut R,
 ) -> ProtocolResult<Vec<u8>> {
     let mut header = [0u8; HEADER_SIZE];
 
@@ -17,12 +16,20 @@ pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(  // <-- Добави�
         Ok(result) => match result {
             Ok(_) => {},
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(Vec::new());
+                // Проверяем разные типы ошибок закрытия соединения
+                match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof |
+                    std::io::ErrorKind::ConnectionReset |
+                    std::io::ErrorKind::ConnectionAborted |
+                    std::io::ErrorKind::BrokenPipe => {
+                        return Err(ProtocolError::ConnectionClosed);
+                    }
+                    _ => {
+                        return Err(ProtocolError::MalformedPacket {
+                            details: format!("IO error: {}", e)
+                        });
+                    }
                 }
-                return Err(ProtocolError::MalformedPacket {
-                    details: format!("IO error: {}", e)
-                });
             }
         },
         Err(_) => {
@@ -50,12 +57,19 @@ pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(  // <-- Добави�
         Ok(result) => match result {
             Ok(_) => {},
             Err(e) => {
-                if e.kind() == std::io::ErrorKind::UnexpectedEof {
-                    return Ok(Vec::new());
+                match e.kind() {
+                    std::io::ErrorKind::UnexpectedEof |
+                    std::io::ErrorKind::ConnectionReset |
+                    std::io::ErrorKind::ConnectionAborted |
+                    std::io::ErrorKind::BrokenPipe => {
+                        return Err(ProtocolError::ConnectionClosed);
+                    }
+                    _ => {
+                        return Err(ProtocolError::MalformedPacket {
+                            details: format!("IO error: {}", e)
+                        });
+                    }
                 }
-                return Err(ProtocolError::MalformedPacket {
-                    details: format!("IO error: {}", e)
-                });
             }
         },
         Err(_) => {
@@ -64,7 +78,5 @@ pub async fn read_frame<R: AsyncReadExt + Unpin + ?Sized>(  // <-- Добави�
             });
         }
     }
-
-    debug!("Read frame of {} bytes", data.len());
     Ok(data)
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::TcpStream;
-use tracing::{info, error, debug};
+use tracing::{info, error};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
@@ -29,7 +29,7 @@ pub async fn handle_phantom_client_connection(
     ).await;
 }
 
-async fn handle_connection_with_batch(
+pub async fn handle_connection_with_batch(
     stream: TcpStream,
     peer: std::net::SocketAddr,
     session: Arc<PhantomSession>,
@@ -46,7 +46,7 @@ async fn handle_connection_with_batch(
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::mpsc::channel::<()>(1);
     connection_manager.register_connection(session_id.clone(), shutdown_tx).await;
 
-    // Используем новый BatchSystem API вместо прямого доступа к batch_reader
+    // Используем новый BatchSystem API
     if let Err(e) = batch_system.register_connection(
         peer,
         session_id.clone(),
@@ -63,17 +63,14 @@ async fn handle_connection_with_batch(
 
     info!("✅ Connection {} fully registered with batch system", peer);
 
-    // ВАЖНОЕ ИЗМЕНЕНИЕ: Ждем небольшое время, чтобы BatchReader начал работу
-    debug!("⏳ Waiting for BatchReader to start reading...");
-    tokio::time::sleep(Duration::from_millis(50)).await;
-
-    // ЖДЕМ КОМАНДУ НА ЗАВЕРШЕНИЕ ИЛИ ТАЙМАУТ
+    // Вместо пассивного ожидания, ждем сигнала о завершении от читателя
     tokio::select! {
         _ = shutdown_rx.recv() => {
             info!("👻 Connection {} closed by manager", peer);
         }
-        _ = tokio::time::sleep(Duration::from_secs(30)) => {
-            info!("👻 Connection {} timeout after 30 seconds", peer);
+        // Добавляем таймаут для соединения
+        _ = tokio::time::sleep(Duration::from_secs(300)) => {
+            info!("⏰ Connection {} timeout after 5 minutes", peer);
         }
     }
 
@@ -113,7 +110,6 @@ impl PhantomConnectionManager {
     pub async fn register_connection(&self, session_id: Vec<u8>, shutdown_tx: tokio::sync::mpsc::Sender<()>) {
         let mut connections = self.active_connections.write().await;
         connections.insert(session_id.clone(), shutdown_tx);
-        info!("👻 Phantom connection registered for session: {}", hex::encode(session_id));
     }
 
     pub async fn unregister_connection(&self, session_id: &[u8]) {

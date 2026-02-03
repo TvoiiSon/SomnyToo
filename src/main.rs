@@ -9,7 +9,6 @@ use somnytoo::config::{AppConfig, ServerConfig, PhantomConfig};
 use somnytoo::core::protocol::server::tcp_server_phantom::handle_phantom_connection;
 use somnytoo::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use somnytoo::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-// Исправляем импорт криптопулла
 use somnytoo::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
 use somnytoo::core::protocol::phantom_crypto::pool::PhantomCryptoPool;
 
@@ -23,7 +22,7 @@ use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
 
 // Импортируем batch систему
 use somnytoo::core::protocol::phantom_crypto::batch::integration::BatchSystem;
-use somnytoo::core::protocol::phantom_crypto::batch::config::BatchConfig;  // Добавляем импорт конфига
+use somnytoo::core::protocol::phantom_crypto::batch::config::BatchConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -84,24 +83,16 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         .ok_or_else(|| anyhow::anyhow!("Failed to get crypto instance from pool"))?;
 
     // Инициализация Heartbeat системы
-    info!("💓 Initializing heartbeat system...");
     let heartbeat_system = initialize_heartbeat_system(
         phantom_session_manager.clone(),
         phantom_connection_manager.clone(),
     ).await;
 
-    info!("💓 Heartbeat system initialized successfully");
-
     // Создаем PhantomPacketService
-    info!("📦 Initializing PhantomPacketService...");
     let packet_service = Arc::new(PhantomPacketService::new(
         phantom_session_manager.clone(),
         heartbeat_system.clone(),
     ));
-    info!("✅ PhantomPacketService initialized");
-
-    // Инициализация batch системы
-    info!("🚀 Initializing Batch System...");
 
     // Создаем монитор для batch системы
     use somnytoo::core::monitoring::unified_monitor::UnifiedMonitor;
@@ -180,12 +171,10 @@ async fn initialize_heartbeat_system(
 
     // Запускаем основной heartbeat manager
     heartbeat_manager.start().await;
-    info!("✅ Basic heartbeat manager started");
 
     // Создаем и запускаем heartbeat sender
     let heartbeat_sender = Arc::new(HeartbeatSender::new(heartbeat_manager.clone()));
     heartbeat_sender.clone().start().await;
-    info!("✅ Heartbeat sender started");
 
     // Возвращаем connection heartbeat manager
     connection_heartbeat_manager
@@ -224,7 +213,6 @@ async fn start_phantom_server(
         tokio::spawn(async move {
             info!(target: "server", "👻 New phantom connection from {}", peer);
 
-            // ПЕРЕДАЕМ ТОЛЬКО 5 АРГУМЕНТОВ:
             match handle_phantom_connection(
                 stream,
                 peer,
@@ -263,7 +251,6 @@ async fn initialize_database(db_config: somnytoo::config::DatabaseConfig) {
                 return;
             }
             QUERY_EXECUTOR.register_server(server).await;
-            info!("Database initialized successfully");
         }
         Err(e) => {
             warn!("Failed to initialize SQL server: {}, using in-memory mode", e);

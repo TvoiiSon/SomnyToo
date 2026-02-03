@@ -1,7 +1,7 @@
 use std::time::Instant;
 use rand_core::{OsRng, RngCore};
 use constant_time_eq::constant_time_eq;
-use tracing::{debug, info};
+use tracing::{debug};
 
 use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
 use crate::core::protocol::phantom_crypto::{
@@ -39,7 +39,6 @@ impl<'a> PhantomPacket<'a> {
         chacha20_accel: &ChaCha20Accelerator,
         blake3_accel: &Blake3Accelerator,
     ) -> ProtocolResult<usize> {
-        let total_start = Instant::now();
         let mut stages_time = Vec::new();
 
         // Проверка размера plaintext
@@ -74,7 +73,7 @@ impl<'a> PhantomPacket<'a> {
         stages_time.push(("generate_nonce", nonce_gen_time));
 
         // 4. Рассчитываем размеры
-        let header_size = 37; // ИСПРАВЛЕНО: 2 + 2 + 16 + 8 + 8 + 1 = 37 байт!
+        let header_size = 37;
         let ciphertext_with_tag_len = plaintext.len() + TAG_SIZE;
         let total_size = header_size + NONCE_SIZE + ciphertext_with_tag_len + SIGNATURE_SIZE;
 
@@ -129,7 +128,7 @@ impl<'a> PhantomPacket<'a> {
             &operation_key,
             packet_type,
             &nonce,
-            &ciphertext_slice, // ТОЛЬКО ciphertext_slice (encrypted_data + tag)
+            &ciphertext_slice,
             signature_slice,
             blake3_accel,
         )?;
@@ -142,36 +141,11 @@ impl<'a> PhantomPacket<'a> {
             session,
             operation_key.sequence,
             packet_type,
-            (total_size - 4) as u16, // минус magic(2)+length(2)
+            (total_size - 4) as u16,
             header_slice,
         );
         let header_time = header_start.elapsed();
         stages_time.push(("header_encoding", header_time));
-
-        let total_time = total_start.elapsed();
-
-        // Логируем время выполнения каждого этапа
-        info!("PACKET CREATION PERFORMANCE:");
-        info!("  Total time: {:?} ({:.2} ms)", total_time, total_time.as_micros() as f64 / 1000.0);
-
-        for (stage_name, duration) in &stages_time {
-            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
-                  stage_name,
-                  duration,
-                  duration.as_nanos() as f64 / 1000.0,
-                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
-        }
-
-        debug!(
-            "Packet created in {:?}: total={} bytes, header={}, nonce={}, ciphertext+tag={}, signature={}, seq={}",
-            total_time,
-            total_size,
-            header_size,
-            NONCE_SIZE,
-            ciphertext_slice.len(),
-            SIGNATURE_SIZE,
-            operation_key.sequence
-        );
 
         Ok(total_size)
     }
@@ -186,8 +160,6 @@ impl<'a> PhantomPacket<'a> {
         sig_buffer: &mut [u8],
         blake3_accel: &Blake3Accelerator,
     ) -> ProtocolResult<()> {
-        let sig_start = Instant::now();
-
         // КРИТИЧЕСКИ ВАЖНО: Эти данные должны быть одинаковыми на клиенте и сервере
         let mut input = Vec::with_capacity(16 + 8 + 1 + NONCE_SIZE + encrypted_data.len());
 
@@ -209,9 +181,6 @@ impl<'a> PhantomPacket<'a> {
         let signature = blake3_accel.hash_keyed(sign_key.as_bytes(), &input);
         sig_buffer.copy_from_slice(&signature);
 
-        let sig_time = sig_start.elapsed();
-        debug!("Signature creation time: {:?} ({:.2} µs)", sig_time, sig_time.as_nanos() as f64 / 1000.0);
-
         Ok(())
     }
 
@@ -223,8 +192,6 @@ impl<'a> PhantomPacket<'a> {
         total_len: u16,
         buffer: &mut [u8],
     ) {
-        let start = Instant::now();
-
         // Записываем MAGIC
         buffer[0..2].copy_from_slice(&HEADER_MAGIC);
 
@@ -247,9 +214,6 @@ impl<'a> PhantomPacket<'a> {
 
         // Packet type (36)
         buffer[36] = packet_type;
-
-        let elapsed = start.elapsed();
-        debug!("Header encoding time: {:?} ({:.2} µs)", elapsed, elapsed.as_nanos() as f64 / 1000.0);
     }
 
     /// Декодирует пакет (zero allocation)
@@ -337,7 +301,6 @@ impl<'a> PhantomPacket<'a> {
         chacha20_accel: &ChaCha20Accelerator,
         blake3_accel: &Blake3Accelerator,
     ) -> ProtocolResult<(u8, usize)> {
-        let total_start = Instant::now();
         let mut stages_time = Vec::new();
 
         // 1. Проверка session_id
@@ -432,20 +395,6 @@ impl<'a> PhantomPacket<'a> {
         let copy_time = copy_start.elapsed();
         stages_time.push(("output_copy", copy_time));
 
-        let total_time = total_start.elapsed();
-
-        // Логируем время выполнения каждого этапа
-        info!("PACKET DECRYPTION PERFORMANCE:");
-        info!("  Total time: {:?} ({:.2} ms)", total_time, total_time.as_micros() as f64 / 1000.0);
-
-        for (stage_name, duration) in &stages_time {
-            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
-                  stage_name,
-                  duration,
-                  duration.as_nanos() as f64 / 1000.0,
-                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
-        }
-
         Ok((self.packet_type, output_len))
     }
 
@@ -520,8 +469,6 @@ impl PhantomPacketProcessor {
         data: &[u8],
         session: &PhantomSession,
     ) -> ProtocolResult<(u8, Vec<u8>)> {
-        let process_start = Instant::now();
-
         let mut work_buffer = vec![0u8; MAX_PAYLOAD_SIZE + TAG_SIZE];
         let mut output_buffer = vec![0u8; MAX_PAYLOAD_SIZE];
 
@@ -538,10 +485,6 @@ impl PhantomPacketProcessor {
         // Возвращаем вектор с данными
         output_buffer.truncate(size);
 
-        let process_time = process_start.elapsed();
-        info!("Full packet processing time: {:?} ({:.2} ms)",
-              process_time, process_time.as_micros() as f64 / 1000.0);
-
         Ok((packet_type, output_buffer))
     }
 
@@ -552,8 +495,6 @@ impl PhantomPacketProcessor {
         packet_type: u8,
         plaintext: &[u8],
     ) -> ProtocolResult<Vec<u8>> {
-        let create_start = Instant::now();
-
         // Проверка размера plaintext
         if plaintext.len() > MAX_PAYLOAD_SIZE {
             return Err(ProtocolError::MalformedPacket {
@@ -583,10 +524,6 @@ impl PhantomPacketProcessor {
         }
 
         buffer.truncate(size);
-
-        let create_time = create_start.elapsed();
-        info!("Full packet creation time: {:?} ({:.2} ms)",
-              create_time, create_time.as_micros() as f64 / 1000.0);
 
         Ok(buffer)
     }

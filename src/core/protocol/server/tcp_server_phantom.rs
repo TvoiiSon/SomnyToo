@@ -19,8 +19,6 @@ pub async fn handle_phantom_connection(
     connection_manager: Arc<PhantomConnectionManager>,
     batch_system: Arc<BatchSystem>,  // Изменён тип
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    info!("👻 Handling phantom connection from {}", peer);
-
     // Выполняем handshake
     let handshake_result = match timeout(
         Duration::from_secs(10),
@@ -43,9 +41,6 @@ pub async fn handle_phantom_connection(
 
     let session = Arc::new(handshake_result.session);
     let session_id = session.session_id().to_vec();
-
-    info!("✅ Phantom handshake completed for {} session: {}",
-          peer, hex::encode(&session_id));
 
     // Регистрируем сессию
     if let Err(e) = session_manager.add_session_with_addr(&session_id, session.clone(), peer).await {

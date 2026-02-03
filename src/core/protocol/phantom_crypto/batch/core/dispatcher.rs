@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::{Instant, Duration};
 use tokio::sync::{mpsc, RwLock, Mutex, Semaphore};
 use bytes::BytesMut;
-use tracing::{info, error};
+use tracing::{info, error, debug};
 
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
@@ -63,8 +63,6 @@ impl PacketDispatcher {
         let (task_tx, task_rx) = mpsc::channel(config.max_queue_size);
         let (result_tx, result_rx) = mpsc::channel(1000);
 
-        info!("🧩 Creating PacketDispatcher with config: {:?}", config);
-
         let dispatcher = Self {
             config: config.clone(),
             session_manager: session_manager.clone(),
@@ -80,26 +78,16 @@ impl PacketDispatcher {
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
 
-        info!("🔧 PacketDispatcher struct created");
-
         // Запускаем worker-ов
         dispatcher.start_workers().await;
-        info!("👷 Workers started");
 
         // Запускаем обработчик результатов
         dispatcher.start_result_handler().await;
-        info!("📨 Result handler started");
-
-        info!("✅ PacketDispatcher initialized with {} workers",
-            dispatcher.config.worker_count);
 
         dispatcher
     }
 
     pub async fn submit_task(&self, task: DispatchTask) -> Result<(), BatchError> {
-        info!("📤 Submitting task from {} session: {}",
-            task.source_addr, hex::encode(&task.session_id));
-
         // Проверяем backpressure
         let permit = self.backpressure.clone()
             .try_acquire_owned()
@@ -119,8 +107,6 @@ impl PacketDispatcher {
     }
 
     async fn start_workers(&self) {
-        info!("🚀 Starting {} dispatcher workers...", self.config.worker_count);
-
         let mut handles = Vec::new();
         for worker_id in 0..self.config.worker_count {
             info!("👷 Spawning worker #{}...", worker_id);
@@ -130,21 +116,15 @@ impl PacketDispatcher {
 
         // Сохраняем handles
         *self.workers.write().await = handles;
-
-        info!("✅ All {} dispatcher workers started", self.config.worker_count);
     }
 
     async fn spawn_worker(&self, worker_id: usize) -> tokio::task::JoinHandle<()> {
         let dispatcher = self.clone();
 
         let handle = tokio::spawn(async move {
-            info!("👷 Dispatcher worker #{} started", worker_id);
-
             // КАЖДЫЙ worker получает СВОЙ receiver из ОБЩЕГО канала
             let task_rx = dispatcher.task_rx.clone();
             let mut task_receiver = task_rx.lock().await;
-
-            info!("📭 Worker #{} got task receiver", worker_id);
 
             while dispatcher.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 info!("⏳ Worker #{} waiting for task...", worker_id);
@@ -198,18 +178,13 @@ impl PacketDispatcher {
         handle
     }
 
+    // В методе process_task в dispatcher.rs
     async fn process_task(&self, task: &DispatchTask) -> Result<DispatchResult, BatchError> {
         let start_time = Instant::now();
 
-        info!("📥 START Processing task from {} session: {} ({} bytes)",
-    task.source_addr, hex::encode(&task.session_id), task.data.len());
-
         // Получаем сессию
         let session = match self.session_manager.get_session(&task.session_id).await {
-            Some(session) => {
-                info!("✅ Session found for {}", hex::encode(&task.session_id));
-                session
-            }
+            Some(session) => session,
             None => {
                 error!("❌ Session not found: {}", hex::encode(&task.session_id));
                 return Err(BatchError::InvalidSession(
@@ -218,15 +193,11 @@ impl PacketDispatcher {
             }
         };
 
-        info!("🔓 Attempting to decrypt packet...");
-
         // Обрабатываем входящий пакет
         match self.packet_processor.process_incoming_vec(&task.data, &session) {
             Ok((packet_type, decrypted_data)) => {
                 info!("✅ DECRYPTED: packet_type=0x{:02x}, data_len={}",
-            packet_type, decrypted_data.len());
-
-                info!("📦 Processing through packet service...");
+                packet_type, decrypted_data.len());
 
                 // Обрабатываем через packet service
                 match self.packet_service.process_packet(
@@ -237,19 +208,17 @@ impl PacketDispatcher {
                 ).await {
                     Ok(processing_result) => {
                         info!("🎯 Packet service processed: response_len={}, packet_type=0x{:02x}, priority={:?}",
-                    processing_result.response.len(), processing_result.packet_type, processing_result.priority);
+                        processing_result.response.len(), processing_result.packet_type, processing_result.priority);
 
-                        info!("🔒 Encrypting response...");
-
-                        // Шифруем ответ
+                        // Шифруем ответ с ТЕМ ЖЕ packet_type (0x01 для PONG ответа)
                         match self.packet_processor.create_outgoing_vec(
                             &session,
-                            processing_result.packet_type, // Используем ТОТ ЖЕ packet_type!
+                            processing_result.packet_type, // Оставляем ТОТ ЖЕ packet_type!
                             &processing_result.response,
                         ) {
                             Ok(encrypted_response) => {
                                 info!("✅ RESPONSE READY: {} bytes to {}",
-                            encrypted_response.len(), task.source_addr);
+                                encrypted_response.len(), task.source_addr);
 
                                 // Отправляем через BatchWriter с правильным приоритетом
                                 info!("📤 Sending response with priority: {:?}", processing_result.priority);
@@ -258,15 +227,17 @@ impl PacketDispatcher {
                                     task.source_addr,
                                     task.session_id.clone(),
                                     bytes::Bytes::from(encrypted_response.clone()),
-                                    processing_result.priority, // Используем приоритет из результата
+                                    processing_result.priority,
                                     true,
                                 ).await {
                                     Ok(_) => {
                                         info!("✅ Response sent successfully to {}", task.source_addr);
+
+                                        // ВАЖНО: НЕ возвращаем response_data, чтобы result handler не отправлял повторно
                                         Ok(DispatchResult {
                                             session_id: task.session_id.clone(),
                                             destination_addr: task.source_addr,
-                                            response_data: Some(BytesMut::from(&encrypted_response[..])),
+                                            response_data: None, // <--- ВОТ ЭТО КЛЮЧЕВОЕ ИЗМЕНЕНИЕ
                                             priority: processing_result.priority,
                                             processing_time: start_time.elapsed(),
                                         })
@@ -277,7 +248,7 @@ impl PacketDispatcher {
                                         Ok(DispatchResult {
                                             session_id: task.session_id.clone(),
                                             destination_addr: task.source_addr,
-                                            response_data: Some(BytesMut::from(&encrypted_response[..])),
+                                            response_data: None, // <--- ТАКЖЕ НЕ ВОЗВРАЩАЕМ
                                             priority: processing_result.priority,
                                             processing_time: start_time.elapsed(),
                                         })
@@ -298,33 +269,27 @@ impl PacketDispatcher {
             }
             Err(e) => {
                 error!("❌ DECRYPTION FAILED for session {} from {}: {}",
-            hex::encode(&task.session_id), task.source_addr, e);
+                hex::encode(&task.session_id), task.source_addr, e);
                 Err(BatchError::Crypto(format!("Decryption failed: {}", e)))
             }
         }
     }
 
     async fn start_result_handler(&self) {
-        info!("🚀 Starting result handler...");
-
         let dispatcher = self.clone();
 
         tokio::spawn(async move {
-            info!("📨 Result handler task started");
-
             // Берем receiver из Arc
             let result_rx = dispatcher.result_rx.clone();
             let mut result_receiver = result_rx.lock().await;
 
-            info!("🔓 Result handler got receiver lock");
-            info!("⏳ Result handler waiting for results...");
-
             while let Some(result) = result_receiver.recv().await {
                 info!("📨 Result handler received result for {}", result.destination_addr);
 
+                // ВАЖНО: Отправляем только если ЕСТЬ response_data
                 if let Some(response_data) = result.response_data {
                     info!("📤 Sending response to {} ({} bytes)",
-                        result.destination_addr, response_data.len());
+                    result.destination_addr, response_data.len());
 
                     // Отправляем ответ через BatchWriter
                     match dispatcher.batch_writer.write(
@@ -339,9 +304,13 @@ impl PacketDispatcher {
                         }
                         Err(e) => {
                             error!("❌ Failed to send response to {}: {}",
-                                result.destination_addr, e);
+                            result.destination_addr, e);
                         }
                     }
+                } else {
+                    // Логируем что пакет был уже отправлен в worker
+                    debug!("📭 Result handler: response already sent in worker for {}",
+                    result.destination_addr);
                 }
             }
 

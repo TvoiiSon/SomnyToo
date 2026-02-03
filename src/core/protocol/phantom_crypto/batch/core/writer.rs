@@ -72,9 +72,6 @@ impl BatchWriter {
 
         self.start_writer_for_connection(destination_addr).await?;
 
-        info!("Registered writer connection: {} session: {}",
-            destination_addr, hex::encode(&session_id));
-
         Ok(())
     }
 
@@ -86,9 +83,6 @@ impl BatchWriter {
         priority: Priority,
         requires_flush: bool,
     ) -> Result<(), BatchError> {
-        info!("📝 BatchWriter: Writing {} bytes to {} session: {}",
-        data.len(), destination_addr, hex::encode(&session_id));
-
         // Проверяем backpressure
         let permit = self.backpressure.clone()
             .try_acquire_owned()
@@ -109,13 +103,11 @@ impl BatchWriter {
 
         // Немедленная запись для критических пакетов
         if priority.is_critical() {
-            info!("⚡ Immediate write for critical packet to {}", destination_addr);
             let result = self.write_immediate(task).await;
             drop(permit);
             return result;
         } else {
             // Буферизированная запись через broadcast
-            info!("📦 Buffered write to {}", destination_addr);
             match self.task_tx.send(task) {
                 Ok(_) => {
                     info!("✅ Task sent to writer broadcast channel");
@@ -131,33 +123,22 @@ impl BatchWriter {
     }
 
     async fn write_immediate(&self, task: WriteTask) -> Result<(), BatchError> {
-        info!("⚡ IMMEDIATE WRITE START: {} bytes to {}",
-        task.data.len(), task.destination_addr);
-
         let mut connections = self.connections.write().await;
 
         if let Some(writer) = connections.iter_mut()
             .find(|w| w.destination_addr == task.destination_addr && w.is_active) {
-
-            info!("✅ Found active writer for {}", task.destination_addr);
 
             match tokio::time::timeout(
                 self.config.write_timeout,
                 frame_writer::write_frame(&mut writer.write_stream, &task.data),
             ).await {
                 Ok(Ok(_)) => {
-                    info!("✅ FRAME WRITTEN: {} bytes", task.data.len());
-
                     if task.requires_flush {
-                        info!("🌀 Flushing stream...");
                         writer.write_stream.flush().await
                             .map_err(BatchError::Io)?;
-                        info!("✅ Stream flushed");
                     }
 
                     writer.last_write_time = Instant::now();
-                    info!("✅ IMMEDIATE WRITE COMPLETE to {} session {}: {} bytes",
-                    task.destination_addr, hex::encode(&writer.session_id), task.data.len());
 
                     Ok(())
                 }

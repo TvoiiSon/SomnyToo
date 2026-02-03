@@ -3,7 +3,7 @@ use std::time::{Instant, Duration};
 use zeroize::Zeroize;
 use blake3::Hasher;
 use rand_core::{OsRng, RngCore};
-use tracing::{info, debug, warn};
+use tracing::{info, debug};
 
 use crate::core::protocol::phantom_crypto::memory::scatterer::{ScatteredParts, MemoryScatterer};
 
@@ -26,8 +26,6 @@ pub struct PhantomMasterKey {
 
 impl PhantomMasterKey {
     pub fn new(scattered_parts: ScatteredParts, session_id: [u8; 16], operation_seed: [u8; 32]) -> Self {
-        info!("Creating new phantom master key for session: {}", hex::encode(session_id));
-
         Self {
             scattered_parts,
             operation_seed,
@@ -46,7 +44,6 @@ impl PhantomMasterKey {
         client_pub_key: &[u8; 32],
         server_pub_key: &[u8; 32],
     ) -> (ScatteredParts, [u8; 16], [u8; 32]) {
-        let total_start = Instant::now();
         let mut stages_time = Vec::new();
 
         // Blake3 для деривации ключей
@@ -78,20 +75,6 @@ impl PhantomMasterKey {
         // Немедленно уничтожаем сырые байты мастер-ключа
         let mut zero_master = master_key;
         zero_master.zeroize();
-
-        let total_time = total_start.elapsed();
-
-        // Логируем время выполнения каждого этапа
-        info!("MASTER KEY GENERATION PERFORMANCE:");
-        info!("  Total time: {:?} ({:.2} ms)", total_time, total_time.as_micros() as f64 / 1000.0);
-
-        for (stage_name, duration) in &stages_time {
-            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
-                  stage_name,
-                  duration,
-                  duration.as_nanos() as f64 / 1000.0,
-                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
-        }
 
         (scattered_parts, session_id, operation_seed)
     }
@@ -136,8 +119,6 @@ impl Drop for PhantomOperationKey {
 impl PhantomOperationKey {
     /// Создает новый операционный ключ
     pub fn new(key_bytes: [u8; 32], sequence: u64) -> Self {
-        debug!("Creating new phantom operation key with sequence: {}", sequence);
-
         Self {
             key_bytes,
             created_at: Instant::now(),
@@ -206,8 +187,6 @@ impl PhantomSession {
 
         let master_key = PhantomMasterKey::new(scattered_parts, session_id, operation_seed);
 
-        info!("Phantom session created: {}", hex::encode(master_key.session_id));
-
         Self {
             master_key,
             handshake_completed: true,
@@ -216,7 +195,6 @@ impl PhantomSession {
 
     /// Генерирует операционный ключ для конкретной операции
     pub fn generate_operation_key(&self, operation_type: &str) -> PhantomOperationKey {
-        let total_start = Instant::now();
         let mut stages_time = Vec::new();
 
         let sequence = self.master_key.sequence_number.fetch_add(1, Ordering::SeqCst);
@@ -246,33 +224,6 @@ impl PhantomSession {
         let key = PhantomOperationKey::new(operation_key_bytes, sequence);
         let creation_time = creation_start.elapsed();
         stages_time.push(("key_object_creation", creation_time));
-
-        let total_time = total_start.elapsed();
-
-        // Логируем время выполнения каждого этапа
-        info!("OPERATION KEY GENERATION PERFORMANCE:");
-        info!("  Total time: {:?} ({:.2} µs)", total_time, total_time.as_nanos() as f64 / 1000.0);
-        info!("  Sequence: {}", sequence);
-
-        for (stage_name, duration) in &stages_time {
-            info!("  {}: {:?} ({:.2} µs, {:.1}%)",
-                  stage_name,
-                  duration,
-                  duration.as_nanos() as f64 / 1000.0,
-                  (duration.as_nanos() as f64 / total_time.as_nanos() as f64) * 100.0);
-        }
-
-        // КРИТИЧЕСКИЙ ЗАМЕР: время генерации операционного ключа
-        if total_time.as_nanos() > 100_000 { // 100 µs
-            warn!("⚠️  SLOW KEY GENERATION: {:?} ({:?} ns) for sequence {} - ТРЕБОВАНИЕ: 20-100µs",
-                  total_time, total_time.as_nanos(), sequence);
-        } else if total_time.as_nanos() < 10_000 { // 10 µs
-            warn!("⚠️  SUSPICIOUSLY FAST KEY GENERATION: {:?} ({:?} ns) for sequence {}",
-                  total_time, total_time.as_nanos(), sequence);
-        } else {
-            info!("✅ Key generation: {:?} ({:?} ns) for sequence {} - В НОРМЕ",
-                  total_time, total_time.as_nanos(), sequence);
-        }
 
         key
     }

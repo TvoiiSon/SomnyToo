@@ -100,12 +100,6 @@ impl PhantomSessionManager {
         }
 
         self.heartbeat_manager.register_session(session_id.clone(), addr).await;
-
-        info!(
-            "👻 Phantom session registered: {} from {}",
-            hex::encode(session_id),
-            addr
-        );
     }
 
     pub async fn update_activity(&self, session_id: &[u8]) {

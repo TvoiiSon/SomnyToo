@@ -48,7 +48,6 @@ pub mod core {
             }
         }
         pub mod packets {
-            // pub mod priority;
             pub mod packet_service;
             pub mod frame_reader;
             pub mod frame_writer;

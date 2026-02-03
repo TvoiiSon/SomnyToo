@@ -41,7 +41,6 @@ impl BatchSystem {
         session_manager: Arc<PhantomSessionManager>,
         crypto: Arc<PhantomCrypto>,
     ) -> Result<Self, BatchError> {
-        info!("🚀 Initializing Batch System...");
 
         // Создаем каналы для событий
         let (reader_events_tx, reader_events_rx) = mpsc::channel(1000);
@@ -114,7 +113,6 @@ impl BatchSystem {
                                 priority,
                                 received_at
                             } => {
-                                info!("📨 Event received from {}: {} bytes", source_addr, data.len());
                                 let task = crate::core::protocol::phantom_crypto::batch::core::dispatcher::DispatchTask {
                                     session_id,
                                     data,
@@ -123,7 +121,6 @@ impl BatchSystem {
                                     received_at,
                                 };
 
-                                info!("📤 Submitting task to dispatcher...");
                                 match dispatcher.submit_task(task).await {
                                     Ok(_) => {
                                         info!("✅ Event submitted to dispatcher");

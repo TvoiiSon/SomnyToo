@@ -1,11 +1,10 @@
 use std::time::Duration;
 use tokio::io::AsyncWriteExt;
 use tokio::time::timeout;
-use tracing::debug;
 
 use crate::core::protocol::error::{ProtocolResult, ProtocolError};
 
-pub async fn write_frame<W: AsyncWriteExt + Unpin + ?Sized>(  // <-- Добавили ?Sized
+pub async fn write_frame<W: AsyncWriteExt + Unpin + ?Sized>(
                                                               writer: &mut W,
                                                               data: &[u8],
 ) -> ProtocolResult<()> {
@@ -46,7 +45,5 @@ pub async fn write_frame<W: AsyncWriteExt + Unpin + ?Sized>(  // <-- Добав�
             duration: Duration::from_secs(5)
         }),
     }
-
-    debug!("Wrote frame of {} bytes", data.len());
     Ok(())
 }

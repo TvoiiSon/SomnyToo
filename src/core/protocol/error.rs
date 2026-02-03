@@ -1,6 +1,6 @@
 use thiserror::Error;
 use std::net::IpAddr;
-use tracing::{error, warn};
+use tracing::{debug, error, warn};
 
 #[derive(Debug, Error, Clone)]
 pub enum ProtocolError {
@@ -10,8 +10,7 @@ pub enum ProtocolError {
         source: CryptoError,
     },
 
-    // Добавьте этот вариант:
-    #[error("IO error: {details}")]
+    #[error("👻 IO error: {details}")]
     IoError {
         details: String,
     },
@@ -51,6 +50,10 @@ pub enum ProtocolError {
 
     #[error("👻 Hardware acceleration unavailable")]
     HardwareAccelerationUnavailable,
+
+    // ДОБАВЛЯЕМ ЗДЕСЬ ConnectionClosed:
+    #[error("👻 Connection closed")]
+    ConnectionClosed,
 }
 
 #[derive(Debug, Error, Clone)]
@@ -80,7 +83,7 @@ pub enum CryptoError {
     MemoryScatteringFailed { reason: String },
 }
 
-// Реализация автоматического логирования для ProtocolError
+// Обновим реализацию автоматического логирования для ProtocolError
 impl ProtocolError {
     pub fn log(self) -> Self {
         match &self {
@@ -96,6 +99,11 @@ impl ProtocolError {
             ProtocolError::PhantomCryptoError { details } => {
                 error!("👻 Phantom crypto error: {}", details);
             }
+            ProtocolError::ConnectionClosed => {
+                // ConnectionClosed - это нормальное событие, не ошибка
+                // Используем debug вместо error/warn
+                debug!("👻 Connection closed");
+            }
             _ => {
                 error!("👻 Protocol error: {}", self);
             }
@@ -104,7 +112,6 @@ impl ProtocolError {
     }
 }
 
-// TODO
 impl From<hkdf::InvalidLength> for ProtocolError {
     fn from(_err: hkdf::InvalidLength) -> Self {
         ProtocolError::Crypto {
@@ -132,7 +139,18 @@ impl From<aes_gcm::Error> for ProtocolError {
 // Конвертация из std::io::Error
 impl From<std::io::Error> for ProtocolError {
     fn from(err: std::io::Error) -> Self {
-        ProtocolError::Io(err.to_string())
+        // Проверяем, является ли ошибка закрытием соединения
+        match err.kind() {
+            std::io::ErrorKind::UnexpectedEof |
+            std::io::ErrorKind::ConnectionReset |
+            std::io::ErrorKind::ConnectionAborted |
+            std::io::ErrorKind::BrokenPipe => {
+                ProtocolError::ConnectionClosed
+            }
+            _ => {
+                ProtocolError::Io(err.to_string())
+            }
+        }
     }
 }
 
@@ -146,7 +164,6 @@ impl From<anyhow::Error> for ProtocolError {
 }
 
 // Конвертация для hmac::digest::InvalidLength
-// TODO
 impl From<digest::InvalidLength> for ProtocolError {
     fn from(_err: digest::InvalidLength) -> Self {
         ProtocolError::Crypto {

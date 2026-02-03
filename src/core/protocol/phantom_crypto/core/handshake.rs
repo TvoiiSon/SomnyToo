@@ -15,7 +15,6 @@ pub const PROTOCOL_VERSION: u8 = 0x02;
 pub struct PhantomHandshakeResult {
     pub session: PhantomSession,
     pub role: HandshakeRole,
-    pub handshake_time: Duration,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -29,22 +28,10 @@ pub async fn perform_phantom_handshake(
     stream: &mut tokio::net::TcpStream,
     role: HandshakeRole,
 ) -> ProtocolResult<PhantomHandshakeResult> {
-    let handshake_start = Instant::now();
-
     let result = match role {
-        HandshakeRole::Client => client_phantom_handshake(stream, handshake_start).await,
-        HandshakeRole::Server => server_phantom_handshake(stream, handshake_start).await,
+        HandshakeRole::Client => client_phantom_handshake(stream).await,
+        HandshakeRole::Server => server_phantom_handshake(stream).await,
     };
-
-    if let Ok(ref res) = result {
-        let handshake_time = handshake_start.elapsed();
-
-        info!(
-            "Phantom handshake completed in {:?}, session_id: {}",
-            handshake_time,
-            hex::encode(res.session.session_id())
-        );
-    }
 
     result
 }
@@ -52,7 +39,6 @@ pub async fn perform_phantom_handshake(
 /// Клиентская часть handshake
 async fn client_phantom_handshake(
     stream: &mut tokio::net::TcpStream,
-    start_time: Instant,
 ) -> ProtocolResult<PhantomHandshakeResult> {
     info!("Starting client phantom handshake");
     let mut stages_time = Vec::new();
@@ -147,39 +133,21 @@ async fn client_phantom_handshake(
     let session_time = session_start.elapsed();
     stages_time.push(("session_creation", session_time));
 
-    let handshake_time = start_time.elapsed();
-
-    // Логируем время выполнения каждого этапа
-    info!("CLIENT HANDSHAKE PERFORMANCE:");
-    info!("  Total time: {:?} ({:.2} ms)", handshake_time, handshake_time.as_micros() as f64 / 1000.0);
-
-    for (stage_name, duration) in &stages_time {
-        info!("  {}: {:?} ({:.2} µs, {:.1}%)", 
-              stage_name, 
-              duration, 
-              duration.as_nanos() as f64 / 1000.0,
-              (duration.as_nanos() as f64 / handshake_time.as_nanos() as f64) * 100.0);
-    }
-
     info!(
-        "Client phantom handshake completed in {:?}, session_id: {}",
-        handshake_time,
+        "Client phantom handshake completed in session_id: {}",
         hex::encode(session.session_id())
     );
 
     Ok(PhantomHandshakeResult {
         session,
         role: HandshakeRole::Client,
-        handshake_time,
     })
 }
 
 /// Серверная часть handshake
 async fn server_phantom_handshake(
     stream: &mut tokio::net::TcpStream,
-    start_time: Instant,
 ) -> ProtocolResult<PhantomHandshakeResult> {
-    info!("Starting server phantom handshake");
     let mut stages_time = Vec::new();
 
     // 1. Читаем ClientHello
@@ -268,29 +236,8 @@ async fn server_phantom_handshake(
     let session_time = session_start.elapsed();
     stages_time.push(("session_creation", session_time));
 
-    let handshake_time = start_time.elapsed();
-
-    // Логируем время выполнения каждого этапа
-    info!("SERVER HANDSHAKE PERFORMANCE:");
-    info!("  Total time: {:?} ({:.2} ms)", handshake_time, handshake_time.as_micros() as f64 / 1000.0);
-
-    for (stage_name, duration) in &stages_time {
-        info!("  {}: {:?} ({:.2} µs, {:.1}%)", 
-              stage_name, 
-              duration, 
-              duration.as_nanos() as f64 / 1000.0,
-              (duration.as_nanos() as f64 / handshake_time.as_nanos() as f64) * 100.0);
-    }
-
-    info!(
-        "Server phantom handshake completed in {:?}, session_id: {}",
-        handshake_time,
-        hex::encode(session.session_id())
-    );
-
     Ok(PhantomHandshakeResult {
         session,
         role: HandshakeRole::Server,
-        handshake_time,
     })
 }
