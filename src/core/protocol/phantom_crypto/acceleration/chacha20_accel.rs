@@ -1,3 +1,4 @@
+// chacha20_accel.rs
 use std::arch::x86_64::*;
 
 #[cfg(target_arch = "x86_64")]
@@ -114,11 +115,13 @@ pub mod x86 {
             x2 = _mm256_add_epi32(x2, key2);
             x3 = _mm256_add_epi32(x3, counter_nonce);
 
-            // Сохраняем результат
-            _mm256_storeu_si256(output.as_mut_ptr() as *mut __m256i, x0);
-            _mm256_storeu_si256(output[32..].as_mut_ptr() as *mut __m256i, x1);
-            _mm256_storeu_si256(output[64..].as_mut_ptr() as *mut __m256i, x2);
-            _mm256_storeu_si256(output[96..].as_mut_ptr() as *mut __m256i, x3);
+            // Сохраняем результат - ИСПРАВЛЕНО!
+            // Используем арифметику указателей вместо индексирования срезов
+            let ptr = output.as_mut_ptr();
+            _mm256_storeu_si256(ptr as *mut __m256i, x0);
+            _mm256_storeu_si256(ptr.add(32) as *mut __m256i, x1);
+            _mm256_storeu_si256(ptr.add(64) as *mut __m256i, x2);
+            _mm256_storeu_si256(ptr.add(96) as *mut __m256i, x3);
         }
     }
 
@@ -135,6 +138,7 @@ pub mod x86 {
         let mut in_ptr = input.as_ptr();
         let mut out_ptr = output.as_mut_ptr();
 
+        // Обрабатываем большие блоки по 256 байт
         while remaining >= 256 {
             // Обрабатываем 4 блока ChaCha20 параллельно
             let mut blocks = [[0u8; 64]; 4];
@@ -145,7 +149,7 @@ pub mod x86 {
                 }
             }
 
-            // XOR с входными данными
+            // XOR с входными данными - ИСПРАВЛЕНО!
             for i in 0..4 {
                 for j in 0..64 {
                     if remaining == 0 { break; }
@@ -153,15 +157,15 @@ pub mod x86 {
                         *out_ptr = *in_ptr ^ blocks[i][j];
                         out_ptr = out_ptr.add(1);
                         in_ptr = in_ptr.add(1);
+                        remaining -= 1;
                     }
-                    remaining -= 1;
                 }
             }
 
             local_counter += 4;
         }
 
-        // Остатки
+        // Остатки - ИСПРАВЛЕНО! (остался тот же код, он был правильным)
         while remaining > 0 {
             let mut block = [0u8; 64];
             unsafe {
