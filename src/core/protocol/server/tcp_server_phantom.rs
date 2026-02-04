@@ -7,7 +7,7 @@ use tracing::{info, error};
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use crate::core::protocol::phantom_crypto::batch::integration::BatchSystem;
+use crate::core::protocol::batch_system::integration::BatchSystem;
 
 // Добавляем импорт функции из connection_manager
 use crate::core::protocol::server::connection_manager_phantom::handle_phantom_client_connection;

@@ -21,8 +21,8 @@ use somnytoo::core::protocol::server::heartbeat::types::ConnectionHeartbeatManag
 use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
 
 // Импортируем batch систему
-use somnytoo::core::protocol::phantom_crypto::batch::integration::BatchSystem;
-use somnytoo::core::protocol::phantom_crypto::batch::config::BatchConfig;
+use somnytoo::core::protocol::batch_system::integration::BatchSystem;
+use somnytoo::core::protocol::batch_system::config::BatchConfig;
 
 #[tokio::main]
 async fn main() -> Result<()> {

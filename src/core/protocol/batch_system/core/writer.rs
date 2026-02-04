@@ -7,9 +7,9 @@ use tracing::{info, debug, error, warn};
 
 use crate::core::protocol::packets::frame_writer;
 
-use crate::core::protocol::phantom_crypto::batch::config::BatchConfig;
-use crate::core::protocol::phantom_crypto::batch::types::error::BatchError;
-use crate::core::protocol::phantom_crypto::batch::types::priority::Priority;
+use crate::core::protocol::batch_system::config::BatchConfig;
+use crate::core::protocol::batch_system::types::error::BatchError;
+use crate::core::protocol::batch_system::types::priority::Priority;
 
 /// Задача записи
 #[derive(Debug, Clone)]

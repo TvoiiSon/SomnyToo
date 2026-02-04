@@ -19,32 +19,35 @@ pub mod core {
             pub mod acceleration {
                 pub mod chacha20_accel;
                 pub mod blake3_accel;
-
-                pub mod batch {
-                    pub mod chacha20_batch_accel;
-                    pub mod blake3_batch_accel;
-                }
             }
             pub mod runtime {
                 pub mod runtime;
             }
-            pub mod batch {
-                pub mod core {
-                    pub mod reader;
-                    pub mod writer;
-                    pub mod dispatcher;
-                    pub mod processor;
-                    pub mod buffer;
-                }
-                pub mod types {
-                    pub mod priority;
-                    pub mod error;
-                    pub mod result;
-                    pub mod state;
-                }
-
-                pub mod config;
-                pub mod integration;
+            
+        }
+        pub mod batch_system {
+            pub mod config;
+            pub mod integration;
+            
+            pub mod acceleration_batch {
+                pub mod chacha20_batch_accel;
+                pub mod blake3_batch_accel;
+            }
+            pub mod core {
+                pub mod reader;
+                pub mod writer;
+                pub mod dispatcher;
+                pub mod processor;
+                pub mod buffer;
+            }
+            pub mod optimized {
+                
+            }
+            pub mod types {
+                pub mod priority;
+                pub mod error;
+                pub mod result;
+                pub mod state;
             }
         }
         pub mod packets {

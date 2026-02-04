@@ -7,8 +7,8 @@ use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::error::{ProtocolResult, ProtocolError, CryptoError};
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
-use crate::core::protocol::phantom_crypto::batch::config::BatchConfig;
-use crate::core::protocol::phantom_crypto::batch::types::priority::Priority;
+use crate::core::protocol::batch_system::config::BatchConfig;
+use crate::core::protocol::batch_system::types::priority::Priority;
 
 /// Криптографическая операция
 #[derive(Debug, Clone)]

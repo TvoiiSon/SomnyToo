@@ -5,7 +5,7 @@ use bytes::BytesMut;
 use tracing::{info, debug, warn};
 use parking_lot::{RwLock, Mutex};
 
-use crate::core::protocol::phantom_crypto::batch::config::BatchConfig;
+use crate::core::protocol::batch_system::config::BatchConfig;
 
 /// Типы буферов
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

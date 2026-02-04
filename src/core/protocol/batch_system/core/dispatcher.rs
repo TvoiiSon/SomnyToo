@@ -8,10 +8,10 @@ use crate::core::protocol::server::session_manager_phantom::PhantomSessionManage
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 use crate::core::protocol::packets::packet_service::PhantomPacketService;
 
-use crate::core::protocol::phantom_crypto::batch::config::BatchConfig;
-use crate::core::protocol::phantom_crypto::batch::types::error::BatchError;
-use crate::core::protocol::phantom_crypto::batch::types::priority::Priority;
-use crate::core::protocol::phantom_crypto::batch::core::writer::BatchWriter;
+use crate::core::protocol::batch_system::config::BatchConfig;
+use crate::core::protocol::batch_system::types::error::BatchError;
+use crate::core::protocol::batch_system::types::priority::Priority;
+use crate::core::protocol::batch_system::core::writer::BatchWriter;
 
 /// Задача для диспетчера
 #[derive(Debug, Clone)]

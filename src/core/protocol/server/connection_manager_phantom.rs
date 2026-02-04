@@ -5,7 +5,7 @@ use tracing::{info, error};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
-use crate::core::protocol::phantom_crypto::batch::integration::BatchSystem;
+use crate::core::protocol::batch_system::integration::BatchSystem;
 
 pub async fn handle_phantom_client_connection(
     stream: TcpStream,

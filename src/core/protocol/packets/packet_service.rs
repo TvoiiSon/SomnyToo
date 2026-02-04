@@ -11,7 +11,7 @@ pub struct PacketProcessingResult {
     pub response: Vec<u8>,
     pub should_encrypt: bool,
     pub packet_type: u8,
-    pub priority: crate::core::protocol::phantom_crypto::batch::types::priority::Priority,
+    pub priority: crate::core::protocol::batch_system::types::priority::Priority,
 }
 
 pub struct PhantomPacketService {
@@ -46,17 +46,17 @@ impl PhantomPacketService {
             0x01 => {
                 let response = self.handle_ping(payload, session.clone(), client_ip).await?;
                 // PING/PONG пакеты имеют критический приоритет для быстрого ответа
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Critical)
+                (response, crate::core::protocol::batch_system::types::priority::Priority::Critical)
             }
             0x10 => {
                 let response = self.handle_heartbeat(session.session_id(), client_ip).await?;
                 // Heartbeat пакеты имеют высокий приоритет
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::High)
+                (response, crate::core::protocol::batch_system::types::priority::Priority::High)
             }
             _ => {
                 let response = self.handle_unknown_packet(packet_type, payload, session.clone(), client_ip).await?;
                 // Неизвестные пакеты имеют нормальный приоритет
-                (response, crate::core::protocol::phantom_crypto::batch::types::priority::Priority::Normal)
+                (response, crate::core::protocol::batch_system::types::priority::Priority::Normal)
             }
         };
 

@@ -7,12 +7,12 @@ use crate::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::packets::packet_service::PhantomPacketService;
 
-use crate::core::protocol::phantom_crypto::batch::config::BatchConfig;
-use crate::core::protocol::phantom_crypto::batch::core::reader::{BatchReader, ReaderEvent};
-use crate::core::protocol::phantom_crypto::batch::core::writer::BatchWriter;
-use crate::core::protocol::phantom_crypto::batch::core::dispatcher::PacketDispatcher;
-use crate::core::protocol::phantom_crypto::batch::types::error::BatchError;
-use crate::core::protocol::phantom_crypto::batch::types::priority::Priority;
+use crate::core::protocol::batch_system::config::BatchConfig;
+use crate::core::protocol::batch_system::core::reader::{BatchReader, ReaderEvent};
+use crate::core::protocol::batch_system::core::writer::BatchWriter;
+use crate::core::protocol::batch_system::core::dispatcher::PacketDispatcher;
+use crate::core::protocol::batch_system::types::error::BatchError;
+use crate::core::protocol::batch_system::types::priority::Priority;
 
 /// Интегрированная batch система
 pub struct BatchSystem {
@@ -113,7 +113,7 @@ impl BatchSystem {
                                 priority,
                                 received_at
                             } => {
-                                let task = crate::core::protocol::phantom_crypto::batch::core::dispatcher::DispatchTask {
+                                let task = crate::core::protocol::batch_system::core::dispatcher::DispatchTask {
                                     session_id,
                                     data,
                                     source_addr,
