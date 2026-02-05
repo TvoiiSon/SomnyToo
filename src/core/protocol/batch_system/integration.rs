@@ -22,7 +22,6 @@ use crate::core::protocol::batch_system::types::error::BatchError;
 use crate::core::protocol::batch_system::types::priority::Priority;
 
 // Импорты из других модулей
-use crate::core::monitoring::unified_monitor::UnifiedMonitor;
 use crate::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::packets::packet_service::PhantomPacketService;
@@ -52,7 +51,6 @@ pub struct IntegratedBatchSystem {
     packet_processor: PhantomPacketProcessor,
     session_manager: Arc<PhantomSessionManager>,
     crypto: Arc<PhantomCrypto>,
-    monitor: Arc<UnifiedMonitor>,
 
     // Каналы и управление
     event_tx: mpsc::Sender<SystemEvent>,
@@ -64,15 +62,18 @@ pub struct IntegratedBatchSystem {
     is_initialized: Arc<std::sync::atomic::AtomicBool>,
     startup_time: Instant,
 
-    // Статистика и мониторинг
+    // Статистика
     stats: Arc<RwLock<SystemStatistics>>,
     metrics: Arc<DashMap<String, MetricValue>>,
-    health_checks: Arc<RwLock<HashMap<String, HealthStatus>>>,
 
     // Очереди и буферы
     pending_batches: Arc<RwLock<Vec<PendingBatch>>>,
     active_connections: Arc<RwLock<HashMap<std::net::SocketAddr, ConnectionInfo>>>,
     session_cache: Arc<RwLock<HashMap<Vec<u8>, SessionCacheEntry>>>,
+
+    // Внутренние настройки для скейлинга
+    scaling_settings: Arc<RwLock<ScalingSettings>>,
+    performance_counters: Arc<DashMap<String, PerformanceCounter>>,
 }
 
 /// События системы
@@ -111,17 +112,6 @@ pub enum SystemEvent {
         context: String,
         severity: ErrorSeverity,
     },
-    HealthCheck {
-        component: String,
-        status: HealthStatus,
-        details: HashMap<String, String>,
-    },
-    PerformanceAlert {
-        metric: String,
-        value: f64,
-        threshold: f64,
-        component: String,
-    },
 }
 
 /// Команды управления системой
@@ -140,9 +130,6 @@ pub enum SystemCommand {
     EmergencyShutdown {
         reason: String,
     },
-    RunHealthCheck {
-        component: Option<String>,
-    },
     GetStatistics,
     ResetStatistics,
     RebalanceWorkers,
@@ -152,21 +139,22 @@ pub enum SystemCommand {
     ScaleDown {
         count: usize,
     },
+    UpdateScalingSettings {
+        settings: ScalingSettings,
+    },
 }
 
 /// Статус системы
 #[derive(Debug, Clone)]
 pub struct SystemStatus {
     pub timestamp: Instant,
-    pub overall_status: SystemHealth,
-    pub component_status: HashMap<String, ComponentStatus>,
+    pub is_running: bool,
     pub statistics: SystemStatistics,
     pub active_connections: usize,
     pub pending_tasks: usize,
     pub memory_usage: MemoryUsage,
-    pub cpu_usage: f64,
     pub throughput: ThroughputMetrics,
-    pub alerts: Vec<SystemAlert>,
+    pub scaling_settings: ScalingSettings,
 }
 
 /// Статистика системы
@@ -203,6 +191,36 @@ impl Default for SystemStatistics {
             work_stealing_count: 0,
             startup_time: Instant::now(),
             uptime: Duration::from_secs(0),
+        }
+    }
+}
+
+/// Настройки скейлинга
+#[derive(Debug, Clone)]
+pub struct ScalingSettings {
+    pub buffer_pool_target_hit_rate: f64,
+    pub crypto_processor_target_success_rate: f64,
+    pub work_stealing_target_queue_size: usize,
+    pub connection_target_count: usize,
+    pub min_worker_count: usize,
+    pub max_worker_count: usize,
+    pub auto_scaling_enabled: bool,
+    pub scaling_cooldown_seconds: u64,
+    pub last_scaling_time: Instant,
+}
+
+impl Default for ScalingSettings {
+    fn default() -> Self {
+        Self {
+            buffer_pool_target_hit_rate: 0.7,
+            crypto_processor_target_success_rate: 0.98,
+            work_stealing_target_queue_size: 1000,
+            connection_target_count: 1000,
+            min_worker_count: 4,
+            max_worker_count: 256,
+            auto_scaling_enabled: true,
+            scaling_cooldown_seconds: 60,
+            last_scaling_time: Instant::now(),
         }
     }
 }
@@ -309,35 +327,6 @@ pub struct ThroughputMetrics {
     pub latency_p99: Duration,
 }
 
-/// Статус компонента
-#[derive(Debug, Clone)]
-pub struct ComponentStatus {
-    pub name: String,
-    pub status: HealthStatus,
-    pub last_check: Instant,
-    pub details: HashMap<String, String>,
-    pub performance: f64,
-}
-
-/// Здоровье системы
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SystemHealth {
-    Healthy,
-    Degraded,
-    Unhealthy,
-    Critical,
-    Offline,
-}
-
-/// Статус здоровья
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HealthStatus {
-    Ok,
-    Warning,
-    Error,
-    Unknown,
-}
-
 /// Серьезность ошибки
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ErrorSeverity {
@@ -345,18 +334,6 @@ pub enum ErrorSeverity {
     Medium,
     High,
     Critical,
-}
-
-/// Оповещение системы
-#[derive(Debug, Clone)]
-pub struct SystemAlert {
-    pub id: u64,
-    pub timestamp: Instant,
-    pub severity: ErrorSeverity,
-    pub message: String,
-    pub component: String,
-    pub details: HashMap<String, String>,
-    pub acknowledged: bool,
 }
 
 /// Значение метрики
@@ -369,13 +346,53 @@ pub enum MetricValue {
     Boolean(bool),
 }
 
+/// Счетчик производительности
+#[derive(Debug, Clone)]
+pub struct PerformanceCounter {
+    pub name: String,
+    pub value: f64,
+    pub timestamp: Instant,
+    pub window_size: usize,
+    pub values: VecDeque<f64>,
+}
+
+impl PerformanceCounter {
+    pub fn new(name: String, window_size: usize) -> Self {
+        Self {
+            name,
+            value: 0.0,
+            timestamp: Instant::now(),
+            window_size,
+            values: VecDeque::with_capacity(window_size),
+        }
+    }
+
+    pub fn update(&mut self, value: f64) {
+        self.value = value;
+        self.timestamp = Instant::now();
+        self.values.push_back(value);
+        if self.values.len() > self.window_size {
+            self.values.pop_front();
+        }
+    }
+
+    pub fn average(&self) -> f64 {
+        if self.values.is_empty() {
+            return 0.0;
+        }
+        self.values.iter().sum::<f64>() / self.values.len() as f64
+    }
+}
+
+use std::collections::VecDeque;
+
 impl IntegratedBatchSystem {
     /// Создание новой интегрированной batch системы
     pub async fn new(
         config: BatchConfig,
-        monitor: Arc<UnifiedMonitor>,
         session_manager: Arc<PhantomSessionManager>,
         crypto: Arc<PhantomCrypto>,
+        monitor: Option<Arc<UnifiedMonitor>>,
     ) -> Result<Self, BatchError> {
         info!("🚀 Инициализация интегрированной Batch системы...");
 
@@ -410,9 +427,17 @@ impl IntegratedBatchSystem {
             session_manager.clone(),
             {
                 use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
+
+                // Используем переданный монитор или создаем временный
+                let monitor_to_use = monitor.unwrap_or_else(|| {
+                    Arc::new(UnifiedMonitor::new(
+                        crate::core::monitoring::config::MonitoringConfig::default()
+                    ))
+                });
+
                 Arc::new(ConnectionHeartbeatManager::new(
                     session_manager.clone(),
-                    monitor.clone(),
+                    monitor_to_use,
                 ))
             },
         ));
@@ -454,7 +479,6 @@ impl IntegratedBatchSystem {
             packet_processor,
             session_manager: session_manager.clone(),
             crypto: crypto.clone(),
-            monitor: monitor.clone(),
             event_tx: system_event_tx.clone(),  // <-- Системный канал
             event_rx: Arc::new(Mutex::new(system_event_rx)),  // <-- Системный канал
             command_tx,
@@ -466,10 +490,11 @@ impl IntegratedBatchSystem {
                 ..Default::default()
             })),
             metrics: Arc::new(DashMap::new()),
-            health_checks: Arc::new(RwLock::new(HashMap::new())),
             pending_batches: Arc::new(RwLock::new(Vec::new())),
             active_connections: Arc::new(RwLock::new(HashMap::new())),
             session_cache: Arc::new(RwLock::new(HashMap::new())),
+            scaling_settings: Arc::new(RwLock::new(ScalingSettings::default())),
+            performance_counters: Arc::new(DashMap::new()),
         };
 
         // ЗАПУСКАЕМ КОНВЕРТЕР ReaderEvent -> SystemEvent
@@ -557,10 +582,9 @@ impl IntegratedBatchSystem {
         // Только потом запускаем обработчики
         self.start_event_handlers().await;
         self.start_command_handlers().await;
-        self.start_monitoring_tasks().await;
         self.start_statistics_collector().await;
         self.start_batch_processor().await;
-        self.initialize_health_checks().await;
+        self.start_performance_monitoring().await;
 
         info!("✅ Все компоненты системы инициализированы");
         Ok(())
@@ -613,12 +637,6 @@ impl IntegratedBatchSystem {
             SystemEvent::ErrorOccurred { error, context, severity } => {
                 self.handle_error_occurred(error, context, severity).await;
             }
-            SystemEvent::HealthCheck { component, status, details } => {
-                self.handle_health_check(component, status, details).await;
-            }
-            SystemEvent::PerformanceAlert { metric, value, threshold, component } => {
-                self.handle_performance_alert(metric, value, threshold, component).await;
-            }
         }
     }
 
@@ -662,6 +680,12 @@ impl IntegratedBatchSystem {
                 });
             }
         }
+
+        // Обновляем счетчик производительности
+        self.update_performance_counters().await;
+
+        // Проверяем необходимость скейлинга
+        self.check_scaling_needs().await;
 
         // Определяем тип обработки на основе приоритета и размера данных
         let _processor_type = self.determine_processor_type(&data, priority);
@@ -710,7 +734,7 @@ impl IntegratedBatchSystem {
         _processing_time: Duration,
         _worker_id: Option<usize>,
     ) {
-        debug!("✅ Данные обработаны для сессии: {}, успех: {}", 
+        debug!("✅ Данные обработаны для сессии: {}, успех: {}",
                hex::encode(&session_id), result.success);
 
         if result.success {
@@ -722,7 +746,7 @@ impl IntegratedBatchSystem {
         } else {
             // Логируем ошибку
             if let Some(error) = &result.error {
-                warn!("⚠️ Ошибка обработки данных для сессии {}: {}", 
+                warn!("⚠️ Ошибка обработки данных для сессии {}: {}",
                       hex::encode(&session_id), error);
             }
         }
@@ -844,7 +868,7 @@ impl IntegratedBatchSystem {
                     let packet_type = data[0];
                     let packet_data = &data[1..];
 
-                    debug!("📦 Обработка дешифрованного пакета: тип=0x{:02x}, размер={}", 
+                    debug!("📦 Обработка дешифрованного пакета: тип=0x{:02x}, размер={}",
                            packet_type, packet_data.len());
 
                     // Получаем сессию
@@ -933,7 +957,7 @@ impl IntegratedBatchSystem {
         processing_time: Duration,
         success_rate: f64
     ) {
-        debug!("✅ Батч {} завершен: размер={}, время={:?}, успех={:.1}%", 
+        debug!("✅ Батч {} завершен: размер={}, время={:?}, успех={:.1}%",
                batch_id, size, processing_time, success_rate * 100.0);
 
         // Обновляем статистику
@@ -962,407 +986,188 @@ impl IntegratedBatchSystem {
         // Обновляем статистику
         let mut stats = self.stats.write().await;
         stats.total_errors += 1;
-
-        // Логируем в мониторинг (если есть такой метод)
-        // self.monitor.record_error(&context, &error, severity as i32).await;
     }
 
-    /// Обработка health check
-    async fn handle_health_check(&self, component: String, status: HealthStatus, details: HashMap<String, String>) {
-        let mut health_checks = self.health_checks.write().await;
-        health_checks.insert(component.clone(), status);
-
-        match status {
-            HealthStatus::Ok => debug!("✅ Health check: {} - OK", component),
-            HealthStatus::Warning => warn!("⚠️ Health check: {} - WARNING: {:?}", component, details),
-            HealthStatus::Error => error!("❌ Health check: {} - ERROR: {:?}", component, details),
-            HealthStatus::Unknown => debug!("❓ Health check: {} - UNKNOWN", component),
-        }
-    }
-
-    /// Обработка performance alert
-    async fn handle_performance_alert(
-        &self,
-        metric: String,
-        value: f64,
-        threshold: f64,
-        component: String
-    ) {
-        warn!("📊 Performance alert: {}={:.2} > {:.2} in {}", metric, value, threshold, component);
-
-        // Можно добавить автоматическую регулировку
-        if value > threshold * 1.5 {
-            self.auto_adjust_config(&component, &metric, value / threshold).await;
-        }
-    }
-
-    /// Автоматическая регулировка конфигурации
-    async fn auto_adjust_config(&self, component: &str, metric: &str, ratio: f64) {
-        debug!("🔄 Автоматическая регулировка: {} -> {} (ratio={:.2})", component, metric, ratio);
-
-        // Пример автоматической регулировки
-        match (component, metric) {
-            ("buffer_pool", "hit_rate") if ratio < 0.5 => {
-                // Увеличиваем размер пула буферов
-                warn!("📈 Увеличиваем buffer_pool из-за низкого hit rate");
-            }
-            ("crypto_processor", "queue_size") if ratio > 2.0 => {
-                // Увеличиваем количество воркеров
-                warn!("📈 Увеличиваем количество crypto workers");
-            }
-            _ => {}
-        }
-    }
-
-    /// Запуск задач мониторинга
-    async fn start_monitoring_tasks(&self) {
-        info!("📊 Запуск задач мониторинга...");
-
-        // Мониторинг буферных пулов
-        self.start_buffer_pool_monitoring().await;
-
-        // Мониторинг диспетчеров
-        self.start_dispatcher_monitoring().await;
-
-        // Мониторинг криптопроцессора
-        self.start_crypto_processor_monitoring().await;
-
-        // Мониторинг соединений
-        self.start_connection_monitoring().await;
-
-        // Мониторинг производительности
-        self.start_performance_monitoring().await;
-
-        // Мониторинг здоровья системы
-        self.start_system_health_monitoring().await;
-    }
-
-    /// Мониторинг буферных пулов
-    async fn start_buffer_pool_monitoring(&self) {
-        let buffer_pool = self.buffer_pool.clone();
-        let optimized_buffer_pool = self.optimized_buffer_pool.clone();
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
-
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(5)).await;
-
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
-
-                // Получаем статистику из обоих пулов
-                let stats = buffer_pool.get_stats();
-                let reuse_rate = optimized_buffer_pool.get_reuse_rate();
-                let memory_usage = optimized_buffer_pool.get_memory_usage();
-
-                // Проверяем health
-                let hit_rate = if stats.allocation_count + stats.reuse_count > 0 {
-                    stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64
-                } else {
-                    0.0
-                };
-
-                let status = if hit_rate > 0.7 && reuse_rate > 0.6 {
-                    HealthStatus::Ok
-                } else if hit_rate > 0.5 && reuse_rate > 0.4 {
-                    HealthStatus::Warning
-                } else {
-                    HealthStatus::Error
-                };
-
-                let details = HashMap::from([
-                    ("hit_rate".to_string(), format!("{:.1}%", hit_rate * 100.0)),
-                    ("reuse_rate".to_string(), format!("{:.1}%", reuse_rate * 100.0)),
-                    ("memory_usage".to_string(), memory_usage.to_string()),
-                    ("allocations".to_string(), stats.allocation_count.to_string()),
-                    ("reuses".to_string(), stats.reuse_count.to_string()),
-                ]);
-
-                // Отправляем health check
-                let event = SystemEvent::HealthCheck {
-                    component: "buffer_pool".to_string(),
-                    status,
-                    details,
-                };
-
-                if let Err(e) = event_tx.send(event).await {
-                    error!("❌ Ошибка отправки health check буферного пула: {}", e);
-                }
-
-                // Проверяем performance alerts
-                if hit_rate < 0.3 {
-                    let event = SystemEvent::PerformanceAlert {
-                        metric: "buffer_hit_rate".to_string(),
-                        value: hit_rate,
-                        threshold: 0.3,
-                        component: "buffer_pool".to_string(),
-                    };
-
-                    if let Err(e) = event_tx.send(event).await {
-                        error!("❌ Ошибка отправки performance alert: {}", e);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Мониторинг диспетчеров
-    async fn start_dispatcher_monitoring(&self) {
-        let work_stealing_dispatcher = self.work_stealing_dispatcher.clone();
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
-
-                // Получаем статистику от диспетчеров
-                let work_stealing_stats = work_stealing_dispatcher.get_stats();
-
-                // Анализируем статистику
-                let work_stealing_tasks: u64 = work_stealing_stats.values().sum();
-
-                let status = if work_stealing_tasks > 0 {
-                    HealthStatus::Ok
-                } else {
-                    HealthStatus::Warning
-                };
-
-                let details = HashMap::from([
-                    ("work_stealing_tasks".to_string(), work_stealing_tasks.to_string()),
-                ]);
-
-                // Отправляем health check
-                let event = SystemEvent::HealthCheck {
-                    component: "dispatchers".to_string(),
-                    status,
-                    details,
-                };
-
-                if let Err(e) = event_tx.send(event).await {
-                    error!("❌ Ошибка отправки health check диспетчеров: {}", e);
-                }
-            }
-        });
-    }
-
-    /// Мониторинг криптопроцессора
-    async fn start_crypto_processor_monitoring(&self) {
-        let crypto_processor = self.crypto_processor.clone();
-        let optimized_crypto_processor = self.optimized_crypto_processor.clone();
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
-
-                // Получаем статистику от криптопроцессоров
-                let stats = crypto_processor.get_stats();
-                let _optimized_stats = optimized_crypto_processor.get_stats();
-
-                let total_operations = stats.total_operations;
-                let failed_operations = stats.total_failed;
-                let success_rate = if total_operations > 0 {
-                    1.0 - (failed_operations as f64 / total_operations as f64)
-                } else {
-                    1.0
-                };
-
-                let status = if success_rate > 0.99 {
-                    HealthStatus::Ok
-                } else if success_rate > 0.95 {
-                    HealthStatus::Warning
-                } else {
-                    HealthStatus::Error
-                };
-
-                let details = HashMap::from([
-                    ("total_operations".to_string(), total_operations.to_string()),
-                    ("failed_operations".to_string(), failed_operations.to_string()),
-                    ("success_rate".to_string(), format!("{:.1}%", success_rate * 100.0)),
-                    ("batches_processed".to_string(), stats.total_batches.to_string()),
-                ]);
-
-                // Отправляем health check
-                let event = SystemEvent::HealthCheck {
-                    component: "crypto_processor".to_string(),
-                    status,
-                    details,
-                };
-
-                if let Err(e) = event_tx.send(event).await {
-                    error!("❌ Ошибка отправки health check криптопроцессора: {}", e);
-                }
-
-                // Проверяем performance alerts
-                if success_rate < 0.98 {
-                    let event = SystemEvent::PerformanceAlert {
-                        metric: "crypto_success_rate".to_string(),
-                        value: success_rate,
-                        threshold: 0.98,
-                        component: "crypto_processor".to_string(),
-                    };
-
-                    if let Err(e) = event_tx.send(event).await {
-                        error!("❌ Ошибка отправки performance alert: {}", e);
-                    }
-                }
-            }
-        });
-    }
-
-    /// Мониторинг соединений
-    async fn start_connection_monitoring(&self) {
-        let active_connections = self.active_connections.clone();
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
-
-                let connections = active_connections.read().await;
-                let total_connections = connections.len();
-                let active_count = connections.values().filter(|c| c.is_active).count();
-
-                let status = if active_count > 0 {
-                    HealthStatus::Ok
-                } else if total_connections == 0 {
-                    HealthStatus::Warning
-                } else {
-                    HealthStatus::Error
-                };
-
-                let details = HashMap::from([
-                    ("total_connections".to_string(), total_connections.to_string()),
-                    ("active_connections".to_string(), active_count.to_string()),
-                    ("inactive_connections".to_string(), (total_connections - active_count).to_string()),
-                ]);
-
-                // Отправляем health check
-                let event = SystemEvent::HealthCheck {
-                    component: "connections".to_string(),
-                    status,
-                    details,
-                };
-
-                if let Err(e) = event_tx.send(event).await {
-                    error!("❌ Ошибка отправки health check соединений: {}", e);
-                }
-            }
-        });
-    }
-
-    /// Мониторинг производительности
+    /// Запуск мониторинга производительности
     async fn start_performance_monitoring(&self) {
-        let stats = self.stats.clone();
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
-
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(10));
-            let mut last_stats = SystemStatistics::default();
-
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                interval.tick().await;
-
-                let current_stats = stats.read().await.clone();
-
-                // Вычисляем throughput
-                let time_diff = current_stats.uptime.as_secs_f64() - last_stats.uptime.as_secs_f64();
-                let data_diff = current_stats.total_data_received - last_stats.total_data_received;
-                let _packets_diff = current_stats.total_packets_processed - last_stats.total_packets_processed;
-
-                let bytes_per_second = if time_diff > 0.0 {
-                    data_diff as f64 / time_diff
-                } else {
-                    0.0
-                };
-
-                // Проверяем пороги производительности
-                if bytes_per_second > 100_000_000.0 { // 100 MB/s
-                    let event = SystemEvent::PerformanceAlert {
-                        metric: "throughput".to_string(),
-                        value: bytes_per_second,
-                        threshold: 100_000_000.0,
-                        component: "system".to_string(),
-                    };
-
-                    if let Err(e) = event_tx.send(event).await {
-                        error!("❌ Ошибка отправки performance alert: {}", e);
-                    }
-                }
-
-                // Сохраняем текущую статистику для следующего цикла
-                last_stats = current_stats;
-            }
-        });
-    }
-
-    /// Мониторинг здоровья системы
-    async fn start_system_health_monitoring(&self) {
-        let event_tx = self.event_tx.clone();
-        let is_running = self.is_running.clone();
         let system = self.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
 
-            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
+            while system.is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
-
-                // Выполняем комплексную проверку здоровья
-                let health_status = system.check_system_health().await;
-
-                // Отправляем общий health check
-                let event = SystemEvent::HealthCheck {
-                    component: "system".to_string(),
-                    status: health_status,
-                    details: HashMap::new(),
-                };
-
-                if let Err(e) = event_tx.send(event).await {
-                    error!("❌ Ошибка отправки системного health check: {}", e);
-                }
+                system.update_performance_counters().await;
+                system.check_scaling_needs().await;
             }
         });
     }
 
-    /// Проверка здоровья системы
-    async fn check_system_health(&self) -> HealthStatus {
-        let health_checks = self.health_checks.read().await;
+    /// Обновление счетчиков производительности
+    async fn update_performance_counters(&self) {
+        // Собираем метрики из буферных пулов
+        let stats = self.buffer_pool.get_stats();
+        let reuse_rate = self.optimized_buffer_pool.get_reuse_rate();
 
-        let mut error_count = 0;
-        let mut warning_count = 0;
-        let mut ok_count = 0;
-
-        for (_, status) in health_checks.iter() {
-            match status {
-                HealthStatus::Ok => ok_count += 1,
-                HealthStatus::Warning => warning_count += 1,
-                HealthStatus::Error => error_count += 1,
-                HealthStatus::Unknown => {}
-            }
-        }
-
-        if error_count > 0 {
-            HealthStatus::Error
-        } else if warning_count > 0 {
-            HealthStatus::Warning
-        } else if ok_count > 0 {
-            HealthStatus::Ok
+        let hit_rate = if stats.allocation_count + stats.reuse_count > 0 {
+            stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64
         } else {
-            HealthStatus::Unknown
+            0.0
+        };
+
+        // Обновляем счетчики
+        {
+            let mut counter = self.performance_counters
+                .entry("buffer_pool_hit_rate".to_string())
+                .or_insert_with(|| PerformanceCounter::new("buffer_pool_hit_rate".to_string(), 60));
+            counter.value_mut().update(hit_rate);
         }
+
+        {
+            let mut counter = self.performance_counters
+                .entry("buffer_pool_reuse_rate".to_string())
+                .or_insert_with(|| PerformanceCounter::new("buffer_pool_reuse_rate".to_string(), 60));
+            counter.value_mut().update(reuse_rate);
+        }
+
+        // Собираем метрики из криптопроцессора
+        let crypto_stats = self.crypto_processor.get_stats();
+        let success_rate = if crypto_stats.total_operations > 0 {
+            1.0 - (crypto_stats.total_failed as f64 / crypto_stats.total_operations as f64)
+        } else {
+            1.0
+        };
+
+        {
+            let mut counter = self.performance_counters
+                .entry("crypto_success_rate".to_string())
+                .or_insert_with(|| PerformanceCounter::new("crypto_success_rate".to_string(), 60));
+            counter.value_mut().update(success_rate);
+        }
+
+        // Собираем метрики из диспетчеров
+        let dispatcher_stats = self.work_stealing_dispatcher.get_stats();
+        let total_tasks: u64 = dispatcher_stats.values().sum();
+
+        {
+            let mut counter = self.performance_counters
+                .entry("work_stealing_tasks".to_string())
+                .or_insert_with(|| PerformanceCounter::new("work_stealing_tasks".to_string(), 60));
+            counter.value_mut().update(total_tasks as f64);
+        }
+
+        // Собираем метрики соединений
+        let connections = self.active_connections.read().await;
+        let active_connections = connections.len();
+
+        {
+            let mut counter = self.performance_counters
+                .entry("active_connections".to_string())
+                .or_insert_with(|| PerformanceCounter::new("active_connections".to_string(), 60));
+            counter.value_mut().update(active_connections as f64);
+        }
+    }
+
+    /// Проверка необходимости скейлинга
+    async fn check_scaling_needs(&self) {
+        let settings = self.scaling_settings.read().await;
+
+        // Проверяем, включен ли автоскейлинг и прошло ли достаточно времени с последнего скейлинга
+        if !settings.auto_scaling_enabled {
+            return;
+        }
+
+        let now = Instant::now();
+        if now.duration_since(settings.last_scaling_time) < Duration::from_secs(settings.scaling_cooldown_seconds) {
+            return;
+        }
+
+        // Получаем текущие значения производительности
+        let buffer_hit_rate = self.performance_counters
+            .get("buffer_pool_hit_rate")
+            .map(|c| c.average())
+            .unwrap_or(0.0);
+
+        let crypto_success_rate = self.performance_counters
+            .get("crypto_success_rate")
+            .map(|c| c.average())
+            .unwrap_or(1.0);
+
+        let work_stealing_tasks = self.performance_counters
+            .get("work_stealing_tasks")
+            .map(|c| c.value)
+            .unwrap_or(0.0) as usize;
+
+        let active_connections = self.performance_counters
+            .get("active_connections")
+            .map(|c| c.value)
+            .unwrap_or(0.0) as usize;
+
+        // Проверяем условия для скейлинга
+        let mut needs_scaling = false;
+        let mut scaling_action = ScalingAction::None;
+
+        // Проверка буферного пула
+        if buffer_hit_rate < settings.buffer_pool_target_hit_rate * 0.8 {
+            needs_scaling = true;
+            scaling_action = ScalingAction::IncreaseBufferPool;
+        }
+
+        // Проверка криптопроцессора
+        if crypto_success_rate < settings.crypto_processor_target_success_rate * 0.9 {
+            needs_scaling = true;
+            scaling_action = ScalingAction::IncreaseCryptoWorkers;
+        }
+
+        // Проверка диспетчеров
+        if work_stealing_tasks > settings.work_stealing_target_queue_size * 2 {
+            needs_scaling = true;
+            scaling_action = ScalingAction::IncreaseWorkers;
+        } else if work_stealing_tasks < settings.work_stealing_target_queue_size / 4 {
+            needs_scaling = true;
+            scaling_action = ScalingAction::DecreaseWorkers;
+        }
+
+        // Проверка соединений
+        if active_connections > settings.connection_target_count * 2 {
+            needs_scaling = true;
+            scaling_action = ScalingAction::IncreaseCapacity;
+        }
+
+        if needs_scaling {
+            self.apply_scaling_action(scaling_action, &settings).await;
+        }
+    }
+
+    /// Применение действия скейлинга
+    async fn apply_scaling_action(&self, action: ScalingAction, _settings: &ScalingSettings) {
+        match action {
+            ScalingAction::IncreaseBufferPool => {
+                warn!("📈 Увеличиваем buffer_pool из-за низкого hit rate");
+                // Здесь можно добавить логику увеличения буферного пула
+            }
+            ScalingAction::IncreaseCryptoWorkers => {
+                warn!("📈 Увеличиваем количество crypto workers");
+                // Здесь можно добавить логику увеличения воркеров
+            }
+            ScalingAction::IncreaseWorkers => {
+                warn!("📈 Увеличиваем количество work-stealing workers");
+                // Здесь можно добавить логику увеличения воркеров
+            }
+            ScalingAction::DecreaseWorkers => {
+                warn!("📉 Уменьшаем количество work-stealing workers");
+                // Здесь можно добавить логику уменьшения воркеров
+            }
+            ScalingAction::IncreaseCapacity => {
+                warn!("📈 Увеличиваем общую емкость системы");
+                // Здесь можно добавить комплексное увеличение емкости
+            }
+            ScalingAction::None => {}
+        }
+
+        // Обновляем время последнего скейлинга
+        let mut settings_write = self.scaling_settings.write().await;
+        settings_write.last_scaling_time = Instant::now();
     }
 
     /// Запуск обработчиков команд
@@ -1418,9 +1223,6 @@ impl IntegratedBatchSystem {
             SystemCommand::EmergencyShutdown { reason } => {
                 self.emergency_shutdown(reason).await;
             }
-            SystemCommand::RunHealthCheck { component } => {
-                self.run_health_check(component).await;
-            }
             SystemCommand::GetStatistics => {
                 self.get_statistics().await;
             }
@@ -1436,7 +1238,17 @@ impl IntegratedBatchSystem {
             SystemCommand::ScaleDown { count } => {
                 self.scale_down(count).await;
             }
+            SystemCommand::UpdateScalingSettings { settings } => {
+                self.update_scaling_settings(settings).await;
+            }
         }
+    }
+
+    /// Обновление настроек скейлинга
+    async fn update_scaling_settings(&self, settings: ScalingSettings) {
+        let mut current_settings = self.scaling_settings.write().await;
+        *current_settings = settings;
+        info!("⚙️ Настройки скейлинга обновлены");
     }
 
     /// Запуск обработки
@@ -1444,17 +1256,6 @@ impl IntegratedBatchSystem {
         if !self.is_running.load(std::sync::atomic::Ordering::SeqCst) {
             info!("▶️ Запуск обработки данных...");
             self.is_running.store(true, std::sync::atomic::Ordering::SeqCst);
-
-            // Обновляем health check
-            let event = SystemEvent::HealthCheck {
-                component: "processing".to_string(),
-                status: HealthStatus::Ok,
-                details: HashMap::from([("action".to_string(), "started".to_string())]),
-            };
-
-            if let Err(e) = self.event_tx.send(event).await {
-                error!("❌ Ошибка отправки события: {}", e);
-            }
         }
     }
 
@@ -1463,16 +1264,6 @@ impl IntegratedBatchSystem {
         if self.is_running.load(std::sync::atomic::Ordering::SeqCst) {
             info!("⏸️ Приостановка обработки данных...");
             self.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
-
-            let event = SystemEvent::HealthCheck {
-                component: "processing".to_string(),
-                status: HealthStatus::Warning,
-                details: HashMap::from([("action".to_string(), "paused".to_string())]),
-            };
-
-            if let Err(e) = self.event_tx.send(event).await {
-                error!("❌ Ошибка отправки события: {}", e);
-            }
         }
     }
 
@@ -1488,16 +1279,6 @@ impl IntegratedBatchSystem {
 
         // Завершаем все активные задачи
         self.shutdown_components().await;
-
-        let event = SystemEvent::HealthCheck {
-            component: "processing".to_string(),
-            status: HealthStatus::Unknown,
-            details: HashMap::from([("action".to_string(), "stopped".to_string())]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Сброс буферов
@@ -1513,16 +1294,6 @@ impl IntegratedBatchSystem {
             let mut cache = self.session_cache.write().await;
             cache.clear();
         }
-
-        let event = SystemEvent::HealthCheck {
-            component: "buffers".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([("action".to_string(), "flushed".to_string())]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Очистка кэшей
@@ -1535,16 +1306,6 @@ impl IntegratedBatchSystem {
         // Note: Акселераторы находятся в Arc, поэтому мы не можем их мутировать напрямую
         // Вместо этого мы можем создать новые экземпляры или добавить методы очистки через внутреннюю мутабельность
         warn!("⚠️ Очистка кэшей акселераторов требует дополнительной реализации");
-
-        let event = SystemEvent::HealthCheck {
-            component: "caches".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([("action".to_string(), "cleared".to_string())]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Регулировка конфигурации
@@ -1553,19 +1314,6 @@ impl IntegratedBatchSystem {
 
         // Здесь можно добавить логику регулировки конфигурации
         // В зависимости от параметра
-
-        let event = SystemEvent::HealthCheck {
-            component: "config".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([
-                ("parameter".to_string(), parameter),
-                ("value".to_string(), value),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Аварийное завершение
@@ -1577,183 +1325,6 @@ impl IntegratedBatchSystem {
 
         // Форсированное завершение
         self.shutdown_components().await;
-
-        let event = SystemEvent::ErrorOccurred {
-            error: reason.clone(),
-            context: "emergency_shutdown".to_string(),
-            severity: ErrorSeverity::Critical,
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
-    }
-
-    /// Выполнение health check
-    async fn run_health_check(&self, component: Option<String>) {
-        info!("🩺 Выполнение health check: {:?}", component);
-
-        if let Some(comp) = component {
-            // Проверка конкретного компонента
-            match comp.as_str() {
-                "buffer_pool" => {
-                    self.check_buffer_pool_health().await;
-                }
-                "crypto_processor" => {
-                    self.check_crypto_processor_health().await;
-                }
-                "dispatchers" => {
-                    self.check_dispatchers_health().await;
-                }
-                "connections" => {
-                    self.check_connections_health().await;
-                }
-                _ => {
-                    warn!("❓ Неизвестный компонент для health check: {}", comp);
-                }
-            }
-        } else {
-            // Проверка всех компонентов
-            self.check_buffer_pool_health().await;
-            self.check_crypto_processor_health().await;
-            self.check_dispatchers_health().await;
-            self.check_connections_health().await;
-        }
-    }
-
-    /// Проверка здоровья buffer pool
-    async fn check_buffer_pool_health(&self) {
-        let stats = self.buffer_pool.get_stats();
-        let reuse_rate = self.optimized_buffer_pool.get_reuse_rate();
-
-        let hit_rate = if stats.allocation_count + stats.reuse_count > 0 {
-            stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64
-        } else {
-            0.0
-        };
-
-        // ИЗМЕНЕНИЕ: На старте системы hit_rate может быть 0
-        // Это НЕ ошибка, а нормальное состояние
-        let status = if stats.total_allocated == 0 {
-            // Система только запустилась, еще не было аллокаций
-            HealthStatus::Ok
-        } else if hit_rate > 0.7 && reuse_rate > 0.6 {
-            HealthStatus::Ok
-        } else if hit_rate > 0.5 && reuse_rate > 0.4 {
-            HealthStatus::Warning
-        } else {
-            HealthStatus::Error
-        };
-
-        let event = SystemEvent::HealthCheck {
-            component: "buffer_pool".to_string(),
-            status,
-            details: HashMap::from([
-                ("hit_rate".to_string(), format!("{:.1}%", hit_rate * 100.0)),
-                ("reuse_rate".to_string(), format!("{:.1}%", reuse_rate * 100.0)),
-                ("allocations".to_string(), stats.allocation_count.to_string()),
-                ("reuses".to_string(), stats.reuse_count.to_string()),
-                ("total_allocated_mb".to_string(), format!("{:.1}", stats.total_allocated as f64 / 1024.0 / 1024.0)),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки health check: {}", e);
-        }
-    }
-
-    /// Проверка здоровья crypto processor
-    async fn check_crypto_processor_health(&self) {
-        let stats = self.crypto_processor.get_stats();
-        let optimized_stats = self.optimized_crypto_processor.get_stats();
-
-        let total_operations = stats.total_operations;
-        let failed_operations = stats.total_failed;
-        let success_rate = if total_operations > 0 {
-            1.0 - (failed_operations as f64 / total_operations as f64)
-        } else {
-            1.0
-        };
-
-        let status = if success_rate > 0.99 {
-            HealthStatus::Ok
-        } else if success_rate > 0.95 {
-            HealthStatus::Warning
-        } else {
-            HealthStatus::Error
-        };
-
-        let event = SystemEvent::HealthCheck {
-            component: "crypto_processor".to_string(),
-            status,
-            details: HashMap::from([
-                ("total_operations".to_string(), total_operations.to_string()),
-                ("failed_operations".to_string(), failed_operations.to_string()),
-                ("success_rate".to_string(), format!("{:.1}%", success_rate * 100.0)),
-                ("optimized_tasks".to_string(), optimized_stats.get("crypto_tasks_processed").unwrap_or(&0).to_string()),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки health check: {}", e);
-        }
-    }
-
-    /// Проверка здоровья диспетчеров
-    async fn check_dispatchers_health(&self) {
-        let work_stealing_stats = self.work_stealing_dispatcher.get_stats();
-
-        let work_stealing_tasks: u64 = work_stealing_stats.values().sum();
-
-        let status = if work_stealing_tasks > 0 {
-            HealthStatus::Ok
-        } else {
-            HealthStatus::Warning
-        };
-
-        let event = SystemEvent::HealthCheck {
-            component: "dispatchers".to_string(),
-            status,
-            details: HashMap::from([
-                ("work_stealing_tasks".to_string(), work_stealing_tasks.to_string()),
-                ("worker_count".to_string(), self.config.worker_count.to_string()),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки health check: {}", e);
-        }
-    }
-
-    /// Проверка здоровья соединений
-    async fn check_connections_health(&self) {
-        let connections = self.active_connections.read().await;
-        let total_connections = connections.len();
-        let active_count = connections.values().filter(|c| c.is_active).count();
-
-        // ИЗМЕНЕНИЕ: 0 соединений на старте - это НОРМАЛЬНО
-        let status = if total_connections == 0 {
-            HealthStatus::Ok  // Было Warning, меняем на Ok
-        } else if active_count > 0 {
-            HealthStatus::Ok
-        } else {
-            // Есть соединения, но все неактивны
-            HealthStatus::Warning
-        };
-
-        let event = SystemEvent::HealthCheck {
-            component: "connections".to_string(),
-            status,
-            details: HashMap::from([
-                ("total_connections".to_string(), total_connections.to_string()),
-                ("active_connections".to_string(), active_count.to_string()),
-                ("inactive_connections".to_string(), (total_connections - active_count).to_string()),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки health check: {}", e);
-        }
     }
 
     /// Получение статистики
@@ -1787,15 +1358,8 @@ impl IntegratedBatchSystem {
         // Также сбрасываем метрики
         self.metrics.clear();
 
-        let event = SystemEvent::HealthCheck {
-            component: "statistics".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([("action".to_string(), "reset".to_string())]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
+        // Сбрасываем счетчики производительности
+        self.performance_counters.clear();
     }
 
     /// Перебалансировка воркеров
@@ -1804,16 +1368,6 @@ impl IntegratedBatchSystem {
 
         // Здесь можно добавить логику перебалансировки
         // Например, перераспределение задач между воркерами
-
-        let event = SystemEvent::HealthCheck {
-            component: "workers".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([("action".to_string(), "rebalanced".to_string())]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Масштабирование вверх
@@ -1822,19 +1376,6 @@ impl IntegratedBatchSystem {
 
         // Здесь можно добавить логику масштабирования
         // Например, создание дополнительных воркеров
-
-        let event = SystemEvent::HealthCheck {
-            component: "scaling".to_string(),
-            status: HealthStatus::Ok,
-            details: HashMap::from([
-                ("action".to_string(), "scale_up".to_string()),
-                ("count".to_string(), count.to_string()),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Масштабирование вниз
@@ -1843,19 +1384,6 @@ impl IntegratedBatchSystem {
 
         // Здесь можно добавить логику масштабирования
         // Например, остановка части воркеров
-
-        let event = SystemEvent::HealthCheck {
-            component: "scaling".to_string(),
-            status: HealthStatus::Warning,
-            details: HashMap::from([
-                ("action".to_string(), "scale_down".to_string()),
-                ("count".to_string(), count.to_string()),
-            ]),
-        };
-
-        if let Err(e) = self.event_tx.send(event).await {
-            error!("❌ Ошибка отправки события: {}", e);
-        }
     }
 
     /// Запуск сборщика статистики
@@ -1903,7 +1431,7 @@ impl IntegratedBatchSystem {
                         .drain(..)
                         .partition(|batch| {
                             batch.deadline.map_or(true, |deadline| now >= deadline)
-                                || batch.operations.len() >= system.config.batch_size as usize
+                                || batch.operations.len() >= system.config.batch_size
                         });
 
                     *batches = not_ready;
@@ -1984,23 +1512,6 @@ impl IntegratedBatchSystem {
         }
     }
 
-    /// Инициализация health checks
-    async fn initialize_health_checks(&self) {
-        info!("🩺 Инициализация health checks...");
-
-        let mut health_checks = self.health_checks.write().await;
-
-        // Инициализируем health checks для всех компонентов
-        health_checks.insert("system".to_string(), HealthStatus::Unknown);
-        health_checks.insert("buffer_pool".to_string(), HealthStatus::Unknown);
-        health_checks.insert("crypto_processor".to_string(), HealthStatus::Unknown);
-        health_checks.insert("dispatchers".to_string(), HealthStatus::Unknown);
-        health_checks.insert("connections".to_string(), HealthStatus::Unknown);
-        health_checks.insert("processing".to_string(), HealthStatus::Unknown);
-
-        info!("✅ Health checks инициализированы");
-    }
-
     /// Завершение компонентов
     async fn shutdown_components(&self) {
         info!("🛑 Завершение компонентов системы...");
@@ -2072,110 +1583,39 @@ impl IntegratedBatchSystem {
     pub async fn get_status(&self) -> SystemStatus {
         let stats = self.stats.read().await.clone();
         let connections = self.active_connections.read().await;
+        let settings = self.scaling_settings.read().await.clone();
 
-        // Собираем статусы компонентов
-        let mut component_status = HashMap::new();
+        // Рассчитываем текущую пропускную способность
+        let throughput = ThroughputMetrics {
+            packets_per_second: 0.0, // Нужно рассчитать на основе истории
+            bytes_per_second: 0.0,
+            operations_per_second: 0.0,
+            avg_batch_size: 0.0,
+            latency_p50: Duration::from_millis(0),
+            latency_p95: Duration::from_millis(0),
+            latency_p99: Duration::from_millis(0),
+        };
 
-        let health_checks = self.health_checks.read().await;
-        for (component, status) in health_checks.iter() {
-            component_status.insert(component.clone(), ComponentStatus {
-                name: component.clone(),
-                status: *status,
-                last_check: Instant::now(),
-                details: HashMap::new(),
-                performance: 0.0,
-            });
-        }
-
-        // Определяем общий статус системы
-        let overall_status = self.determine_overall_status(&component_status).await;
+        // Рассчитываем использование памяти (упрощенно)
+        let memory_usage = MemoryUsage {
+            total: 0,
+            used: 0,
+            free: 0,
+            buffer_pool: 0,
+            crypto_pool: 0,
+            connections: connections.len(),
+        };
 
         SystemStatus {
             timestamp: Instant::now(),
-            overall_status,
-            component_status,
+            is_running: self.is_running.load(std::sync::atomic::Ordering::Relaxed),
             statistics: stats,
             active_connections: connections.len(),
-            pending_tasks: 0, // Можно вычислить из диспетчеров
-            memory_usage: MemoryUsage {
-                total: 0,
-                used: 0,
-                free: 0,
-                buffer_pool: 0,
-                crypto_pool: 0,
-                connections: connections.len(),
-            },
-            cpu_usage: 0.0,
-            throughput: ThroughputMetrics {
-                packets_per_second: 0.0,
-                bytes_per_second: 0.0,
-                operations_per_second: 0.0,
-                avg_batch_size: 0.0,
-                latency_p50: Duration::from_millis(0),
-                latency_p95: Duration::from_millis(0),
-                latency_p99: Duration::from_millis(0),
-            },
-            alerts: Vec::new(),
+            pending_tasks: self.pending_batches.read().await.len(),
+            memory_usage,
+            throughput,
+            scaling_settings: settings,
         }
-    }
-
-    /// Определение общего статуса системы
-    async fn determine_overall_status(&self, component_status: &HashMap<String, ComponentStatus>) -> SystemHealth {
-        let mut error_count = 0;
-        let mut warning_count = 0;
-        let mut ok_count = 0;
-
-        for (_, status) in component_status.iter() {
-            match status.status {
-                HealthStatus::Ok => ok_count += 1,
-                HealthStatus::Warning => warning_count += 1,
-                HealthStatus::Error => error_count += 1,
-                HealthStatus::Unknown => {}
-            }
-        }
-
-        if error_count > 0 {
-            SystemHealth::Critical
-        } else if warning_count > 0 {
-            SystemHealth::Degraded
-        } else if ok_count > 0 {
-            SystemHealth::Healthy
-        } else {
-            SystemHealth::Offline
-        }
-    }
-
-    /// Отправка команды в систему
-    pub fn send_command(&self, command: SystemCommand) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-        self.command_tx.send(command)?;
-        Ok(())
-    }
-
-    /// Получение статистики в реальном времени
-    pub async fn get_realtime_stats(&self) -> SystemStatistics {
-        self.stats.read().await.clone()
-    }
-
-    /// Проверка работоспособности системы
-    pub fn is_healthy(&self) -> bool {
-        self.is_running.load(std::sync::atomic::Ordering::Relaxed)
-            && self.is_initialized.load(std::sync::atomic::Ordering::Relaxed)
-    }
-
-    /// Гибкое завершение системы
-    pub async fn graceful_shutdown(&self) {
-        info!("🛑 Гибкое завершение системы...");
-
-        // Останавливаем обработку
-        self.stop_processing().await;
-
-        // Ждем завершения текущих задач
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        // Завершаем компоненты
-        self.shutdown_components().await;
-
-        info!("✅ Система завершена");
     }
 }
 
@@ -2198,6 +1638,17 @@ impl tokio::io::AsyncRead for ReaderEventStream {
     }
 }
 
+/// Действия скейлинга
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScalingAction {
+    None,
+    IncreaseBufferPool,
+    IncreaseCryptoWorkers,
+    IncreaseWorkers,
+    DecreaseWorkers,
+    IncreaseCapacity,
+}
+
 impl Clone for IntegratedBatchSystem {
     fn clone(&self) -> Self {
         Self {
@@ -2216,7 +1667,6 @@ impl Clone for IntegratedBatchSystem {
             packet_processor: self.packet_processor.clone(),
             session_manager: self.session_manager.clone(),
             crypto: self.crypto.clone(),
-            monitor: self.monitor.clone(),
             event_tx: self.event_tx.clone(),
             event_rx: self.event_rx.clone(),
             command_tx: self.command_tx.clone(),
@@ -2225,13 +1675,15 @@ impl Clone for IntegratedBatchSystem {
             startup_time: self.startup_time,
             stats: self.stats.clone(),
             metrics: self.metrics.clone(),
-            health_checks: self.health_checks.clone(),
             pending_batches: self.pending_batches.clone(),
             active_connections: self.active_connections.clone(),
             session_cache: self.session_cache.clone(),
+            scaling_settings: self.scaling_settings.clone(),
+            performance_counters: self.performance_counters.clone(),
         }
     }
 }
 
 // Экспортируем тип для использования в других модулях
 pub use IntegratedBatchSystem as BatchSystem;
+use crate::core::monitoring::unified_monitor::UnifiedMonitor;

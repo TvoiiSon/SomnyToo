@@ -50,6 +50,11 @@ pub mod core {
                 pub mod priority;
                 pub mod error;
             }
+            pub mod heartbeat {
+                pub mod batch_system_monitor;
+                pub mod health_check;
+                pub mod metrics;
+            }
         }
         pub mod packets {
             pub mod packet_service;
@@ -126,6 +131,7 @@ pub mod core {
         }
         pub mod childs {
             pub mod server_monitor;
+            pub mod batch_system_monitor;
         }
     }
     pub mod sql_server {

@@ -107,9 +107,9 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
     // Создаем batch систему с обработкой ошибки
     let batch_system_result = BatchSystem::new(
         batch_config,  // Первый аргумент: BatchConfig
-        monitor.clone(),
         phantom_session_manager.clone(),
         phantom_crypto_instance.clone(),
+        Some(monitor.clone()),
     ).await;
 
     // Обрабатываем ошибку создания batch системы
