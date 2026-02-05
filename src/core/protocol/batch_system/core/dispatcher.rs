@@ -109,10 +109,11 @@ impl PacketDispatcher {
     async fn start_workers(&self) {
         let mut handles = Vec::new();
         for worker_id in 0..self.config.worker_count {
-            info!("👷 Spawning worker #{}...", worker_id);
             let handle = self.spawn_worker(worker_id).await;
             handles.push(handle);
         }
+
+        info!("👷 Spawning workers #{}...", self.config.worker_count);
 
         // Сохраняем handles
         *self.workers.write().await = handles;

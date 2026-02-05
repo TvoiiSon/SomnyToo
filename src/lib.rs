@@ -23,12 +23,12 @@ pub mod core {
             pub mod runtime {
                 pub mod runtime;
             }
-            
+
         }
         pub mod batch_system {
             pub mod config;
             pub mod integration;
-            
+
             pub mod acceleration_batch {
                 pub mod chacha20_batch_accel;
                 pub mod blake3_batch_accel;
@@ -41,7 +41,10 @@ pub mod core {
                 pub mod buffer;
             }
             pub mod optimized {
-                
+                pub mod work_stealing_dispatcher;
+                pub mod buffer_pool;
+                pub mod crypto_processor;
+                pub mod factory;
             }
             pub mod types {
                 pub mod priority;

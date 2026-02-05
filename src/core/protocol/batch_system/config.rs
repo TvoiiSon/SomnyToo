@@ -1,3 +1,4 @@
+// Файл: config.rs
 use std::time::Duration;
 
 /// Конфигурация всей batch системы
@@ -35,8 +36,10 @@ pub struct BatchConfig {
 
 impl Default for BatchConfig {
     fn default() -> Self {
-        let cpu_count = 16; // AMD Ryzen 7 7735HS имеет 8 ядер/16 потоков
-        
+        // ИСПРАВЛЕНИЕ: Используем реальное количество CPU
+        let cpu_count = num_cpus::get();
+        let worker_multiplier = 8; // AMD Ryzen 7 7735HS имеет 8 ядер/16 потоков
+
         Self {
             // Чтение - оптимизировано для 10K+ соединений
             read_buffer_size: 32768,        // 32KB для снижения syscall
@@ -56,7 +59,8 @@ impl Default for BatchConfig {
             enable_adaptive_batching: true, // Критически важно!
 
             // Диспетчер - максимальный параллелизм
-            worker_count: cpu_count * 8,    // 128 воркеров! (16*8)
+            // ИСПРАВЛЕНИЕ: Умножаем на 8 как и планировалось
+            worker_count: cpu_count * worker_multiplier, // 128 воркеров! (16*8)
             max_queue_size: 500000,         // Полмиллиона задач в очереди
             enable_work_stealing: true,
             load_balancing_interval: Duration::from_millis(100), // Супер-частая балансировка

@@ -403,15 +403,14 @@ dependencies = [
 
 [[package]]
 name = "dashmap"
-version = "7.0.0-rc2"
+version = "5.5.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e4a1e35a65fe0538a60167f0ada6e195ad5d477f6ddae273943596d4a1a5730b"
+checksum = "978747c1d849a7d2ee5e8adc0159961c48fb7e5db2f06af6723b80123bb53856"
 dependencies = [
  "cfg-if",
- "crossbeam-utils",
- "equivalent",
- "hashbrown 0.15.4",
+ "hashbrown 0.14.5",
  "lock_api",
+ "once_cell",
  "parking_lot_core",
 ]
 
@@ -1446,6 +1445,20 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2b15c43186be67a4fd63bee50d0303afffcef381492ebe2c5d87f324e1b8815c"
 
 [[package]]
+name = "ring"
+version = "0.17.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4689e6c2294d81e88dc6261c768b63bc4fcdb852be6d1352498b114f61383b7"
+dependencies = [
+ "cc",
+ "cfg-if",
+ "getrandom 0.2.16",
+ "libc",
+ "untrusted",
+ "windows-sys 0.52.0",
+]
+
+[[package]]
 name = "rsa"
 version = "0.9.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1668,6 +1681,7 @@ dependencies = [
  "rand_core",
  "rayon",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "sqlx",
@@ -2214,6 +2228,12 @@ dependencies = [
  "crypto-common",
  "subtle",
 ]
+
+[[package]]
+name = "untrusted"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "url"

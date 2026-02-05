@@ -8,8 +8,6 @@ use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_han
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
 use crate::core::protocol::batch_system::integration::BatchSystem;
-
-// Добавляем импорт функции из connection_manager
 use crate::core::protocol::server::connection_manager_phantom::handle_phantom_client_connection;
 
 pub async fn handle_phantom_connection(
@@ -17,7 +15,7 @@ pub async fn handle_phantom_connection(
     peer: std::net::SocketAddr,
     session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<BatchSystem>,  // Изменён тип
+    batch_system: Arc<BatchSystem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Выполняем handshake
     let handshake_result = match timeout(
@@ -32,7 +30,11 @@ pub async fn handle_phantom_connection(
     };
 
     let handshake_result = match handshake_result {
-        Ok(result) => result,
+        Ok(result) => {
+            info!("✅ Handshake successful for {}, session: {}",
+                  peer, hex::encode(result.session.session_id()));
+            result
+        },
         Err(e) => {
             error!("Handshake failed for {}: {}", peer, e);
             return Ok(());
@@ -41,6 +43,8 @@ pub async fn handle_phantom_connection(
 
     let session = Arc::new(handshake_result.session);
     let session_id = session.session_id().to_vec();
+
+    info!("📝 Registering session: {} for {}", hex::encode(&session_id), peer);
 
     // Регистрируем сессию
     if let Err(e) = session_manager.add_session_with_addr(&session_id, session.clone(), peer).await {
@@ -63,7 +67,6 @@ pub async fn handle_phantom_connection(
         }
         Err(e) => {
             error!("❌ Connection {} failed: {}", peer, e);
-            // Все равно возвращаем Ok, чтобы не падать на одной ошибке соединения
             Ok(())
         }
     }

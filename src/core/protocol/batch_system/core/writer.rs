@@ -125,8 +125,12 @@ impl BatchWriter {
     async fn write_immediate(&self, task: WriteTask) -> Result<(), BatchError> {
         let mut connections = self.connections.write().await;
 
+        // ИЩЕМ ПО session_id, а не по адресу!
         if let Some(writer) = connections.iter_mut()
-            .find(|w| w.destination_addr == task.destination_addr && w.is_active) {
+            .find(|w| w.session_id == task.session_id && w.is_active) {
+
+            info!("✅ Found connection for session {} to {}",
+              hex::encode(&task.session_id), task.destination_addr);
 
             match tokio::time::timeout(
                 self.config.write_timeout,
@@ -145,19 +149,27 @@ impl BatchWriter {
                 Ok(Err(e)) => {
                     writer.is_active = false;
                     error!("❌ Immediate write failed for session {}: {}",
-                    hex::encode(&writer.session_id), e);
+                hex::encode(&writer.session_id), e);
                     Err(BatchError::ProcessingError(e.to_string()))
                 }
                 Err(_) => {
                     writer.is_active = false;
                     error!("⏰ Immediate write timeout for session {}",
-                    hex::encode(&writer.session_id));
+                hex::encode(&writer.session_id));
                     Err(BatchError::Timeout)
                 }
             }
         } else {
-            error!("❌ Connection not found for immediate write to {}",
-            task.destination_addr);
+            error!("❌ Connection not found for session {} to {}",
+               hex::encode(&task.session_id), task.destination_addr);
+
+            // Дополнительная отладка: выведем все доступные соединения
+            debug!("Available connections:");
+            for conn in connections.iter() {
+                debug!("  - Session: {}, Addr: {}, Active: {}",
+                   hex::encode(&conn.session_id), conn.destination_addr, conn.is_active);
+            }
+
             Err(BatchError::ConnectionError("Connection not found".to_string()))
         }
     }
