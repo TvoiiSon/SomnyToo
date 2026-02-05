@@ -102,11 +102,6 @@ impl PhantomConnectionManager {
         }
     }
 
-    pub async fn connection_exists(&self, session_id: &[u8]) -> bool {
-        let connections = self.active_connections.read().await;
-        connections.contains_key(session_id)
-    }
-
     pub async fn register_connection(&self, session_id: Vec<u8>, shutdown_tx: tokio::sync::mpsc::Sender<()>) {
         let mut connections = self.active_connections.write().await;
         connections.insert(session_id.clone(), shutdown_tx);
@@ -123,10 +118,5 @@ impl PhantomConnectionManager {
             let _ = shutdown_tx.send(()).await;
             info!("👻 Forced disconnect for phantom session: {}", hex::encode(session_id));
         }
-    }
-
-    pub async fn get_active_connections_count(&self) -> usize {
-        let connections = self.active_connections.read().await;
-        connections.len()
     }
 }

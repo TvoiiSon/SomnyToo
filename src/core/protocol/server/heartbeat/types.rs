@@ -158,10 +158,9 @@ impl ConnectionHeartbeatManager {
     ) {
         let mut to_remove = Vec::new();
 
-        // TODO
         for (session_id, (_session, response_tx)) in active_connections.iter() {
             // Временное решение: создаем простой heartbeat пакет
-            let heartbeat_data = vec![0x11]; // Простой heartbeat пакет
+            let heartbeat_data = vec![0x10]; // Простой heartbeat пакет
 
             if response_tx.send(heartbeat_data).is_err() {
                 warn!("👻 Failed to send heartbeat to phantom session: {}, connection closed",

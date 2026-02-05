@@ -49,8 +49,6 @@ pub mod core {
             pub mod types {
                 pub mod priority;
                 pub mod error;
-                pub mod result;
-                pub mod state;
             }
         }
         pub mod packets {

@@ -23,7 +23,7 @@ pub enum BatchError {
     Crypto(String),
 
     #[error("Connection closed: {0}")]
-    ConnectionClosed(String), // Добавляем здесь
+    ConnectionClosed(String),
 }
 
 /// Результат batch операций

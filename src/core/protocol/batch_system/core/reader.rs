@@ -52,6 +52,12 @@ impl BatchReader {
         session_id: Vec<u8>,
         read_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     ) -> Result<(), BatchError> {
+        // ПРОВЕРКА: event_tx еще открыт
+        if self.event_tx.is_closed() {
+            error!("❌ Event channel is closed, cannot register connection");
+            return Err(BatchError::ConnectionError("Event channel closed".to_string()));
+        }
+
         let event_tx = self.event_tx.clone();
         let config = self.config.clone();
         let is_running = self.is_running.clone();

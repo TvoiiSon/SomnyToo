@@ -25,8 +25,4 @@ impl Priority {
     pub fn is_critical(&self) -> bool {
         matches!(self, Priority::Critical)
     }
-
-    pub fn is_high(&self) -> bool {
-        matches!(self, Priority::Critical | Priority::High)
-    }
 }
