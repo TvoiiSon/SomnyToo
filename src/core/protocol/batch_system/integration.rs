@@ -3,7 +3,7 @@ use std::time::{Instant, Duration};
 use std::collections::HashMap;
 use tokio::sync::{mpsc, RwLock, Mutex, broadcast};
 use bytes::Bytes;
-use tracing::{info, error, debug, warn, trace};
+use tracing::{info, error, debug, warn};
 use dashmap::DashMap;
 
 // Импорты из batch системы
@@ -29,51 +29,40 @@ use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 
 /// Основной интегрированный узел Batch системы
 pub struct IntegratedBatchSystem {
-    // Конфигурация
     config: BatchConfig,
-
-    // Основные компоненты
     reader: Arc<BatchReader>,
     writer: Arc<BatchWriter>,
     dispatcher: Arc<PacketDispatcher>,
-    work_stealing_dispatcher: Arc<WorkStealingDispatcher>,
+    work_stealing_dispatcher: Arc<WorkStealingDispatcher>, // Теперь это LoadAwareDispatcher
     crypto_processor: Arc<CryptoProcessor>,
     optimized_crypto_processor: Arc<OptimizedCryptoProcessor>,
     buffer_pool: Arc<UnifiedBufferPool>,
     optimized_buffer_pool: Arc<OptimizedBufferPool>,
-
-    // Акселераторы
     chacha20_accelerator: Arc<ChaCha20BatchAccelerator>,
     blake3_accelerator: Arc<Blake3BatchAccelerator>,
-
-    // Сервисы
     packet_service: Arc<PhantomPacketService>,
     packet_processor: PhantomPacketProcessor,
     session_manager: Arc<PhantomSessionManager>,
     crypto: Arc<PhantomCrypto>,
-
-    // Каналы и управление
     event_tx: mpsc::Sender<SystemEvent>,
     event_rx: Arc<Mutex<mpsc::Receiver<SystemEvent>>>,
     command_tx: broadcast::Sender<SystemCommand>,
-
-    // Состояние системы
     is_running: Arc<std::sync::atomic::AtomicBool>,
     is_initialized: Arc<std::sync::atomic::AtomicBool>,
     startup_time: Instant,
-
-    // Статистика
     stats: Arc<RwLock<SystemStatistics>>,
     metrics: Arc<DashMap<String, MetricValue>>,
-
-    // Очереди и буферы
     pending_batches: Arc<RwLock<Vec<PendingBatch>>>,
     active_connections: Arc<RwLock<HashMap<std::net::SocketAddr, ConnectionInfo>>>,
     session_cache: Arc<RwLock<HashMap<Vec<u8>, SessionCacheEntry>>>,
-
-    // Внутренние настройки для скейлинга
     scaling_settings: Arc<RwLock<ScalingSettings>>,
     performance_counters: Arc<DashMap<String, PerformanceCounter>>,
+
+    // Новые поля
+    circuit_breaker_manager: Arc<CircuitBreakerManager>,
+    qos_manager: Arc<QosManager>,
+    adaptive_batcher: Arc<AdaptiveBatcher>,
+    metrics_tracing: Arc<MetricsTracingSystem>,
 }
 
 /// События системы
@@ -386,6 +375,19 @@ impl PerformanceCounter {
 
 use std::collections::VecDeque;
 
+#[derive(Debug, Clone)]
+pub struct AdvancedSystemMetrics {
+    pub system_status: SystemStatus,
+    pub dispatcher_metrics: AdvancedDispatcherMetrics,
+    pub batch_metrics: BatchMetrics,
+    pub qos_stats: QosStatistics,
+    pub qos_quotas: (f64, f64, f64),
+    pub qos_utilization: (f64, f64, f64),
+    pub circuit_stats: Vec<CircuitBreakerStats>,
+    pub trace_stats: TraceStats,
+    pub timestamp: Instant,
+}
+
 impl IntegratedBatchSystem {
     /// Создание новой интегрированной batch системы
     pub async fn new(
@@ -394,15 +396,66 @@ impl IntegratedBatchSystem {
         crypto: Arc<PhantomCrypto>,
         monitor: Option<Arc<UnifiedMonitor>>,
     ) -> Result<Self, BatchError> {
-        info!("🚀 Инициализация интегрированной Batch системы...");
+        info!("🚀 Инициализация оптимизированной Batch системы...");
 
         let startup_time = Instant::now();
 
-        // Создаем каналы для событий СИСТЕМЫ
+        // Инициализируем системы метрик и трассировки
+        let metrics_config = MetricsConfig {
+            enabled: config.metrics_enabled,
+            collection_interval: config.metrics_collection_interval,
+            trace_sampling_rate: config.trace_sampling_rate,
+            service_name: "batch-system".to_string(),
+            service_version: "1.0.0".to_string(),
+            environment: "production".to_string(),
+            retention_period: Duration::from_secs(300),
+        };
+
+        let metrics_tracing = Arc::new(
+            MetricsTracingSystem::new(metrics_config)
+                .map_err(|e| BatchError::ProcessingError(e.to_string()))?
+        );
+
+        // Инициализируем Circuit Breaker Manager
+        let circuit_breaker_manager = Arc::new(
+            CircuitBreakerManager::new(Arc::new(config.clone()))
+        );
+
+        // Создаем Circuit Breaker для ключевых компонентов
+        let _dispatcher_circuit_breaker = circuit_breaker_manager.get_or_create("dispatcher");
+
+        // Инициализируем QoS Manager
+        let qos_manager = Arc::new(
+            QosManager::new(
+                config.high_priority_quota,
+                config.normal_priority_quota,
+                config.low_priority_quota,
+                config.max_queue_size,
+            )
+        );
+
+        // Инициализируем Adaptive Batcher
+        let adaptive_batcher_config = AdaptiveBatcherConfig {
+            min_batch_size: config.min_batch_size,
+            max_batch_size: config.max_batch_size,
+            initial_batch_size: config.batch_size,
+            window_duration: config.adaptive_batch_window,
+            target_latency: Duration::from_millis(50),
+            max_increase_rate: 0.5,
+            min_decrease_rate: 0.3,
+            adaptation_interval: Duration::from_secs(1),
+            enable_auto_tuning: config.enable_adaptive_batching,
+        };
+
+        let adaptive_batcher = Arc::new(
+            AdaptiveBatcher::new(adaptive_batcher_config)
+        );
+
+        // Каналы для событий СИСТЕМЫ
         let (system_event_tx, system_event_rx) = mpsc::channel(10000);
         let (command_tx, _) = broadcast::channel(100);
 
-        // Создаем канал для READER событий
+        // Канал для READER событий
         let (reader_event_tx, reader_event_rx) = mpsc::channel(10000);
 
         // Инициализируем основные компоненты
@@ -419,8 +472,8 @@ impl IntegratedBatchSystem {
             num_cpus::get()
         ));
 
-        let chacha20_accelerator = Arc::new(ChaCha20BatchAccelerator::new(8));
-        let blake3_accelerator = Arc::new(Blake3BatchAccelerator::new(8));
+        let chacha20_accelerator = Arc::new(ChaCha20BatchAccelerator::new(4));
+        let blake3_accelerator = Arc::new(Blake3BatchAccelerator::new(4));
 
         // Создаем packet service
         let packet_service = Arc::new(PhantomPacketService::new(
@@ -428,7 +481,6 @@ impl IntegratedBatchSystem {
             {
                 use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
 
-                // Используем переданный монитор или создаем временный
                 let monitor_to_use = monitor.unwrap_or_else(|| {
                     Arc::new(UnifiedMonitor::new(
                         crate::core::monitoring::config::MonitoringConfig::default()
@@ -444,7 +496,7 @@ impl IntegratedBatchSystem {
 
         let packet_processor = PhantomPacketProcessor::new();
 
-        // Создаем reader с ЧИТАТЕЛЬСКИМ каналом
+        // Создаем reader
         let reader = Arc::new(BatchReader::new(config.clone(), reader_event_tx.clone()));
 
         let writer = Arc::new(BatchWriter::new(config.clone()));
@@ -456,11 +508,14 @@ impl IntegratedBatchSystem {
             writer.clone(),
         ).await);
 
-        let work_stealing_dispatcher = Arc::new(WorkStealingDispatcher::new(
-            config.worker_count,
-            config.max_queue_size,
-            session_manager.clone(),
-        ));
+        // Создаем WorkStealingDispatcher вместо LoadAwareDispatcher для совместимости
+        let work_stealing_dispatcher = Arc::new(
+            WorkStealingDispatcher::new(
+                config.worker_count,
+                config.max_queue_size,
+                session_manager.clone(),
+            )
+        );
 
         // Создаем систему
         let system = Self {
@@ -479,8 +534,8 @@ impl IntegratedBatchSystem {
             packet_processor,
             session_manager: session_manager.clone(),
             crypto: crypto.clone(),
-            event_tx: system_event_tx.clone(),  // <-- Системный канал
-            event_rx: Arc::new(Mutex::new(system_event_rx)),  // <-- Системный канал
+            event_tx: system_event_tx.clone(),
+            event_rx: Arc::new(Mutex::new(system_event_rx)),
             command_tx,
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             is_initialized: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -495,16 +550,111 @@ impl IntegratedBatchSystem {
             session_cache: Arc::new(RwLock::new(HashMap::new())),
             scaling_settings: Arc::new(RwLock::new(ScalingSettings::default())),
             performance_counters: Arc::new(DashMap::new()),
+
+            // Новые поля
+            circuit_breaker_manager,
+            qos_manager,
+            adaptive_batcher,
+            metrics_tracing,
         };
 
-        // ЗАПУСКАЕМ КОНВЕРТЕР ReaderEvent -> SystemEvent
+        // Запускаем конвертер ReaderEvent -> SystemEvent
         system.start_reader_event_converter(reader_event_rx).await;
 
         // Инициализируем систему
         system.initialize().await?;
 
-        info!("✅ Интегрированная Batch система успешно инициализирована");
+        info!("✅ Оптимизированная Batch система успешно инициализирована");
         Ok(system)
+    }
+
+    // Добавляем новые методы
+
+    /// Получить расширенные метрики системы
+    pub async fn get_advanced_metrics(&self) -> AdvancedSystemMetrics {
+        let status = self.get_status().await;
+
+        // Получаем метрики из диспетчера
+        let dispatcher_metrics = self.work_stealing_dispatcher.get_advanced_metrics().await;
+        let batch_metrics = self.adaptive_batcher.get_metrics().await;
+        let qos_stats = self.qos_manager.get_statistics().await;
+        let qos_quotas = self.qos_manager.get_quotas().await;
+        let qos_utilization = self.qos_manager.get_utilization().await;
+        let circuit_stats = self.circuit_breaker_manager.get_all_stats().await;
+        let trace_stats = self.metrics_tracing.get_trace_stats();
+
+        AdvancedSystemMetrics {
+            system_status: status,
+            dispatcher_metrics,
+            batch_metrics,
+            qos_stats,
+            qos_quotas,
+            qos_utilization,
+            circuit_stats,
+            trace_stats,
+            timestamp: Instant::now(),
+        }
+    }
+
+    /// Принудительная адаптация батчинга
+    pub async fn force_batch_adaptation(&self) {
+        self.adaptive_batcher.force_adaptation().await;
+    }
+
+    /// Обновление QoS квот
+    pub async fn update_qos_quotas(
+        &self,
+        high_priority: Option<f64>,
+        normal_priority: Option<f64>,
+        low_priority: Option<f64>,
+    ) -> Result<(), super::qos_manager::QosError> {
+        self.qos_manager.update_quotas(high_priority, normal_priority, low_priority).await
+    }
+
+    /// Сброс Circuit Breaker
+    pub async fn reset_circuit_breaker(&self, name: &str) {
+        if let Some(breaker) = self.circuit_breaker_manager.get_breaker(name).await {
+            breaker.reset().await;
+        }
+    }
+
+    /// Graceful degradation при перегрузке
+    pub async fn enable_graceful_degradation(&self) {
+        info!("🔄 Включение graceful degradation");
+
+        // 1. Уменьшаем QoS квоты для низкоприоритетного трафика
+        let _ = self.update_qos_quotas(
+            Some(0.5),   // Увеличиваем high priority
+            Some(0.4),   // Нормальный оставляем
+            Some(0.1),   // Уменьшаем low priority
+        ).await;
+
+        // 2. Уменьшаем размер батчей
+        self.adaptive_batcher.force_adaptation().await;
+
+        // 3. Включаем более агрессивный Circuit Breaker
+        // (уже настроено в конфигурации)
+
+        info!("✅ Graceful degradation активирован");
+    }
+
+    /// Восстановление нормального режима
+    pub async fn disable_graceful_degradation(&self) {
+        info!("🔄 Выключение graceful degradation");
+
+        // Возвращаем стандартные QoS квоты
+        let _ = self.update_qos_quotas(
+            Some(self.config.high_priority_quota),
+            Some(self.config.normal_priority_quota),
+            Some(self.config.low_priority_quota),
+        ).await;
+
+        // Сбрасываем Circuit Breakers
+        for breaker in self.circuit_breaker_manager.get_all_breakers() {
+            breaker.reset().await;
+        }
+
+        info!("✅ Нормальный режим восстановлен");
     }
 
     // Добавьте этот метод для конвертации событий
@@ -649,7 +799,7 @@ impl IntegratedBatchSystem {
         priority: Priority,
         timestamp: Instant,
     ) {
-        trace!("📥 Получены данные: {} байт от {}", data.len(), source_addr);
+        info!("📥 Получены данные: {} байт от {}", data.len(), source_addr);
 
         // Обновляем статистику
         {
@@ -690,7 +840,7 @@ impl IntegratedBatchSystem {
         // Определяем тип обработки на основе приоритета и размера данных
         let _processor_type = self.determine_processor_type(&data, priority);
 
-        // Создаем задачу
+        // Создаем задачу для WorkStealingDispatcher
         let task = WorkStealingTask {
             id: 0, // Будет установлен диспетчером
             session_id: session_id.clone(),
@@ -704,7 +854,7 @@ impl IntegratedBatchSystem {
         // Отправляем в work-stealing диспетчер
         match self.work_stealing_dispatcher.submit_task(task).await {
             Ok(task_id) => {
-                debug!("✅ Задача отправлена в work-stealing диспетчер, ID: {}", task_id);
+                info!("✅ Задача отправлена в work-stealing диспетчер, ID: {}", task_id);
 
                 // Отслеживаем результат
                 self.track_task_result(task_id, session_id, source_addr).await;
@@ -734,7 +884,7 @@ impl IntegratedBatchSystem {
         _processing_time: Duration,
         _worker_id: Option<usize>,
     ) {
-        debug!("✅ Данные обработаны для сессии: {}, успех: {}",
+        info!("✅ Данные обработаны для сессии: {}, успех: {}",
                hex::encode(&session_id), result.success);
 
         if result.success {
@@ -770,6 +920,8 @@ impl IntegratedBatchSystem {
         session_id: Vec<u8>,
         source_addr: std::net::SocketAddr,
     ) {
+        info!("🔄 Отслеживание результата задачи {}", task_id);
+
         let dispatcher = self.work_stealing_dispatcher.clone();
         let event_tx = self.event_tx.clone();
         let system = self.clone();
@@ -790,6 +942,8 @@ impl IntegratedBatchSystem {
 
             match result {
                 Ok(Some(task_result)) => {
+                    info!("✅ Получен результат задачи {}", task_id);
+
                     // Клонируем результат перед использованием
                     let result_clone = task_result.result.clone();
                     let processing_time = task_result.processing_time;
@@ -861,18 +1015,24 @@ impl IntegratedBatchSystem {
         session_id: Vec<u8>,
         source_addr: std::net::SocketAddr,
     ) {
+        info!("🔄 Processing task result for session: {}", hex::encode(&session_id));
+
         match task_result.result {
             Ok(data) => {
+                info!("✅ Task result successful, data length: {}", data.len());
+
                 // Данные уже дешифрованы work-stealing dispatcher
                 if data.len() > 1 {
                     let packet_type = data[0];
                     let packet_data = &data[1..];
 
-                    debug!("📦 Обработка дешифрованного пакета: тип=0x{:02x}, размер={}",
+                    info!("📦 Обработка дешифрованного пакета: тип=0x{:02x}, размер={}",
                            packet_type, packet_data.len());
 
                     // Получаем сессию
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
+                        info!("✅ Session found for {}", hex::encode(&session_id));
+
                         // Обрабатываем через packet service
                         match self.packet_service.process_packet(
                             session.clone(),
@@ -881,6 +1041,9 @@ impl IntegratedBatchSystem {
                             source_addr,
                         ).await {
                             Ok(processing_result) => {
+                                info!("✅ Packet service processed: packet_type=0x{:02x}, response_len={}",
+                                       processing_result.packet_type, processing_result.response.len());
+
                                 // Шифруем ответ
                                 match self.packet_processor.create_outgoing_vec(
                                     &session,
@@ -888,15 +1051,25 @@ impl IntegratedBatchSystem {
                                     &processing_result.response,
                                 ) {
                                     Ok(encrypted_response) => {
+                                        info!("✅ Response encrypted: {} bytes", encrypted_response.len());
+
                                         // Отправляем зашифрованный ответ
-                                        if let Err(e) = self.writer.write(
+                                        info!("📤 Sending response to {} with priority: {:?}",
+                                               source_addr, processing_result.priority);
+
+                                        match self.writer.write(
                                             source_addr,
-                                            session_id,
-                                            Bytes::from(encrypted_response),
+                                            session_id.clone(),
+                                            Bytes::from(encrypted_response.clone()),
                                             processing_result.priority,
                                             true,
                                         ).await {
-                                            error!("❌ Ошибка отправки ответа: {}", e);
+                                            Ok(_) => {
+                                                info!("✅ Response sent successfully to {}", source_addr);
+                                            }
+                                            Err(e) => {
+                                                error!("❌ Ошибка отправки ответа: {}", e);
+                                            }
                                         }
                                     }
                                     Err(e) => {
@@ -911,6 +1084,8 @@ impl IntegratedBatchSystem {
                     } else {
                         warn!("⚠️ Сессия не найдена: {}", hex::encode(&session_id));
                     }
+                } else {
+                    warn!("⚠️ Получены данные некорректной длины: {}", data.len());
                 }
             }
             Err(err) => {
@@ -957,7 +1132,7 @@ impl IntegratedBatchSystem {
         processing_time: Duration,
         success_rate: f64
     ) {
-        debug!("✅ Батч {} завершен: размер={}, время={:?}, успех={:.1}%",
+        info!("✅ Батч {} завершен: размер={}, время={:?}, успех={:.1}%",
                batch_id, size, processing_time, success_rate * 100.0);
 
         // Обновляем статистику
@@ -1450,7 +1625,7 @@ impl IntegratedBatchSystem {
 
     /// Обработка батча
     async fn process_batch(&self, batch: PendingBatch) {
-        debug!("🔄 Обработка батча {} с {} операциями", batch.id, batch.operations.len());
+        info!("🔄 Обработка батча {} с {} операциями", batch.id, batch.operations.len());
 
         let start_time = Instant::now();
         let mut successful = 0;
@@ -1619,25 +1794,6 @@ impl IntegratedBatchSystem {
     }
 }
 
-// Добавьте структуру-обертку для потока:
-struct ReaderEventStream {
-    inner: Box<dyn tokio::io::AsyncRead + Unpin + Send + Sync>,
-    event_tx: mpsc::Sender<ReaderEvent>,
-    addr: std::net::SocketAddr,
-    session_id: Vec<u8>,
-}
-
-impl tokio::io::AsyncRead for ReaderEventStream {
-    fn poll_read(
-        mut self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-        buf: &mut tokio::io::ReadBuf<'_>,
-    ) -> std::task::Poll<std::io::Result<()>> {
-        // Просто делегируем чтение внутреннему потоку
-        std::pin::Pin::new(&mut self.inner).poll_read(cx, buf)
-    }
-}
-
 /// Действия скейлинга
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScalingAction {
@@ -1680,6 +1836,10 @@ impl Clone for IntegratedBatchSystem {
             session_cache: self.session_cache.clone(),
             scaling_settings: self.scaling_settings.clone(),
             performance_counters: self.performance_counters.clone(),
+            circuit_breaker_manager: self.circuit_breaker_manager.clone(),
+            qos_manager: self.qos_manager.clone(),
+            adaptive_batcher: self.adaptive_batcher.clone(),
+            metrics_tracing: self.metrics_tracing.clone(),
         }
     }
 }
@@ -1687,3 +1847,8 @@ impl Clone for IntegratedBatchSystem {
 // Экспортируем тип для использования в других модулях
 pub use IntegratedBatchSystem as BatchSystem;
 use crate::core::monitoring::unified_monitor::UnifiedMonitor;
+use crate::core::protocol::batch_system::adaptive_batcher::{AdaptiveBatcher, AdaptiveBatcherConfig, BatchMetrics};
+use crate::core::protocol::batch_system::circuit_breaker::{CircuitBreakerManager, CircuitBreakerStats};
+use crate::core::protocol::batch_system::load_aware_dispatcher::AdvancedDispatcherMetrics;
+use crate::core::protocol::batch_system::metrics_tracing::{MetricsConfig, MetricsTracingSystem, TraceStats};
+use crate::core::protocol::batch_system::qos_manager::{QosManager, QosStatistics};

@@ -96,6 +96,37 @@ impl WorkStealingDispatcher {
         dispatcher
     }
 
+    /// Получить расширенные метрики (для совместимости)
+    pub async fn get_advanced_metrics(&self) -> super::super::load_aware_dispatcher::AdvancedDispatcherMetrics {
+        use super::super::circuit_breaker::CircuitState;
+
+        // Получаем базовые метрики
+        let stats = self.get_stats();
+        let _total_tasks: u64 = stats.values().sum();
+
+        super::super::load_aware_dispatcher::AdvancedDispatcherMetrics {
+            total_workers: self.worker_senders.len(),
+            healthy_workers: self.worker_senders.len(), // Все worker'ы считаются здоровыми
+            total_queue: 0, // WorkStealingDispatcher не отслеживает очередь
+            avg_processing_time_ms: 0.0,
+            circuit_breaker_state: CircuitState::Closed,
+            qos_quotas: (0.0, 0.0, 0.0),
+            qos_utilization: (0.0, 0.0, 0.0),
+            current_batch_size: 0,
+            batch_metrics: super::super::adaptive_batcher::BatchMetrics {
+                total_batches: 0,
+                total_items: 0,
+                avg_batch_size: 0.0,
+                avg_processing_time: Duration::from_secs(0),
+                p95_processing_time: Duration::from_secs(0),
+                p99_processing_time: Duration::from_secs(0),
+                last_adaptation: Instant::now(),
+                adaptation_count: 0,
+            },
+            imbalance: 0.0,
+        }
+    }
+
     fn process_task_with_decryption(
         worker_id: usize,
         task: WorkStealingTask,

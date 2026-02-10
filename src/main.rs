@@ -23,6 +23,7 @@ use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
 // Импортируем batch систему
 use somnytoo::core::protocol::batch_system::integration::BatchSystem;
 use somnytoo::core::protocol::batch_system::config::BatchConfig;
+use somnytoo::core::protocol::batch_system::metrics_tracing::MetricsTracingSystem;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -55,6 +56,8 @@ async fn main() -> Result<()> {
     info!("  - Phantom Mode: {}", app_config.phantom.enabled);
     info!("  - Phantom Assembler: {}", app_config.phantom.assembler_type);
     info!("  - Hardware Auth: {}", app_config.phantom.hardware_auth_enabled);
+
+    MetricsTracingSystem::init_tracing()?;
 
     run_server_mode(app_config).await
 }
