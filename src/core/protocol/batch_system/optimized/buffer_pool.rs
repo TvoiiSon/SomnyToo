@@ -118,6 +118,16 @@ impl PooledBuffer {
     pub fn is_stale(&self, max_age: Duration) -> bool {
         !self.is_used && Instant::now().duration_since(self.last_used) > max_age
     }
+
+    /// ✅ Добавляем метод для получения возраста буфера
+    pub fn age(&self) -> Duration {
+        Instant::now().duration_since(self.created_at)
+    }
+
+    /// ✅ Добавляем метод для получения размерного класса
+    pub fn size_class(&self) -> SizeClass {
+        self.size_class
+    }
 }
 
 /// Оптимизированный пул буферов с размерными классами
@@ -139,6 +149,7 @@ pub struct SizeClassStats {
     pub peak_active: usize,
     pub memory_usage: usize,
     pub avg_reuse_count: f64,
+    pub avg_buffer_age_secs: f64, // ✅ Добавляем средний возраст буферов
 }
 
 /// Глобальная статистика пула
@@ -187,6 +198,7 @@ pub struct ClassDetailStats {
     pub hit_rate: f64,
     pub memory_mb: f64,
     pub avg_reuse_count: f64,
+    pub avg_buffer_age_secs: f64, // ✅ Добавляем средний возраст
 }
 
 impl OptimizedBufferPool {
@@ -253,6 +265,7 @@ impl OptimizedBufferPool {
                 peak_active: 0,
                 memory_usage: 0,
                 avg_reuse_count: 0.0,
+                avg_buffer_age_secs: 0.0, // ✅ Инициализируем новое поле
             });
         }
     }
@@ -273,15 +286,26 @@ impl OptimizedBufferPool {
             .position(|buf| buf.can_reuse_for(requested_size))
         {
             let mut buffer = pools[pool_index].swap_remove_back(index).unwrap();
+
+            // ✅ Используем поля size_class и created_at для статистики
+            let buffer_size_class = buffer.size_class();
+            let buffer_age = buffer.age();
+
             buffer.prepare_for_reuse();
 
             stats.reuses += 1;
             stats.current_active += 1;
             stats.peak_active = stats.peak_active.max(stats.current_active);
+
+            // ✅ Обновляем средний возраст буферов этого класса
+            let total_age_secs = stats.avg_buffer_age_secs * (stats.reuses - 1) as f64;
+            stats.avg_buffer_age_secs = (total_age_secs + buffer_age.as_secs_f64()) / stats.reuses as f64;
+
             global_stats.total_reuses += 1;
 
-            debug!("✅ Buffer reuse: class={}, size={}, capacity={}, time={:?}",
-                   size_class.name(), requested_size, buffer.capacity(), start_time.elapsed());
+            debug!("✅ Buffer reuse: class={}, size={}, capacity={}, age={:?}, time={:?}",
+                   buffer_size_class.name(), requested_size, buffer.capacity(),
+                   buffer_age, start_time.elapsed());
 
             return buffer.data;
         }
@@ -294,18 +318,28 @@ impl OptimizedBufferPool {
                 .position(|buf| buf.can_reuse_for(requested_size))
             {
                 let mut buffer = pools[larger_pool_index].swap_remove_back(index).unwrap();
+
+                // ✅ Используем поля size_class и created_at
+                let buffer_size_class = buffer.size_class();
+                let buffer_age = buffer.age();
+
                 buffer.prepare_for_reuse();
 
                 if let Some(mut larger_stats) = self.stats.get_mut(&larger_class) {
                     larger_stats.reuses += 1;
                     larger_stats.current_active += 1;
                     larger_stats.peak_active = larger_stats.peak_active.max(larger_stats.current_active);
+
+                    // ✅ Обновляем средний возраст для большего класса
+                    let total_age_secs = larger_stats.avg_buffer_age_secs * (larger_stats.reuses - 1) as f64;
+                    larger_stats.avg_buffer_age_secs = (total_age_secs + buffer_age.as_secs_f64()) / larger_stats.reuses as f64;
                 }
 
                 global_stats.total_reuses += 1;
 
-                debug!("✅ Buffer reuse from larger class: from={}, to={}, size={}, capacity={}",
-                       larger_class.name(), size_class.name(), requested_size, buffer.capacity());
+                debug!("✅ Buffer reuse from larger class: from={}, to={}, size={}, capacity={}, age={:?}",
+                       buffer_size_class.name(), size_class.name(), requested_size,
+                       buffer.capacity(), buffer_age);
 
                 return buffer.data;
             }
@@ -323,6 +357,9 @@ impl OptimizedBufferPool {
         stats.current_active += 1;
         stats.peak_active = stats.peak_active.max(stats.current_active);
         stats.memory_usage += buffer.capacity();
+
+        // ✅ Для новых буферов возраст 0, но мы все равно записываем
+        stats.avg_buffer_age_secs = (stats.avg_buffer_age_secs * (stats.allocations - 1) as f64) / stats.allocations as f64;
 
         global_stats.total_allocations += 1;
         global_stats.total_memory_allocated += buffer.capacity();
@@ -427,6 +464,7 @@ impl OptimizedBufferPool {
                     hit_rate,
                     memory_mb,
                     avg_reuse_count: stats.avg_reuse_count,
+                    avg_buffer_age_secs: stats.avg_buffer_age_secs, // ✅ Добавляем в статистику
                 });
             }
         }
@@ -440,6 +478,7 @@ impl OptimizedBufferPool {
             hit_rate: global_stats.current_hit_rate,
             memory_mb: global_stats.total_memory_allocated as f64 / 1024.0 / 1024.0,
             avg_reuse_count: 0.0,
+            avg_buffer_age_secs: 0.0,
         });
 
         result
@@ -469,6 +508,17 @@ impl OptimizedBufferPool {
 
             if hit_rate < 0.3 {
                 return false;
+            }
+
+            // ✅ Используем size_class для принятия решения
+            match size_class {
+                SizeClass::Giant | SizeClass::XLarge => {
+                    // Для больших буферов более строгие условия
+                    if stats.avg_reuse_count < 2.0 {
+                        return false;
+                    }
+                }
+                _ => {}
             }
         }
 
@@ -513,8 +563,11 @@ impl OptimizedBufferPool {
             pool.retain(|buf| {
                 let is_stale = buf.is_stale(max_age);
 
+                // ✅ Используем created_at через age() для логирования
                 if is_stale && before > min_pool_size {
                     total_freed += buf.capacity();
+                    debug!("🧹 Removing stale buffer: class={}, age={:?}, capacity={}",
+                           buf.size_class().name(), buf.age(), buf.capacity());
                     false
                 } else {
                     true
@@ -540,8 +593,15 @@ impl OptimizedBufferPool {
                 let class = SizeClass::all_classes()[class_idx];
                 let class_memory: usize = pool.iter().map(|buf| buf.data.capacity()).sum();
 
+                // ✅ Обновляем статистику с учетом возраста оставшихся буферов
                 if let Some(mut stats) = self.stats.get_mut(&class) {
                     stats.memory_usage = class_memory;
+
+                    // Пересчитываем средний возраст для оставшихся буферов
+                    if !pool.is_empty() {
+                        let total_age: f64 = pool.iter().map(|buf| buf.age().as_secs_f64()).sum();
+                        stats.avg_buffer_age_secs = total_age / pool.len() as f64;
+                    }
                 }
             }
         }
