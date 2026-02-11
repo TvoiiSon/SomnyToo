@@ -1,8 +1,10 @@
+use std::io;
+
 /// Единые ошибки batch системы
 #[derive(Debug, thiserror::Error)]
 pub enum BatchError {
     #[error("IO error: {0}")]
-    Io(#[from] std::io::Error),
+    Io(#[from] io::Error),
 
     #[error("Connection error: {0}")]
     ConnectionError(String),

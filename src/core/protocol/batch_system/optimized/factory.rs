@@ -4,7 +4,7 @@ use super::work_stealing_dispatcher::WorkStealingDispatcher;
 use super::buffer_pool::OptimizedBufferPool;
 use super::crypto_processor::OptimizedCryptoProcessor;
 
-// НОВЫЕ ИМПОРТЫ
+// ИМПОРТЫ ДЛЯ ИНТЕГРАЦИИ
 use crate::core::protocol::batch_system::adaptive_batcher::AdaptiveBatcher;
 use crate::core::protocol::batch_system::qos_manager::QosManager;
 use crate::core::protocol::batch_system::circuit_breaker::CircuitBreaker;

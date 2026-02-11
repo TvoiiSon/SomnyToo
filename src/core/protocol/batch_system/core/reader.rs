@@ -52,7 +52,6 @@ impl BatchReader {
         session_id: Vec<u8>,
         read_stream: Box<dyn AsyncRead + Unpin + Send + Sync>,
     ) -> Result<(), BatchError> {
-        // ПРОВЕРКА: event_tx еще открыт
         if self.event_tx.is_closed() {
             error!("❌ Event channel is closed, cannot register connection");
             return Err(BatchError::ConnectionError("Event channel closed".to_string()));
@@ -61,16 +60,11 @@ impl BatchReader {
         let event_tx = self.event_tx.clone();
         let config = self.config.clone();
         let is_running = self.is_running.clone();
-
-        // Клонируем session_id для использования в замыкании
         let session_id_clone = session_id.clone();
 
         tokio::spawn(async move {
-            // Обернем read_stream в Mutex для потокобезопасного доступа
             let read_stream = Arc::new(Mutex::new(read_stream));
             let session_id_inner = session_id_clone.clone();
-
-            // Счетчик неудачных попыток чтения
             let mut consecutive_read_errors = 0;
             const MAX_CONSECUTIVE_ERRORS: u32 = 3;
 
@@ -82,7 +76,7 @@ impl BatchReader {
 
                 match read_result {
                     Ok(Some((data, _bytes_read))) => {
-                        consecutive_read_errors = 0; // Сброс счетчика ошибок
+                        consecutive_read_errors = 0;
 
                         let priority = Priority::from_byte(&data);
 
@@ -100,7 +94,6 @@ impl BatchReader {
                         }
                     }
                     Ok(None) => {
-                        // Нет данных - соединение закрыто
                         debug!("🔌 Connection closed gracefully for {}", source_addr);
                         break;
                     }
@@ -121,22 +114,17 @@ impl BatchReader {
                             _ => {
                                 warn!("⚠️ Read error from {} (attempt {}): {}",
                                     source_addr, consecutive_read_errors, e);
-
-                                // Краткая пауза перед повторной попыткой
                                 tokio::time::sleep(Duration::from_millis(100)).await;
                             }
                         }
                     }
                 }
 
-                // Короткая пауза между чтениями чтобы не загружать CPU
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
 
-            // Очищаем ресурсы
             info!("📕 Reader task finished for {}", source_addr);
 
-            // Отправляем событие о закрытии соединения
             let event = ReaderEvent::ConnectionClosed {
                 source_addr,
                 reason: "Reader task finished".to_string(),
@@ -154,17 +142,12 @@ impl BatchReader {
         read_stream: &mut (dyn AsyncRead + Unpin + Send + Sync),
         config: &BatchConfig,
     ) -> Result<Option<(BytesMut, usize)>, BatchError> {
-        // Убираем лишний debug log
-        // debug!("Attempting to read frame from stream...");
-
-        // Используем frame_reader для чтения
         match tokio::time::timeout(
             config.read_timeout,
             frame_reader::read_frame(read_stream),
         ).await {
             Ok(Ok(data)) => {
                 if data.is_empty() {
-                    // Пустые данные - соединение закрыто корректно
                     return Ok(None);
                 }
 
@@ -174,7 +157,6 @@ impl BatchReader {
                 Ok(Some((buffer, bytes_read)))
             }
             Ok(Err(e)) => {
-                // Проверяем, является ли ошибка закрытием соединения
                 if e.to_string().contains("Connection closed") ||
                     e.to_string().contains("UnexpectedEof") ||
                     e.to_string().contains("Broken pipe") ||

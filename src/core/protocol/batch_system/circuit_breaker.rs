@@ -53,13 +53,11 @@ impl CircuitBreaker {
         match state {
             CircuitState::Closed => true,
             CircuitState::Open => {
-                // Проверяем, не прошло ли достаточно времени для recovery
                 if let Some(last_failure) = *self.last_failure.read().await {
                     if Instant::now().duration_since(last_failure) >= self.recovery_timeout {
-                        // Переходим в HalfOpen
                         *self.state.write().await = CircuitState::HalfOpen;
                         *self.half_open_success_count.write().await = 0;
-                        info!("🔧 Circuit breaker '{}' переход в HalfOpen", self.name);
+                        info!("🔧 Circuit breaker '{}' transition to HalfOpen", self.name);
                         return true;
                     }
                 }
@@ -82,18 +80,16 @@ impl CircuitBreaker {
                 *count += 1;
 
                 if *count >= self.half_open_max_requests {
-                    // Восстановление успешно
                     *state = CircuitState::Closed;
                     *self.failure_count.write().await = 0;
                     *self.last_failure.write().await = None;
                     *count = 0;
 
-                    info!("✅ Circuit breaker '{}' восстановлен", self.name);
+                    info!("✅ Circuit breaker '{}' recovered", self.name);
                     self.record_metric("recovered".to_string(), 1.0);
                 }
             }
             CircuitState::Closed => {
-                // Сбрасываем счетчик ошибок после успешных операций
                 *self.failure_count.write().await = 0;
             }
             _ => {}
@@ -107,7 +103,6 @@ impl CircuitBreaker {
 
         *self.last_failure.write().await = Some(Instant::now());
 
-        // Обновляем метрики
         self.record_metric("failures".to_string(), *failure_count as f64);
         self.record_metric("failure_rate".to_string(),
                            *failure_count as f64 / self.failure_threshold as f64);
@@ -116,7 +111,7 @@ impl CircuitBreaker {
             let mut state = self.state.write().await;
             if *state != CircuitState::Open {
                 *state = CircuitState::Open;
-                warn!("🚨 Circuit breaker '{}' открыт после {} ошибок",
+                warn!("🚨 Circuit breaker '{}' opened after {} failures",
                     self.name, *failure_count);
                 self.record_metric("circuit_opened".to_string(), 1.0);
             }
@@ -130,7 +125,7 @@ impl CircuitBreaker {
         *self.last_failure.write().await = None;
         *self.half_open_success_count.write().await = 0;
 
-        info!("🔄 Circuit breaker '{}' принудительно сброшен", self.name);
+        info!("🔄 Circuit breaker '{}' manually reset", self.name);
         self.record_metric("manual_reset".to_string(), 1.0);
     }
 
@@ -206,7 +201,7 @@ impl CircuitBreakerManager {
 
         for entry in self.breakers.iter() {
             let breaker = entry.value();
-            let breaker_stats = breaker.get_stats().await; // Уже есть .await
+            let breaker_stats = breaker.get_stats().await;
             stats.push(breaker_stats);
         }
 

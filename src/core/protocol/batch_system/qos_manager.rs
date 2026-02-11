@@ -78,11 +78,9 @@ pub struct AdaptationDecision {
 /// Вспомогательная функция для преобразования приоритета в строку
 fn priority_to_str(priority: Priority) -> &'static str {
     match priority {
-        Priority::Critical => "critical",
-        Priority::High => "high",
+        Priority::Critical | Priority::High => "high",
         Priority::Normal => "normal",
-        Priority::Low => "low",
-        Priority::Background => "background",
+        Priority::Low | Priority::Background => "low",
     }
 }
 
@@ -95,7 +93,7 @@ impl QosManager {
     ) -> Self {
         let total = high_priority_quota + normal_priority_quota + low_priority_quota;
         let (normalized_high, normalized_normal, normalized_low) = if (total - 1.0).abs() > 0.01 {
-            warn!("QoS quotas don't sum to 1.0 ({}), normalizing", total);
+            warn!("⚠️ QoS quotas don't sum to 1.0 ({}), normalizing", total);
             (
                 high_priority_quota / total,
                 normal_priority_quota / total,
@@ -128,7 +126,6 @@ impl QosManager {
 
         let metrics = Arc::new(DashMap::new());
 
-        // Инициализируем метрики
         metrics.insert("qos.initialized".to_string(), 1.0);
         metrics.insert("qos.high_capacity".to_string(), high_capacity as f64);
         metrics.insert("qos.normal_capacity".to_string(), normal_capacity as f64);
@@ -150,7 +147,6 @@ impl QosManager {
     pub async fn acquire_permit(&self, priority: Priority) -> Result<QosPermit<'_>, QosError> {
         let start_wait = Instant::now();
 
-        // Обновляем статистику запросов
         self.update_statistics(priority, false).await;
 
         let permit_result = match priority {
@@ -177,7 +173,6 @@ impl QosManager {
         match permit_result {
             Ok(Ok(permit_owned)) => {
                 let wait_time = start_wait.elapsed();
-
                 self.record_wait_time(priority, wait_time).await;
 
                 self.record_metric(
@@ -266,7 +261,7 @@ impl QosManager {
         let mut new_low = quotas.current_low_priority;
         let mut reason = String::new();
 
-        // Простая адаптивная логика
+        // Адаптивная логика
         if high_rejection > 0.1 {
             let increase = 0.05;
             if new_low > 0.1 {
@@ -294,7 +289,6 @@ impl QosManager {
             return Err(QosError::NoAdaptationNeeded);
         }
 
-        // Нормализация
         let total = new_high + new_normal + new_low;
         new_high /= total;
         new_normal /= total;
@@ -311,6 +305,7 @@ impl QosManager {
             reason,
         };
 
+        drop(quotas);
         self.apply_adaptation(&decision).await?;
         Ok(decision)
     }
@@ -345,17 +340,16 @@ impl QosManager {
         quotas.current_low_priority = decision.to_low;
         quotas.last_adaptation = Instant::now();
 
-        // Записываем метрики адаптации
         self.record_metric("qos.adaptation".to_string(), 1.0);
         self.record_metric("qos.high_quota".to_string(), decision.to_high);
         self.record_metric("qos.normal_quota".to_string(), decision.to_normal);
         self.record_metric("qos.low_quota".to_string(), decision.to_low);
 
-        info!("🔄 QoS адаптация применена:");
+        info!("🔄 QoS adaptation applied:");
         info!("  High: {:.1}% → {:.1}%", decision.from_high * 100.0, decision.to_high * 100.0);
         info!("  Normal: {:.1}% → {:.1}%", decision.from_normal * 100.0, decision.to_normal * 100.0);
         info!("  Low: {:.1}% → {:.1}%", decision.from_low * 100.0, decision.to_low * 100.0);
-        info!("  Причина: {}", decision.reason);
+        info!("  Reason: {}", decision.reason);
 
         Ok(())
     }
@@ -479,13 +473,13 @@ impl<'a> Drop for QosPermit<'a> {
 
 #[derive(Debug, thiserror::Error)]
 pub enum QosError {
-    #[error("Таймаут ожидания разрешения QoS")]
+    #[error("Timeout waiting for QoS permit")]
     Timeout,
-    #[error("Семафор QoS закрыт")]
+    #[error("Semaphore closed")]
     SemaphoreClosed,
-    #[error("Недостаточно данных для адаптации")]
+    #[error("Insufficient data for adaptation")]
     InsufficientData,
-    #[error("Адаптация не требуется")]
+    #[error("No adaptation needed")]
     NoAdaptationNeeded,
 }
 

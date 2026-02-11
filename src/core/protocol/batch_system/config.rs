@@ -64,57 +64,48 @@ impl Default for BatchConfig {
         let optimal_worker_count = cpu_count * 2;
 
         Self {
-            // Чтение
             read_buffer_size: 32768,
             read_timeout: Duration::from_secs(10),
             max_concurrent_reads: 10000,
             adaptive_read_timeout: true,
 
-            // Запись
             write_buffer_size: 65536,
             write_timeout: Duration::from_secs(5),
             max_pending_writes: 50000,
             flush_interval: Duration::from_millis(10),
             enable_qos: true,
 
-            // Обработка
             batch_size: 256,
             min_batch_size: 64,
             max_batch_size: 2048,
             enable_adaptive_batching: true,
             adaptive_batch_window: Duration::from_secs(1),
 
-            // Диспетчер
             worker_count: optimal_worker_count,
             max_queue_size: 100000,
             enable_work_stealing: true,
             load_balancing_interval: Duration::from_millis(250),
             enable_load_aware_scheduling: true,
 
-            // Буферы
             buffer_preallocation_size: 65536,
             max_concurrent_batches: cpu_count * 4,
             enable_monitoring: true,
             shrink_interval: Duration::from_secs(60),
 
-            // Circuit Breaker
             circuit_breaker_enabled: true,
             failure_threshold: 50,
             recovery_timeout: Duration::from_secs(30),
             half_open_max_requests: 10,
 
-            // QoS
             qos_enabled: true,
             high_priority_quota: 0.4,
             normal_priority_quota: 0.4,
             low_priority_quota: 0.2,
 
-            // Metrics
             metrics_enabled: true,
             metrics_collection_interval: Duration::from_secs(5),
             trace_sampling_rate: 0.1,
 
-            // SIMD Акселерация
             enable_simd_acceleration: true,
             simd_batch_size: 8,
         }

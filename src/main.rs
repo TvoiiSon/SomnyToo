@@ -94,13 +94,6 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         heartbeat_system.clone(),
     ));
 
-    // Создаем монитор для batch системы
-    use somnytoo::core::monitoring::unified_monitor::UnifiedMonitor;
-    use somnytoo::core::monitoring::config::MonitoringConfig;
-
-    let monitoring_config = MonitoringConfig::default();
-    let monitor = Arc::new(UnifiedMonitor::new(monitoring_config));
-
     // Создаем конфигурацию для batch системы
     let batch_config = BatchConfig::default();  // Используем конфиг по умолчанию
 
@@ -109,7 +102,7 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
         batch_config,  // Первый аргумент: BatchConfig
         phantom_session_manager.clone(),
         phantom_crypto_instance.clone(),
-        Some(monitor.clone()),
+        heartbeat_system.clone(),
     ).await;
 
     // Обрабатываем ошибку создания batch системы

@@ -1,7 +1,7 @@
 /// Единая система приоритетов для всей batch системы
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum Priority {
-    Critical = 0,    // Heartbeat, управляющие команды
+    Critical = 0,    // Heartbeat, Ping, управляющие команды
     High = 1,        // Важные данные
     Normal = 2,      // Обычный трафик
     Low = 3,         // Фоновые задачи
@@ -15,7 +15,7 @@ impl Priority {
         }
 
         match data[0] {
-            0x01 | 0x10 => Priority::Critical,    // PING и Heartbeat
+            0x01 | 0x10 => Priority::Critical,    // Ping и Heartbeat
             _ if data.len() <= 64 => Priority::High,
             _ if data.len() > 1024 => Priority::Low,
             _ => Priority::Normal,

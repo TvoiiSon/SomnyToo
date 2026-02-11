@@ -119,7 +119,6 @@ pub struct WorkStealingDispatcher {
     // 🎮 Управление
     is_running: Arc<std::sync::atomic::AtomicBool>,
     next_task_id: std::sync::atomic::AtomicU64,
-    next_batch_id: std::sync::atomic::AtomicU64,
 
     // 🔧 Обработка пакетов
     packet_processor: PhantomPacketProcessor,
@@ -145,7 +144,6 @@ impl WorkStealingDispatcher {
         qos_manager: Arc<QosManager>,
         circuit_breaker: Arc<CircuitBreaker>,
     ) -> Self {
-
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut worker_receivers = Vec::with_capacity(num_workers);
         let worker_queues = Arc::new(DashMap::with_capacity(num_workers));
@@ -158,7 +156,6 @@ impl WorkStealingDispatcher {
         }
 
         let (injector_sender, injector_receiver) = bounded(queue_capacity * 4);
-
         let backpressure_threshold = (queue_capacity as f64 * 0.8) as usize;
 
         let dispatcher = Self {
@@ -173,7 +170,6 @@ impl WorkStealingDispatcher {
             latency_histogram: Arc::new(DashMap::new()),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             next_task_id: std::sync::atomic::AtomicU64::new(1),
-            next_batch_id: std::sync::atomic::AtomicU64::new(1),
             packet_processor: PhantomPacketProcessor::new(),
             session_manager,
             adaptive_batcher,
@@ -183,29 +179,20 @@ impl WorkStealingDispatcher {
             backpressure_threshold,
         };
 
-        // ✅ ЗАПУСКАЕМ ВСЕ НЕОБХОДИМЫЕ СИСТЕМЫ ПРЯМО В КОНСТРУКТОРЕ
         dispatcher.start_workers();
         dispatcher.start_metrics_collector();
         dispatcher.start_queue_monitor();
         dispatcher.start_task_cleaner();
 
-        info!("✅ WorkStealingDispatcher полностью инициализирован со всеми системами");
-
+        info!("✅ WorkStealingDispatcher инициализирован с {} workers", num_workers);
         dispatcher
     }
 
     /// 👷 Запуск worker'ов
-    pub fn start_workers(&self) {
+    fn start_workers(&self) {
         let num_workers = self.worker_senders.len();
 
-        // Сохраняем в stats информацию о запуске
         self.stats.insert("workers_started".to_string(), num_workers as u64);
-        self.stats.insert("worker_start_time".to_string(),
-                          std::time::SystemTime::now()
-                              .duration_since(std::time::UNIX_EPOCH)
-                              .unwrap_or_default()
-                              .as_secs()
-        );
 
         for worker_id in 0..num_workers {
             let worker_receiver = self.worker_receivers[worker_id].clone();
@@ -244,12 +231,6 @@ impl WorkStealingDispatcher {
             });
         }
 
-        // Обновляем статистику о здоровых воркерах
-        self.worker_queues.clear();
-        for i in 0..num_workers {
-            self.worker_queues.insert(i, 0);
-        }
-
         info!("✅ Запущено {} work-stealing workers", num_workers);
     }
 
@@ -259,7 +240,7 @@ impl WorkStealingDispatcher {
         worker_id: usize,
         worker_receiver: Receiver<WorkStealingTask>,
         injector_receiver: Receiver<WorkStealingTask>,
-        injector_sender: Sender<WorkStealingTask>,
+        _injector_sender: Sender<WorkStealingTask>,
         results: Arc<DashMap<u64, WorkStealingResult>>,
         stats: Arc<DashMap<String, u64>>,
         latency_histogram: Arc<DashMap<u64, u64>>,
@@ -275,9 +256,9 @@ impl WorkStealingDispatcher {
 
         let mut tasks_processed = 0;
         let mut successful_tasks = 0;
-        let mut failed_tasks = 0;  // ✅ ТЕПЕРЬ ИСПОЛЬЗУЕТСЯ
+        let mut failed_tasks = 0;
         let mut batch_start_time = Instant::now();
-        let mut local_batch_size = adaptive_batcher.get_batch_size().await;
+        let mut batch_size = adaptive_batcher.get_batch_size().await;
 
         while is_running.load(std::sync::atomic::Ordering::Relaxed) {
             if !circuit_breaker.allow_request().await {
@@ -286,7 +267,7 @@ impl WorkStealingDispatcher {
             }
 
             if batch_start_time.elapsed() > Duration::from_millis(100) {
-                local_batch_size = adaptive_batcher.get_batch_size().await;
+                batch_size = adaptive_batcher.get_batch_size().await;
             }
 
             tokio::select! {
@@ -300,18 +281,18 @@ impl WorkStealingDispatcher {
                         Err(e) => {
                             debug!("Worker #{} QoS failed: {}, task requeued", worker_id, e);
                             circuit_breaker.record_failure().await;
-                            failed_tasks += 1;  // ✅ ИСПОЛЬЗУЕМ СЧЕТЧИК
+                            failed_tasks += 1;
 
                             if task.retry_count < 3 {
                                 let mut retry_task = task.clone();
                                 retry_task.retry_count += 1;
-                                let _ = injector_sender.send_async(retry_task).await;
+                                let _ = qos_manager.acquire_permit(Priority::Low).await;
                             }
                             continue;
                         }
                     };
 
-                    let result = Self::process_task_with_decryption(
+                    let result = Self::process_task(
                         worker_id,
                         task,
                         &results,
@@ -328,14 +309,14 @@ impl WorkStealingDispatcher {
                             circuit_breaker.record_success().await;
                         }
                         Err(_) => {
-                            failed_tasks += 1;  // ✅ ИСПОЛЬЗУЕМ СЧЕТЧИК
+                            failed_tasks += 1;
                             circuit_breaker.record_failure().await;
                         }
                     }
 
                     drop(permit);
 
-                    if tasks_processed >= local_batch_size {
+                    if tasks_processed >= batch_size {
                         let elapsed = batch_start_time.elapsed();
                         let success_rate = if tasks_processed > 0 {
                             successful_tasks as f64 / tasks_processed as f64
@@ -343,14 +324,9 @@ impl WorkStealingDispatcher {
                             1.0
                         };
 
-                        // ✅ СОХРАНЯЕМ МЕТРИКИ БАТЧА
                         stats.entry(format!("worker_{}_batches", worker_id))
                             .and_modify(|e| *e += 1)
                             .or_insert(1);
-
-                        stats.entry(format!("worker_{}_success_rate", worker_id))
-                            .and_modify(|e| *e = ((*e as f64 * 0.9) + (success_rate * 100.0 * 0.1)) as u64)
-                            .or_insert((success_rate * 100.0) as u64);
 
                         adaptive_batcher.record_batch_execution(
                             tasks_processed,
@@ -375,12 +351,12 @@ impl WorkStealingDispatcher {
                         Ok(p) => p,
                         Err(e) => {
                             debug!("Worker #{} (steal) QoS failed: {}", worker_id, e);
-                            failed_tasks += 1;  // ✅ ИСПОЛЬЗУЕМ СЧЕТЧИК
+                            failed_tasks += 1;
                             continue;
                         }
                     };
 
-                    let result = Self::process_task_with_decryption(
+                    let result = Self::process_task(
                         worker_id,
                         task,
                         &results,
@@ -395,7 +371,7 @@ impl WorkStealingDispatcher {
                         successful_tasks += 1;
                         circuit_breaker.record_success().await;
                     } else {
-                        failed_tasks += 1;  // ✅ ИСПОЛЬЗУЕМ СЧЕТЧИК
+                        failed_tasks += 1;
                         circuit_breaker.record_failure().await;
                     }
 
@@ -403,51 +379,20 @@ impl WorkStealingDispatcher {
                 }
 
                 _ = tokio::time::sleep(Duration::from_micros(5)) => {
-                    // ✅ ПЕРИОДИЧЕСКИ ОБНОВЛЯЕМ МЕТРИКИ
-                    if tasks_processed > 0 {
-                        let current_time = Instant::now();
-                        if current_time.duration_since(batch_start_time) > Duration::from_secs(1) {
-                            stats.entry(format!("worker_{}_idle", worker_id))
-                                .and_modify(|e| *e += 1)
-                                .or_insert(1);
-                        }
-                    }
                     continue;
                 }
             }
         }
 
-        // ✅ СОХРАНЯЕМ ФИНАЛЬНУЮ СТАТИСТИКУ ВОРКЕРА
-        stats.insert(
-            format!("worker_{}_final_tasks", worker_id),
-            tasks_processed.try_into().unwrap_or(0)
-        );
-        stats.insert(
-            format!("worker_{}_final_success", worker_id),
-            successful_tasks.try_into().unwrap_or(0)
-        );
-        stats.insert(
-            format!("worker_{}_final_failed", worker_id),
-            failed_tasks.try_into().unwrap_or(0)
-        );
-        stats.insert(
-            format!("worker_{}_shutdown_time", worker_id),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs()
-        );
+        stats.insert(format!("worker_{}_final_tasks", worker_id), tasks_processed as u64);
+        stats.insert(format!("worker_{}_final_success", worker_id), successful_tasks as u64);
+        stats.insert(format!("worker_{}_final_failed", worker_id), failed_tasks as u64);
 
-        let processed_count = stats.get(&format!("worker_{}_tasks", worker_id))
-            .map(|r| *r.value())
-            .unwrap_or(0);
-
-        debug!("👋 Worker #{} stopped (processed: {}, failed: {})",
-            worker_id, processed_count, failed_tasks);
+        debug!("👋 Worker #{} stopped", worker_id);
     }
 
-    /// 🔐 Обработка задачи с дешифрованием
-    async fn process_task_with_decryption(
+    /// 🔐 Обработка задачи
+    async fn process_task(
         worker_id: usize,
         task: WorkStealingTask,
         results: &Arc<DashMap<u64, WorkStealingResult>>,
@@ -463,7 +408,6 @@ impl WorkStealingDispatcher {
                 .and_modify(|e| *e += 1)
                 .or_insert(1);
 
-            // ✅ ЗАПИСЫВАЕМ РЕЗУЛЬТАТ С ОШИБКОЙ ТАЙМАУТА
             let result = WorkStealingResult {
                 task_id: task.id,
                 session_id: task.session_id,
@@ -474,7 +418,6 @@ impl WorkStealingDispatcher {
                 completed_at: Instant::now(),
             };
             results.insert(task.id, result);
-
             return Err(());
         }
 
@@ -517,7 +460,6 @@ impl WorkStealingDispatcher {
                             .and_modify(|e| *e += processing_ms)
                             .or_insert(processing_ms);
 
-                        // ✅ СОХРАНЯЕМ ДЕТАЛЬНУЮ ИНФОРМАЦИЮ О ПАКЕТЕ
                         stats.entry(format!("packet_type_{}", packet_type))
                             .and_modify(|e| *e += 1)
                             .or_insert(1);
@@ -588,15 +530,13 @@ impl WorkStealingDispatcher {
     fn start_metrics_collector(&self) {
         let stats = self.stats.clone();
         let latency_histogram = self.latency_histogram.clone();
-        let adaptive_batcher = self.adaptive_batcher.clone();
+        let _adaptive_batcher = self.adaptive_batcher.clone();
         let is_running = self.is_running.clone();
         let worker_queues = self.worker_queues.clone();
         let results = self.results.clone();
 
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(10));
-
-            // ✅ ИНИЦИАЛИЗИРУЕМ МЕТРИКИ
             stats.insert("metrics_collector_started".to_string(), 1);
             let mut collection_count = 0;
 
@@ -613,7 +553,6 @@ impl WorkStealingDispatcher {
                 let p95 = latencies.get(latencies.len() * 95 / 100).copied().unwrap_or(0);
                 let p99 = latencies.get(latencies.len() * 99 / 100).copied().unwrap_or(0);
 
-                // ✅ СОХРАНЯЕМ АГРЕГИРОВАННЫЕ МЕТРИКИ
                 stats.insert("metrics_collection_count".to_string(), collection_count);
                 stats.insert("current_p50_latency".to_string(), p50);
                 stats.insert("current_p95_latency".to_string(), p95);
@@ -626,20 +565,10 @@ impl WorkStealingDispatcher {
 
                 let active_results = results.len() as u64;
                 stats.insert("active_results".to_string(), active_results);
-
-                let _batch_metrics = adaptive_batcher.get_metrics().await;
-
-                // ✅ ЗАПИСЫВАЕМ В adaptive_batcher МЕТРИКИ ДЛЯ ПРЕДСКАЗАНИЯ
-                let _ = adaptive_batcher.record_batch_execution(
-                    0,  // размер не важен для метрики
-                    Duration::from_millis(0),
-                    1.0,
-                    0
-                ).await;
             }
 
             stats.insert("metrics_collector_stopped".to_string(), 1);
-            debug!("📊 Metrics collector stopped after {} collections", collection_count);
+            debug!("📊 Metrics collector stopped");
         });
     }
 
@@ -648,7 +577,7 @@ impl WorkStealingDispatcher {
         let worker_senders = self.worker_senders.clone();
         let worker_queues = self.worker_queues.clone();
         let injector_backlog = self.injector_backlog.clone();
-        let backpressure_semaphore = self.backpressure_semaphore.clone();
+        let _backpressure_semaphore = self.backpressure_semaphore.clone();
         let is_running = self.is_running.clone();
         let stats = self.stats.clone();
 
@@ -663,47 +592,32 @@ impl WorkStealingDispatcher {
                 monitor_count += 1;
 
                 let mut total_queue = 0;
-                let mut max_queue = 0;
                 let mut overloaded_workers = 0;
-                let queue_capacity = worker_senders.len() * 1000; // примерная емкость
 
                 for (i, sender) in worker_senders.iter().enumerate() {
                     let len = sender.len();
                     worker_queues.insert(i, len);
                     total_queue += len;
-                    max_queue = max_queue.max(len);
 
-                    if len > 500 { // порог перегрузки
+                    if len > 500 {
                         overloaded_workers += 1;
-                    }
-
-                    if len > worker_senders.len() * 1000 {
-                        let _ = backpressure_semaphore.acquire().await;
-                        stats.entry("backpressure_triggered".to_string())
-                            .and_modify(|e| *e += 1)
-                            .or_insert(1);
                     }
                 }
 
-                let injector_len = worker_senders.len(); // фикс: получаем реальную длину
+                let injector_len = worker_senders[0].len();
                 injector_backlog.store(injector_len, std::sync::atomic::Ordering::Relaxed);
 
                 peak_queue = peak_queue.max(total_queue);
                 peak_injector = peak_injector.max(injector_len);
 
-                // ✅ СОХРАНЯЕМ ИСТОРИЧЕСКИЕ МЕТРИКИ
-                if monitor_count % 100 == 0 { // каждые ~10 секунд
+                if monitor_count % 100 == 0 {
                     stats.insert("peak_queue_size".to_string(), peak_queue as u64);
                     stats.insert("peak_injector_size".to_string(), peak_injector as u64);
                     stats.insert("overloaded_workers_count".to_string(), overloaded_workers as u64);
                     stats.insert("queue_monitor_checks".to_string(), monitor_count);
-
-                    debug!("📊 Queue monitor peak: queue={}, injector={}, overloaded={}",
-                        peak_queue, peak_injector, overloaded_workers);
                 }
 
-                // ✅ АДАПТИВНОЕ РЕГУЛИРОВАНИЕ
-                if total_queue > queue_capacity / 2 {
+                if total_queue > worker_senders.len() * 500 {
                     stats.entry("high_queue_warnings".to_string())
                         .and_modify(|e| *e += 1)
                         .or_insert(1);
@@ -711,7 +625,7 @@ impl WorkStealingDispatcher {
             }
 
             stats.insert("queue_monitor_stopped".to_string(), 1);
-            debug!("📊 Queue monitor stopped after {} checks", monitor_count);
+            debug!("📊 Queue monitor stopped");
         });
     }
 
@@ -732,7 +646,6 @@ impl WorkStealingDispatcher {
 
                 let now = Instant::now();
                 let mut to_remove = Vec::new();
-                let before_count = results.len();
 
                 for entry in results.iter() {
                     if now.duration_since(entry.completed_at) > Duration::from_secs(300) {
@@ -746,9 +659,7 @@ impl WorkStealingDispatcher {
 
                 let cleaned = to_remove.len();
                 total_cleaned += cleaned;
-                let after_count = results.len();
 
-                // ✅ СОХРАНЯЕМ СТАТИСТИКУ ОЧИСТКИ
                 stats.entry("total_cleaned_tasks".to_string())
                     .and_modify(|e| *e += cleaned as u64)
                     .or_insert(cleaned as u64);
@@ -758,15 +669,13 @@ impl WorkStealingDispatcher {
                     .or_insert(1);
 
                 if !to_remove.is_empty() {
-                    debug!("🧹 Cleanup #{}: removed {} old tasks (before: {}, after: {}, total cleaned: {})",
-                        cleanup_count, cleaned, before_count, after_count, total_cleaned);
+                    debug!("🧹 Cleanup #{}: removed {} old tasks", cleanup_count, cleaned);
                 }
             }
 
             stats.insert("final_cleanup_count".to_string(), cleanup_count);
             stats.insert("final_total_cleaned".to_string(), total_cleaned as u64);
-            debug!("🧹 Task cleaner stopped after {} cleanups, total cleaned: {}",
-                cleanup_count, total_cleaned);
+            debug!("🧹 Task cleaner stopped");
         });
     }
 
@@ -942,9 +851,9 @@ impl WorkStealingDispatcher {
     /// ⚖️ Расчет дисбаланса нагрузки
     async fn calculate_imbalance(&self) -> f64 {
         let mut worker_loads = Vec::new();
+        let stats = self.get_stats();
 
         for i in 0..self.worker_senders.len() {
-            let stats = self.get_stats();
             let processed = stats.get(&format!("worker_{}_tasks", i)).copied().unwrap_or(0);
             worker_loads.push(processed as f64);
         }
@@ -954,11 +863,15 @@ impl WorkStealingDispatcher {
         }
 
         let avg = worker_loads.iter().sum::<f64>() / worker_loads.len() as f64;
+        if avg == 0.0 {
+            return 0.0;
+        }
+
         let variance = worker_loads.iter()
             .map(|&x| (x - avg).powi(2))
             .sum::<f64>() / worker_loads.len() as f64;
 
-        (variance.sqrt() / (avg + 1.0)).min(1.0)
+        (variance.sqrt() / avg).min(1.0)
     }
 
     /// 🛑 Остановка
@@ -1011,9 +924,6 @@ impl Clone for WorkStealingDispatcher {
             is_running: self.is_running.clone(),
             next_task_id: std::sync::atomic::AtomicU64::new(
                 self.next_task_id.load(std::sync::atomic::Ordering::Relaxed)
-            ),
-            next_batch_id: std::sync::atomic::AtomicU64::new(
-                self.next_batch_id.load(std::sync::atomic::Ordering::Relaxed)
             ),
             packet_processor: self.packet_processor.clone(),
             session_manager: self.session_manager.clone(),

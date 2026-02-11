@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Instant, Duration};
 use dashmap::DashMap;
-use tracing::info;
+use tracing::{info, debug};
 use flume::{Sender, Receiver, bounded};
 
 use crate::core::protocol::batch_system::types::error::BatchError;
@@ -91,7 +91,6 @@ impl OptimizedCryptoProcessor {
 
         let (injector_sender, injector_receiver) = bounded(2000);
 
-        // ИНИЦИАЛИЗАЦИЯ SIMD АКСЕЛЕРАТОРОВ
         let chacha20_accelerator = Arc::new(ChaCha20BatchAccelerator::new(8));
         let blake3_accelerator = Arc::new(Blake3BatchAccelerator::new(8));
 
@@ -122,7 +121,6 @@ impl OptimizedCryptoProcessor {
             let stats = self.stats.clone();
             let is_running = self.is_running.clone();
 
-            // КЛОНЫ АКСЕЛЕРАТОРОВ ДЛЯ WORKER'ОВ
             let chacha20 = self.chacha20_accelerator.clone();
             let blake3 = self.blake3_accelerator.clone();
 
@@ -154,7 +152,7 @@ impl OptimizedCryptoProcessor {
         chacha20_accelerator: Arc<ChaCha20BatchAccelerator>,
         blake3_accelerator: Arc<Blake3BatchAccelerator>,
     ) {
-        info!("🔐 Crypto worker #{} started with SIMD", worker_id);
+        debug!("🔐 Crypto worker #{} started with SIMD", worker_id);
 
         let mut batch_buffer: Vec<CryptoTask> = Vec::with_capacity(32);
         let mut batch_start = Instant::now();
@@ -165,7 +163,9 @@ impl OptimizedCryptoProcessor {
                     batch_buffer.push(task);
                 }
                 Ok(task) = injector_receiver.recv_async() => {
-                    *stats.entry("crypto_steals".to_string()).or_insert(0) += 1;
+                    stats.entry("crypto_steals".to_string())
+                        .and_modify(|e| *e += 1)
+                        .or_insert(1);
                     batch_buffer.push(task);
                 }
                 _ = tokio::time::sleep(Duration::from_micros(100)) => {
@@ -184,7 +184,6 @@ impl OptimizedCryptoProcessor {
                 }
             }
 
-            // Обработка батча при накоплении
             if batch_buffer.len() >= 16 {
                 Self::process_batch(
                     worker_id,
@@ -215,8 +214,8 @@ impl OptimizedCryptoProcessor {
         }
 
         let start_time = Instant::now();
+        let batch_size = tasks.len();
 
-        // Группируем операции по типу
         let mut chacha_ops = Vec::new();
         let mut blake_ops = Vec::new();
         let mut derive_ops = Vec::new();
@@ -230,24 +229,30 @@ impl OptimizedCryptoProcessor {
             }
         }
 
-        // ПАКЕТНАЯ ОБРАБОТКА CHACHA20 С SIMD
         if !chacha_ops.is_empty() {
             Self::process_chacha_batch(worker_id, &chacha_ops, results, stats, chacha20).await;
         }
 
-        // ПАКЕТНАЯ ОБРАБОТКА BLAKE3 С SIMD
         if !blake_ops.is_empty() {
             Self::process_blake_batch(worker_id, &blake_ops, results, stats, blake3).await;
         }
 
-        // Обработка key derivation (последовательно)
         for task in derive_ops {
             Self::process_derive_task(worker_id, task, results, stats).await;
         }
 
         let elapsed = start_time.elapsed();
-        *stats.entry("crypto_batch_processing_time".to_string()).or_insert(0) += elapsed.as_micros() as u64;
-        *stats.entry("crypto_batches_processed".to_string()).or_insert(0) += 1;
+        stats.entry("crypto_batch_processing_time".to_string())
+            .and_modify(|e| *e += elapsed.as_micros() as u64)
+            .or_insert(elapsed.as_micros() as u64);
+
+        stats.entry("crypto_batches_processed".to_string())
+            .and_modify(|e| *e += 1)
+            .or_insert(1);
+
+        stats.entry("crypto_tasks_processed".to_string())
+            .and_modify(|e| *e += batch_size as u64)
+            .or_insert(batch_size as u64);
     }
 
     async fn process_chacha_batch(
@@ -281,25 +286,25 @@ impl OptimizedCryptoProcessor {
             }
         }
 
-        // ПАКЕТНОЕ ШИФРОВАНИЕ/ДЕШИФРОВАНИЕ ЧЕРЕЗ SIMD
         let processed = if is_encryption.iter().all(|&x| x) {
             accelerator.encrypt_batch(&keys, &nonces, &data_buffers).await
         } else {
             accelerator.decrypt_batch(&keys, &nonces, &data_buffers).await
         };
 
-        // Сохраняем результаты
         for (i, task) in tasks.iter().enumerate() {
             let result = CryptoResult {
                 id: task.id,
                 result: Ok(processed[i].clone()),
-                processing_time: Duration::from_micros(0), // Будет обновлено
+                processing_time: Duration::from_micros(0),
                 worker_id,
             };
             results.insert(task.id, result);
         }
 
-        *stats.entry("chacha_batch_operations".to_string()).or_insert(0) += batch_size as u64;
+        stats.entry("chacha_batch_operations".to_string())
+            .and_modify(|e| *e += batch_size as u64)
+            .or_insert(batch_size as u64);
     }
 
     async fn process_blake_batch(
@@ -320,7 +325,6 @@ impl OptimizedCryptoProcessor {
             }
         }
 
-        // ПАКЕТНОЕ ХЕШИРОВАНИЕ ЧЕРЕЗ SIMD
         let hashes = accelerator.hash_keyed_batch(&keys, &inputs).await;
 
         for (i, task) in tasks.iter().enumerate() {
@@ -333,7 +337,9 @@ impl OptimizedCryptoProcessor {
             results.insert(task.id, result);
         }
 
-        *stats.entry("blake_batch_operations".to_string()).or_insert(0) += batch_size as u64;
+        stats.entry("blake_batch_operations".to_string())
+            .and_modify(|e| *e += batch_size as u64)
+            .or_insert(batch_size as u64);
     }
 
     async fn process_derive_task(
@@ -394,7 +400,10 @@ impl OptimizedCryptoProcessor {
                 worker_id,
             };
             results.insert(task.id, crypto_result);
-            *stats.entry("derive_key_operations".to_string()).or_insert(0) += 1;
+
+            stats.entry("derive_key_operations".to_string())
+                .and_modify(|e| *e += 1)
+                .or_insert(1);
         }
     }
 
@@ -412,13 +421,17 @@ impl OptimizedCryptoProcessor {
 
         match self.worker_senders[worker_idx].try_send(task.clone()) {
             Ok(_) => {
-                *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
+                self.stats.entry("crypto_tasks_submitted".to_string())
+                    .and_modify(|e| *e += 1)
+                    .or_insert(1);
                 Ok(task_id)
             }
             Err(_) => {
                 match self.injector_sender.try_send(task) {
                     Ok(_) => {
-                        *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
+                        self.stats.entry("crypto_tasks_submitted".to_string())
+                            .and_modify(|e| *e += 1)
+                            .or_insert(1);
                         Ok(task_id)
                     }
                     Err(_) => Err(BatchError::ProcessingError("All crypto queues are full".to_string())),

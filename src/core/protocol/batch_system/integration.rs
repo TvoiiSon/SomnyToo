@@ -33,7 +33,7 @@ use crate::core::protocol::batch_system::adaptive_batcher::{
 use crate::core::protocol::batch_system::metrics_tracing::{
     MetricsTracingSystem, MetricsConfig
 };
-use crate::core::protocol::batch_system::types::packet_types::{is_packet_supported, get_packet_info, get_packet_priority};
+use crate::core::protocol::batch_system::types::packet_types::{is_packet_supported, get_packet_priority, PacketType};
 
 // ✅ READER & WRITER
 use crate::core::protocol::batch_system::core::reader::{BatchReader, ReaderEvent};
@@ -44,10 +44,8 @@ use crate::core::protocol::phantom_crypto::core::instance::PhantomCrypto;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::packets::packet_service::PhantomPacketService;
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
-use crate::core::monitoring::unified_monitor::UnifiedMonitor;
 
 /// ⚡ ОСНОВНОЙ ИНТЕГРИРОВАННЫЙ УЗЕЛ BATCH СИСТЕМЫ v2.1
-/// Полностью рабочая версия с динамическим масштабированием
 pub struct IntegratedBatchSystem {
     // 📋 КОНФИГУРАЦИЯ
     config: BatchConfig,
@@ -89,7 +87,7 @@ pub struct IntegratedBatchSystem {
     stats: Arc<RwLock<SystemStatistics>>,
     metrics: Arc<DashMap<String, MetricValue>>,
 
-    // ✅ ИСПРАВЛЕНО: РЕАЛЬНО ИСПОЛЬЗУЕМЫЕ КОМПОНЕНТЫ
+    // 📦 ИСПОЛЬЗУЕМЫЕ КОМПОНЕНТЫ
     pending_batches: Arc<RwLock<Vec<PendingBatch>>>,
     active_connections: Arc<RwLock<HashMap<std::net::SocketAddr, ConnectionInfo>>>,
     session_cache: Arc<RwLock<HashMap<Vec<u8>, SessionCacheEntry>>>,
@@ -139,17 +137,11 @@ impl WorkerPool {
             let mut shutdown_rx = shutdown_rx.resubscribe();
 
             let handle = tokio::spawn(async move {
-                loop {
-                    tokio::select! {
-                        _ = shutdown_rx.recv() => {
-                            debug!("👋 Dynamic worker #{} shutting down", worker_id);
-                            break;
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
-                            // Worker будет получать задачи через диспетчер
-                        }
-                    }
+                debug!("👷 Dynamic worker #{} started", worker_id);
+                while shutdown_rx.try_recv().is_err() {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
                 }
+                debug!("👋 Dynamic worker #{} shutting down", worker_id);
             });
 
             handles.push(handle);
@@ -168,7 +160,6 @@ impl WorkerPool {
             return Ok(0);
         }
 
-        // Отправляем сигнал остановки для to_remove воркеров
         for _ in 0..to_remove {
             let _ = self.shutdown_tx.send(());
         }
@@ -184,7 +175,7 @@ impl IntegratedBatchSystem {
         config: BatchConfig,
         session_manager: Arc<PhantomSessionManager>,
         crypto: Arc<PhantomCrypto>,
-        monitor: Option<Arc<UnifiedMonitor>>,
+        heartbeat_manager: Arc<ConnectionHeartbeatManager>, // ✅ Изменено: теперь принимаем ConnectionHeartbeatManager
     ) -> Result<Self, BatchError> {
         let startup_time = Instant::now();
 
@@ -225,7 +216,7 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 4. ИНИЦИАЛИЗАЦИЯ ADAPTIVE BATCHER =============
-        info!("🔄 [4/11] Инициализация Adaptive Batcher с ML предсказанием...");
+        info!("🔄 [4/11] Инициализация Adaptive Batcher...");
         let adaptive_batcher_config = AdaptiveBatcherConfig {
             min_batch_size: config.min_batch_size,
             max_batch_size: config.max_batch_size,
@@ -277,22 +268,11 @@ impl IntegratedBatchSystem {
 
         // ============= 8. ВНЕШНИЕ СЕРВИСЫ =============
         info!("🌐 [8/11] Инициализация внешних сервисов...");
+
+        // ✅ ИСПРАВЛЕНО: используем переданный heartbeat_manager
         let packet_service = Arc::new(PhantomPacketService::new(
             session_manager.clone(),
-            {
-                use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;
-
-                let monitor_to_use = monitor.unwrap_or_else(|| {
-                    Arc::new(UnifiedMonitor::new(
-                        crate::core::monitoring::config::MonitoringConfig::default()
-                    ))
-                });
-
-                Arc::new(ConnectionHeartbeatManager::new(
-                    session_manager.clone(),
-                    monitor_to_use,
-                ))
-            },
+            heartbeat_manager, // ✅ Теперь передаем правильный тип
         ));
 
         let packet_processor = PhantomPacketProcessor::new();
@@ -312,7 +292,7 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 10. ИНИЦИАЛИЗАЦИЯ WORKER POOL =============
-        info!("🏭 [10/11] Инициализация Worker Pool для динамического масштабирования...");
+        info!("🏭 [10/11] Инициализация Worker Pool...");
         let worker_pool = Arc::new(WorkerPool::new(
             config.worker_count / 2,
             config.worker_count * 4,
@@ -426,7 +406,7 @@ impl IntegratedBatchSystem {
         let is_running = self.is_running.clone();
 
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 минут
+            let mut interval = tokio::time::interval(Duration::from_secs(300));
 
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
@@ -436,7 +416,7 @@ impl IntegratedBatchSystem {
                 let now = Instant::now();
 
                 cache.retain(|_, entry| {
-                    now.duration_since(entry.last_used) < Duration::from_secs(3600) // 1 час
+                    now.duration_since(entry.last_used) < Duration::from_secs(3600)
                 });
 
                 let removed = before - cache.len();
@@ -459,30 +439,25 @@ impl IntegratedBatchSystem {
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
 
-                // Обновляем счетчики производительности
                 let stats = system.stats.read().await;
+                let uptime = stats.uptime.as_secs_f64().max(1.0);
+                let throughput = stats.total_packets_processed as f64 / uptime;
 
                 let mut throughput_counter = perf_counters
                     .entry("throughput".to_string())
                     .or_insert_with(|| PerformanceCounter::new("throughput".to_string(), 60));
-
-                let uptime = stats.uptime.as_secs_f64().max(1.0);
-                let throughput = stats.total_packets_processed as f64 / uptime;
                 throughput_counter.update(throughput);
 
                 let mut latency_counter = perf_counters
                     .entry("avg_latency_ms".to_string())
                     .or_insert_with(|| PerformanceCounter::new("avg_latency_ms".to_string(), 60));
-
                 latency_counter.update(stats.avg_processing_time.as_millis() as f64);
 
+                let batch_metrics = system.adaptive_batcher.get_metrics().await;
                 let mut batch_size_counter = perf_counters
                     .entry("avg_batch_size".to_string())
                     .or_insert_with(|| PerformanceCounter::new("avg_batch_size".to_string(), 60));
-
-                batch_size_counter.update(system.adaptive_batcher.get_metrics().await.avg_batch_size);
-
-                debug!("📊 Performance counters updated");
+                batch_size_counter.update(batch_metrics.avg_batch_size);
             }
         });
     }
@@ -552,33 +527,28 @@ impl IntegratedBatchSystem {
         session_id: Vec<u8>,
         data: Bytes,
         source_addr: std::net::SocketAddr,
-        _priority: Priority,  // Не используем переданный приоритет, определяем после дешифровки
+        _priority: Priority,
         timestamp: Instant,
     ) {
         debug!("📥 Raw data received: {} bytes from {}", data.len(), source_addr);
 
-        // Обновляем статистику
         {
             let mut stats = self.stats.write().await;
             stats.total_data_received += data.len() as u64;
         }
-
-        // ✅ НЕ ПРОВЕРЯЕМ ТИП ПАКЕТА ЗДЕСЬ!
-        // Тип пакета будет определен ПОСЛЕ дешифрования в worker'е
 
         let task = WorkStealingTask {
             id: 0,
             session_id: session_id.clone(),
             data: data.clone(),
             source_addr,
-            priority: Priority::Normal, // Временный приоритет, реальный определится после дешифровки
+            priority: Priority::Normal,
             created_at: timestamp,
             worker_id: None,
             retry_count: 0,
             deadline: Some(timestamp + Duration::from_secs(30)),
         };
 
-        // Отправляем в диспетчер
         match self.work_stealing_dispatcher.submit_task(task).await {
             Ok(task_id) => {
                 debug!("✅ Task {} submitted to dispatcher", task_id);
@@ -667,12 +637,12 @@ impl IntegratedBatchSystem {
         });
     }
 
-    /// 🔄 Обработка результата задачи
+    /// 🔄 Обработка результата задачи - ✅ ИСПРАВЛЕНО: ОДИН ПУТЬ ОБРАБОТКИ
     async fn process_task_result(
         &self,
         task_result: WorkStealingResult,
         _session_id: Vec<u8>,
-        _source_addr: std::net::SocketAddr,
+        source_addr: std::net::SocketAddr,
     ) {
         match task_result.result {
             Ok(data) => {
@@ -680,43 +650,80 @@ impl IntegratedBatchSystem {
                     let packet_type = data[0];
                     let packet_data = &data[1..];
 
+                    // ✅ Проверяем поддерживается ли тип пакета
+                    if !is_packet_supported(packet_type) {
+                        debug!("⚠️ Unsupported packet type: 0x{:02x}", packet_type);
+                        return;
+                    }
+
+                    // ✅ Получаем приоритет из packet_types
+                    let priority = get_packet_priority(packet_type).unwrap_or(Priority::Normal);
+
+                    // ✅ Проверяем требует ли пакет немедленной отправки
+                    let requires_flush = PacketType::from_byte(packet_type)
+                        .map(|pt| pt.requires_immediate_flush())
+                        .unwrap_or(false);
+
                     if let Some(session) = self.session_manager.get_session(&task_result.session_id).await {
-                        // ✅ ИСПРАВЛЕНО: Отправляем пакет в packet_service для обработки
+                        // ✅ ЕДИНСТВЕННЫЙ ПУТЬ: через packet_service
                         match self.packet_service.process_packet(
                             session.clone(),
                             packet_type,
                             packet_data.to_vec(),
-                            task_result.destination_addr,
+                            source_addr,
                         ).await {
                             Ok(processing_result) => {
-                                // ✅ packet_service уже вернул правильный ответ
+                                // ✅ Шифруем ответ
                                 match self.packet_processor.create_outgoing_vec(
                                     &session,
-                                    processing_result.packet_type,  // Используем тип из processing_result
-                                    &processing_result.response,    // Используем ответ из packet_service
+                                    processing_result.packet_type,
+                                    &processing_result.response,
                                 ) {
                                     Ok(encrypted_response) => {
+                                        // ✅ Отправляем через writer
                                         if let Err(e) = self.writer.write(
-                                            task_result.destination_addr,
+                                            source_addr,
                                             task_result.session_id.clone(),
                                             Bytes::from(encrypted_response),
-                                            processing_result.priority,  // Используем приоритет из packet_service
-                                            true,  // requires_flush для критических пакетов
+                                            priority,
+                                            requires_flush,
                                         ).await {
                                             error!("❌ Failed to send response: {}", e);
                                         } else {
                                             debug!("✅ Response sent for packet type 0x{:02x}", packet_type);
+
+                                            // ✅ Обновляем статистику
+                                            let mut stats = self.stats.write().await;
+                                            stats.total_packets_processed += 1;
+                                            stats.total_data_sent += processing_result.response.len() as u64;
                                         }
                                     }
-                                    Err(e) => error!("❌ Encryption failed: {}", e),
+                                    Err(e) => {
+                                        error!("❌ Encryption failed: {}", e);
+
+                                        let mut stats = self.stats.write().await;
+                                        stats.total_errors += 1;
+                                    }
                                 }
                             }
-                            Err(e) => error!("❌ Packet processing failed: {}", e),
+                            Err(e) => {
+                                error!("❌ Packet processing failed for type 0x{:02x}: {}", packet_type, e);
+
+                                let mut stats = self.stats.write().await;
+                                stats.total_errors += 1;
+                            }
                         }
+                    } else {
+                        error!("❌ Session not found for packet type 0x{:02x}", packet_type);
                     }
                 }
             }
-            Err(e) => error!("❌ Task processing failed: {}", e),
+            Err(e) => {
+                error!("❌ Task processing failed: {}", e);
+
+                let mut stats = self.stats.write().await;
+                stats.total_errors += 1;
+            }
         }
     }
 
@@ -841,7 +848,6 @@ impl IntegratedBatchSystem {
 
     /// 📊 Обновление счетчиков производительности
     async fn update_performance_counters(&self) {
-        // Статистика буферного пула
         let buffer_stats = self.buffer_pool.get_detailed_stats();
         let total_hit_rate = buffer_stats.get("Global")
             .map(|s| s.hit_rate)
@@ -850,7 +856,6 @@ impl IntegratedBatchSystem {
         self.record_metric("buffer_pool.hit_rate", total_hit_rate).await;
         self.record_metric("buffer_pool.reuse_rate", self.buffer_pool.get_reuse_rate()).await;
 
-        // Статистика криптопроцессора
         let crypto_stats = self.crypto_processor.get_stats();
         let crypto_tasks = crypto_stats.get("crypto_tasks_submitted").copied().unwrap_or(0);
         let crypto_processed = crypto_stats.get("crypto_tasks_processed").copied().unwrap_or(0);
@@ -860,7 +865,6 @@ impl IntegratedBatchSystem {
         self.record_metric("crypto.tasks_processed", crypto_processed as f64).await;
         self.record_metric("crypto.steals", crypto_steals as f64).await;
 
-        // Статистика диспетчера
         let dispatcher_stats = self.work_stealing_dispatcher.get_advanced_stats().await;
         self.record_metric("dispatcher.tasks_processed", dispatcher_stats.total_tasks_processed as f64).await;
         self.record_metric("dispatcher.work_steals", dispatcher_stats.work_steals as f64).await;
@@ -872,7 +876,6 @@ impl IntegratedBatchSystem {
             stats.buffer_hit_rate = total_hit_rate;
         }
 
-        // Статистика соединений
         let connections = self.active_connections.read().await.len();
         self.record_metric("connections.active", connections as f64).await;
     }
@@ -898,7 +901,6 @@ impl IntegratedBatchSystem {
                 }
 
                 drop(settings);
-
                 system.perform_auto_scaling().await;
             }
         });
@@ -912,14 +914,12 @@ impl IntegratedBatchSystem {
         let dispatcher_stats = self.work_stealing_dispatcher.get_advanced_stats().await;
         let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
 
-        // Критерии для масштабирования вверх
         let should_scale_up =
             dispatcher_stats.queue_backlog > settings.work_stealing_target_queue_size * 2 ||
                 dispatcher_stats.imbalance > 0.7 ||
                 dispatcher_stats.avg_processing_time_ms > 100.0 ||
                 self.active_connections.read().await.len() as f64 > settings.connection_target_count as f64 * 0.8;
 
-        // Критерии для масштабирования вниз
         let should_scale_down =
             dispatcher_stats.queue_backlog < settings.work_stealing_target_queue_size / 4 &&
                 dispatcher_stats.imbalance < 0.2 &&
@@ -928,13 +928,11 @@ impl IntegratedBatchSystem {
 
         if should_scale_up && current_workers < settings.max_worker_count {
             let scale_up_by = 2.min(settings.max_worker_count - current_workers);
-            info!("📈 Auto-scaling: scaling UP by {} workers (current: {}, queue: {})",
-                scale_up_by, current_workers, dispatcher_stats.queue_backlog);
+            info!("📈 Auto-scaling: scaling UP by {} workers", scale_up_by);
             let _ = self.scale_up(scale_up_by).await;
         } else if should_scale_down && current_workers > settings.min_worker_count {
             let scale_down_by = 2.min(current_workers - settings.min_worker_count);
-            info!("📉 Auto-scaling: scaling DOWN by {} workers (current: {}, queue: {})",
-                scale_down_by, current_workers, dispatcher_stats.queue_backlog);
+            info!("📉 Auto-scaling: scaling DOWN by {} workers", scale_down_by);
             let _ = self.scale_down(scale_down_by).await;
         }
     }
@@ -948,15 +946,7 @@ impl IntegratedBatchSystem {
 
             loop {
                 interval.tick().await;
-
-                match qos_manager.adapt_quotas().await {
-                    Ok(decision) => {
-                        info!("🔄 QoS adapted: {}", decision.reason);
-                    }
-                    Err(e) => {
-                        debug!("QoS adaptation skipped: {}", e);
-                    }
-                }
+                let _ = qos_manager.adapt_quotas().await;
             }
         });
     }
@@ -973,7 +963,7 @@ impl IntegratedBatchSystem {
 
         if buffer_hit_rate < settings.buffer_pool_target_hit_rate * 0.8 {
             warn!("📉 Buffer pool hit rate low: {:.1}%", buffer_hit_rate * 100.0);
-            let _ = self.buffer_pool.force_cleanup();
+            let _ = self.buffer_pool.force_cleanup().await;
         }
 
         if crypto_success_rate < settings.crypto_processor_target_success_rate * 0.9 {
@@ -1068,7 +1058,7 @@ impl IntegratedBatchSystem {
     /// 🌀 Сброс буферов
     async fn flush_buffers(&self) {
         info!("🌀 Flushing all buffers...");
-        let _ = self.buffer_pool.force_cleanup();
+        let _ = self.buffer_pool.force_cleanup().await;
 
         let mut cache = self.session_cache.write().await;
         cache.clear();
@@ -1107,8 +1097,7 @@ impl IntegratedBatchSystem {
                     *self.adaptive_batcher.current_batch_size.write().await = clamped_size;
 
                     self.record_metric("config.batch_size", clamped_size as f64).await;
-                    info!("✅ Batch size updated to {} (clamped to {}-{})",
-                        clamped_size, config.min_batch_size, config.max_batch_size);
+                    info!("✅ Batch size updated to {}", clamped_size);
                 }
             }
             "worker_count" => {
@@ -1121,18 +1110,12 @@ impl IntegratedBatchSystem {
                             let increase = count - current_workers;
                             info!("📈 Increasing worker count by {} to {}", increase, count);
                             let _ = self.scale_up(increase).await;
-                        } else {
-                            warn!("Requested worker count {} exceeds maximum {}",
-                                count, settings.max_worker_count);
                         }
                     } else if count < current_workers {
                         if count >= settings.min_worker_count {
                             let decrease = current_workers - count;
                             info!("📉 Decreasing worker count by {} to {}", decrease, count);
                             let _ = self.scale_down(decrease).await;
-                        } else {
-                            warn!("Requested worker count {} below minimum {}",
-                                count, settings.min_worker_count);
                         }
                     }
                 }
@@ -1167,44 +1150,12 @@ impl IntegratedBatchSystem {
                     info!("✅ Target latency updated to {} ms", ms);
                 }
             }
-            "confidence_threshold" => {
-                if let Ok(threshold) = value.parse::<f64>() {
-                    let mut config = self.adaptive_batcher.config.clone();
-                    config.confidence_threshold = threshold.clamp(0.0, 1.0);
-                    self.record_metric("config.confidence_threshold", threshold).await;
-                    info!("✅ Confidence threshold updated to {:.2}", threshold);
-                }
-            }
             "enable_predictive_adaptation" => {
                 if let Ok(enabled) = value.parse::<bool>() {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.enable_predictive_adaptation = enabled;
                     self.record_metric("config.enable_predictive_adaptation", enabled as i64 as f64).await;
                     info!("✅ Predictive adaptation {}", if enabled { "enabled" } else { "disabled" });
-                }
-            }
-            "enable_auto_tuning" => {
-                if let Ok(enabled) = value.parse::<bool>() {
-                    let mut config = self.adaptive_batcher.config.clone();
-                    config.enable_auto_tuning = enabled;
-                    self.record_metric("config.enable_auto_tuning", enabled as i64 as f64).await;
-                    info!("✅ Auto tuning {}", if enabled { "enabled" } else { "disabled" });
-                }
-            }
-            "prediction_horizon_sec" => {
-                if let Ok(sec) = value.parse::<u64>() {
-                    let mut config = self.adaptive_batcher.config.clone();
-                    config.prediction_horizon = Duration::from_secs(sec);
-                    self.record_metric("config.prediction_horizon_sec", sec as f64).await;
-                    info!("✅ Prediction horizon updated to {} seconds", sec);
-                }
-            }
-            "smoothing_factor" => {
-                if let Ok(factor) = value.parse::<f64>() {
-                    let mut config = self.adaptive_batcher.config.clone();
-                    config.smoothing_factor = factor.clamp(0.1, 0.9);
-                    self.record_metric("config.smoothing_factor", factor).await;
-                    info!("✅ Smoothing factor updated to {:.2}", factor);
                 }
             }
             _ => warn!("⚠️ Unknown parameter: {}", parameter),
@@ -1217,7 +1168,6 @@ impl IntegratedBatchSystem {
 
         self.is_running.store(false, std::sync::atomic::Ordering::SeqCst);
         self.shutdown_components().await;
-
         self.record_metric("system.emergency_shutdown", 1.0).await;
     }
 
@@ -1257,32 +1207,8 @@ impl IntegratedBatchSystem {
     /// ⚖️ ПЕРЕБАЛАНСИРОВКА ВОРКЕРОВ
     async fn rebalance_workers(&self) {
         info!("⚖️ Rebalancing workers...");
-
-        let stats = self.work_stealing_dispatcher.get_advanced_stats().await;
-        let imbalance = stats.imbalance;
-
-        if imbalance > 0.3 {
-            info!("⚖️ High imbalance detected: {:.2}, forcing rebalance", imbalance);
-
-            let current_loads: Vec<usize> = (0..self.work_stealing_dispatcher.worker_senders.len())
-                .map(|i| self.work_stealing_dispatcher.worker_queues.get(&i).map(|q| *q).unwrap_or(0))
-                .collect();
-
-            let avg_load = current_loads.iter().sum::<usize>() as f64 / current_loads.len() as f64;
-
-            for (worker_id, &load) in current_loads.iter().enumerate() {
-                if load as f64 > avg_load * 1.5 {
-                    debug!("⚖️ Worker #{} overloaded ({} > {:.1}), stealing tasks",
-                        worker_id, load, avg_load * 1.5);
-                }
-            }
-        }
-
         self.record_metric("dispatcher.manual_rebalance", 1.0).await;
-        self.record_metric("dispatcher.imbalance", imbalance).await;
-
-        info!("✅ Workers rebalanced, imbalance: {:.2} → {:.2}",
-            imbalance, self.work_stealing_dispatcher.get_advanced_stats().await.imbalance);
+        info!("✅ Workers rebalanced");
     }
 
     /// 📈 МАСШТАБИРОВАНИЕ ВВЕРХ
@@ -1290,16 +1216,10 @@ impl IntegratedBatchSystem {
         info!("📈 Scaling up by {} workers", count);
 
         let _lock = self.scaling_lock.lock().await;
-
         let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
         let settings = self.scaling_settings.read().await;
 
-        if count == 0 {
-            return Ok(0);
-        }
-
-        if current_workers >= settings.max_worker_count {
-            warn!("⚠️ Cannot scale up: already at maximum workers ({})", current_workers);
+        if count == 0 || current_workers >= settings.max_worker_count {
             return Ok(0);
         }
 
@@ -1313,8 +1233,7 @@ impl IntegratedBatchSystem {
             self.record_metric("scaling.scale_up", added as f64).await;
             self.record_metric("scaling.current_workers", (current_workers + added) as f64).await;
 
-            info!("✅ Scaled UP from {} to {} workers (added {})",
-                current_workers, current_workers + added, added);
+            info!("✅ Scaled UP from {} to {} workers", current_workers, current_workers + added);
         }
 
         Ok(added)
@@ -1325,16 +1244,10 @@ impl IntegratedBatchSystem {
         info!("📉 Scaling down by {} workers", count);
 
         let _lock = self.scaling_lock.lock().await;
-
         let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
         let settings = self.scaling_settings.read().await;
 
-        if count == 0 {
-            return Ok(0);
-        }
-
-        if current_workers <= settings.min_worker_count {
-            warn!("⚠️ Cannot scale down: already at minimum workers ({})", current_workers);
+        if count == 0 || current_workers <= settings.min_worker_count {
             return Ok(0);
         }
 
@@ -1348,8 +1261,7 @@ impl IntegratedBatchSystem {
             self.record_metric("scaling.scale_down", removed as f64).await;
             self.record_metric("scaling.current_workers", (current_workers - removed) as f64).await;
 
-            info!("✅ Scaled DOWN from {} to {} workers (removed {})",
-                current_workers, current_workers - removed, removed);
+            info!("✅ Scaled DOWN from {} to {} workers", current_workers, current_workers - removed);
         }
 
         Ok(removed)
@@ -1359,41 +1271,19 @@ impl IntegratedBatchSystem {
     async fn update_scaling_settings(&self, settings: ScalingSettings) {
         let mut current = self.scaling_settings.write().await;
 
-        // Валидация настроек
         let mut validated = settings;
         if validated.min_worker_count < 1 {
             validated.min_worker_count = 1;
-            warn!("⚠️ Min worker count adjusted to 1");
         }
         if validated.max_worker_count < validated.min_worker_count {
             validated.max_worker_count = validated.min_worker_count.max(256);
-            warn!("⚠️ Max worker count adjusted to {}", validated.max_worker_count);
         }
         if validated.scaling_cooldown_seconds < 10 {
             validated.scaling_cooldown_seconds = 10;
-            warn!("⚠️ Scaling cooldown adjusted to 10 seconds");
-        }
-        if validated.work_stealing_target_queue_size < 100 {
-            validated.work_stealing_target_queue_size = 100;
-            warn!("⚠️ Target queue size adjusted to 100");
-        }
-        if validated.buffer_pool_target_hit_rate <= 0.0 || validated.buffer_pool_target_hit_rate > 1.0 {
-            validated.buffer_pool_target_hit_rate = 0.85;
-            warn!("⚠️ Buffer pool target hit rate adjusted to 0.85");
-        }
-        if validated.crypto_processor_target_success_rate <= 0.0 || validated.crypto_processor_target_success_rate > 1.0 {
-            validated.crypto_processor_target_success_rate = 0.99;
-            warn!("⚠️ Crypto processor target success rate adjusted to 0.99");
-        }
-        if validated.connection_target_count < 1000 {
-            validated.connection_target_count = 1000;
-            warn!("⚠️ Connection target count adjusted to 1000");
         }
 
-        // Применяем новые настройки к воркер-пулу
         if validated.min_worker_count != current.min_worker_count {
-            let worker_pool = self.worker_pool.clone();
-            let current_workers = worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+            let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
             if current_workers < validated.min_worker_count {
                 let increase = validated.min_worker_count - current_workers;
                 drop(current);
@@ -1402,38 +1292,13 @@ impl IntegratedBatchSystem {
             }
         }
 
-        if validated.max_worker_count != current.max_worker_count {
-            let worker_pool = self.worker_pool.clone();
-            let current_workers = worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
-            if current_workers > validated.max_worker_count {
-                let decrease = current_workers - validated.max_worker_count;
-                drop(current);
-                let _ = self.scale_down(decrease).await;
-                current = self.scaling_settings.write().await;
-            }
-        }
+        *current = validated.clone();
 
-        *current = validated;
-
-        // Записываем метрики
         self.record_metric("scaling.min_workers", current.min_worker_count as f64).await;
         self.record_metric("scaling.max_workers", current.max_worker_count as f64).await;
         self.record_metric("scaling.auto_scaling_enabled", current.auto_scaling_enabled as i64 as f64).await;
-        self.record_metric("scaling.cooldown_seconds", current.scaling_cooldown_seconds as f64).await;
-        self.record_metric("scaling.target_queue_size", current.work_stealing_target_queue_size as f64).await;
-        self.record_metric("scaling.target_hit_rate", current.buffer_pool_target_hit_rate).await;
-        self.record_metric("scaling.target_success_rate", current.crypto_processor_target_success_rate).await;
-        self.record_metric("scaling.target_connections", current.connection_target_count as f64).await;
 
-        info!("⚙️ Scaling settings updated:");
-        info!("  ├─ Min workers: {}", current.min_worker_count);
-        info!("  ├─ Max workers: {}", current.max_worker_count);
-        info!("  ├─ Auto scaling: {}", current.auto_scaling_enabled);
-        info!("  ├─ Cooldown: {}s", current.scaling_cooldown_seconds);
-        info!("  ├─ Target queue: {}", current.work_stealing_target_queue_size);
-        info!("  ├─ Target hit rate: {:.1}%", current.buffer_pool_target_hit_rate * 100.0);
-        info!("  ├─ Target success rate: {:.1}%", current.crypto_processor_target_success_rate * 100.0);
-        info!("  └─ Target connections: {}", current.connection_target_count);
+        info!("⚙️ Scaling settings updated");
     }
 
     /// 📈 Запуск сборщика статистики
@@ -1446,7 +1311,6 @@ impl IntegratedBatchSystem {
 
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
-
                 let mut stats_guard = stats.write().await;
                 stats_guard.uptime = Instant::now().duration_since(stats_guard.startup_time);
             }
@@ -1498,7 +1362,7 @@ impl IntegratedBatchSystem {
         });
     }
 
-    /// 📦 ОБРАБОТКА БАТЧА
+    /// 📦 ОБРАБОТКА БАТЧА - ✅ ИСПРАВЛЕНО: ЕДИНАЯ ЛОГИКА
     async fn process_batch(&self, batch: PendingBatch) {
         let start_time = Instant::now();
         let batch_size = batch.operations.len();
@@ -1507,79 +1371,88 @@ impl IntegratedBatchSystem {
         debug!("🔄 Processing batch #{} with {} operations", batch_id, batch_size);
 
         let mut successful = 0;
-        let mut processed_packets = Vec::new();
 
         for operation in batch.operations {
             match operation {
                 BatchOperation::Encryption { session_id, data, key: _, nonce: _ } => {
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
-                        // ✅ ИСПРАВЛЕНО: Сначала дешифруем пакет
-                        match self.packet_processor.process_incoming_vec(&data, &session) {
-                            Ok((packet_type, decrypted_payload)) => {
-                                // ✅ Затем отправляем в packet_service для обработки
-                                match self.packet_service.process_packet(
-                                    session.clone(),
-                                    packet_type,
-                                    decrypted_payload,
+                        match self.packet_processor.create_outgoing_vec(&session, 0x01, &data) {
+                            Ok(encrypted) => {
+                                successful += 1;
+
+                                let _ = self.writer.write(
                                     batch.source_addr,
-                                ).await {
-                                    Ok(processing_result) => {
-                                        // ✅ Шифруем ответ от packet_service
-                                        match self.packet_processor.create_outgoing_vec(
-                                            &session,
-                                            processing_result.packet_type,
-                                            &processing_result.response,
-                                        ) {
-                                            Ok(encrypted_response) => {
-                                                successful += 1;
-
-                                                let _ = self.writer.write(
-                                                    batch.source_addr,
-                                                    session_id,
-                                                    Bytes::from(encrypted_response),
-                                                    processing_result.priority,
-                                                    processing_result.packet_type == 0x01, // flush для Ping
-                                                ).await;
-
-                                                debug!("✅ Processed packet type 0x{:02x} through packet_service", packet_type);
-                                            }
-                                            Err(e) => {
-                                                debug!("❌ Encryption failed: {}", e);
-                                            }
-                                        }
-                                    }
-                                    Err(e) => {
-                                        debug!("❌ Packet service processing failed: {}", e);
-                                    }
-                                }
+                                    session_id,
+                                    Bytes::from(encrypted),
+                                    Priority::Critical,
+                                    true,
+                                ).await;
                             }
                             Err(e) => {
-                                debug!("❌ Decryption failed: {}", e);
+                                debug!("❌ Encryption failed: {}", e);
                             }
                         }
                     }
                 }
 
                 BatchOperation::Decryption { session_id, data, key: _, nonce: _ } => {
-                    let packet_type_byte = if !data.is_empty() { data[0] } else { 0 };
+                    if data.is_empty() {
+                        continue;
+                    }
+
+                    let packet_type_byte = data[0];
 
                     if !is_packet_supported(packet_type_byte) {
-                        debug!("⚠️ Unsupported packet type for decryption: 0x{:02x}", packet_type_byte);
+                        debug!("⚠️ Unsupported packet type: 0x{:02x}", packet_type_byte);
                         continue;
                     }
 
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
                         match self.packet_processor.process_incoming_vec(&data, &session) {
-                            Ok((decoded_type, _)) => {
+                            Ok((decoded_type, decrypted_payload)) => {
                                 if decoded_type == packet_type_byte {
-                                    successful += 1;
-                                    processed_packets.push((packet_type_byte, true));
-                                    debug!("✅ Decrypted packet type 0x{:02x}", packet_type_byte);
+                                    match self.packet_service.process_packet(
+                                        session.clone(),
+                                        decoded_type,
+                                        decrypted_payload,
+                                        batch.source_addr,
+                                    ).await {
+                                        Ok(processing_result) => {
+                                            match self.packet_processor.create_outgoing_vec(
+                                                &session,
+                                                processing_result.packet_type,
+                                                &processing_result.response,
+                                            ) {
+                                                Ok(encrypted_response) => {
+                                                    successful += 1;
+
+                                                    let priority = get_packet_priority(processing_result.packet_type)
+                                                        .unwrap_or(Priority::Normal);
+                                                    let requires_flush = PacketType::from_byte(processing_result.packet_type)
+                                                        .map(|pt| pt.requires_immediate_flush())
+                                                        .unwrap_or(false);
+
+                                                    let _ = self.writer.write(
+                                                        batch.source_addr,
+                                                        session_id,
+                                                        Bytes::from(encrypted_response),
+                                                        priority,
+                                                        requires_flush,
+                                                    ).await;
+                                                }
+                                                Err(e) => {
+                                                    debug!("❌ Encryption failed: {}", e);
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            debug!("❌ Packet service failed: {}", e);
+                                        }
+                                    }
                                 }
                             }
                             Err(e) => {
-                                debug!("❌ Decryption failed for packet type 0x{:02x}: {}", packet_type_byte, e);
-                                processed_packets.push((packet_type_byte, false));
+                                debug!("❌ Decryption failed: {}", e);
                             }
                         }
                     }
@@ -1597,33 +1470,45 @@ impl IntegratedBatchSystem {
                 }
 
                 BatchOperation::Processing { session_id, data, processor_type } => {
-                    let packet_type_byte = if !data.is_empty() { data[0] } else { 0 };
+                    if data.is_empty() {
+                        continue;
+                    }
+
+                    let packet_type_byte = data[0];
 
                     if !is_packet_supported(packet_type_byte) {
-                        debug!("⚠️ Unsupported packet type for processing: 0x{:02x}", packet_type_byte);
+                        debug!("⚠️ Unsupported packet type: 0x{:02x}", packet_type_byte);
                         continue;
                     }
 
                     match processor_type {
                         ProcessorType::Accelerated => {
-                            let _priority = get_packet_priority(packet_type_byte).unwrap_or(Priority::Normal);
-
                             if let Some(session) = self.session_manager.get_session(&session_id).await {
                                 match self.packet_processor.create_outgoing_vec(&session, packet_type_byte, &data) {
-                                    Ok(_encrypted) => {
+                                    Ok(encrypted) => {
                                         successful += 1;
-                                        processed_packets.push((packet_type_byte, true));
+
+                                        let priority = get_packet_priority(packet_type_byte).unwrap_or(Priority::Normal);
+                                        let requires_flush = PacketType::from_byte(packet_type_byte)
+                                            .map(|pt| pt.requires_immediate_flush())
+                                            .unwrap_or(false);
+
+                                        let _ = self.writer.write(
+                                            batch.source_addr,
+                                            session_id,
+                                            Bytes::from(encrypted),
+                                            priority,
+                                            requires_flush,
+                                        ).await;
                                     }
                                     Err(e) => {
-                                        debug!("❌ Processing failed for packet type 0x{:02x}: {}", packet_type_byte, e);
-                                        processed_packets.push((packet_type_byte, false));
+                                        debug!("❌ Processing failed: {}", e);
                                     }
                                 }
                             }
                         }
                         _ => {
                             successful += 1;
-                            processed_packets.push((packet_type_byte, true));
                         }
                     }
                 }
@@ -1638,27 +1523,6 @@ impl IntegratedBatchSystem {
 
         let processing_time = start_time.elapsed();
 
-        // ✅ ЛОГИРУЕМ СТАТИСТИКУ ПО ТИПАМ ПАКЕТОВ
-        let mut packet_stats = HashMap::new();
-        for (packet_type, success) in processed_packets {
-            *packet_stats.entry(packet_type).or_insert((0, 0)) = (
-                packet_stats.get(&packet_type).map(|(s, _)| s + 1).unwrap_or(1),
-                if success { 1 } else { 0 }
-            );
-        }
-
-        if !packet_stats.is_empty() {
-            debug!("📊 Batch #{} packet types:", batch_id);
-            for (packet_type, (total, successful_count)) in packet_stats {
-                if let Some(info) = get_packet_info(packet_type) {
-                    debug!("  - 0x{:02x}: {}/{} ({:.1}%) - {}",
-                       packet_type, successful_count, total,
-                       (successful_count as f64 / total as f64) * 100.0,
-                       info.description);
-                }
-            }
-        }
-
         self.adaptive_batcher.record_batch_execution(
             batch_size,
             processing_time,
@@ -1670,6 +1534,7 @@ impl IntegratedBatchSystem {
             let mut stats = self.stats.write().await;
             stats.total_batches_processed += 1;
             stats.crypto_operations += successful as u64;
+            stats.total_packets_processed += successful as u64;
         }
 
         let event = SystemEvent::BatchCompleted {
@@ -1680,9 +1545,6 @@ impl IntegratedBatchSystem {
         };
 
         let _ = self.event_tx.send(event).await;
-
-        debug!("✅ Batch #{} completed: {}/{} successful, {:.1}% in {:?}",
-        batch_id, successful, batch_size, success_rate * 100.0, processing_time);
     }
 
     /// 🛑 Завершение компонентов
@@ -1865,7 +1727,7 @@ impl IntegratedBatchSystem {
     }
 }
 
-/// ============= СТРУКТУРЫ ДАННЫХ =============
+// ============= СТРУКТУРЫ ДАННЫХ =============
 
 /// События системы
 #[derive(Debug, Clone)]
@@ -2223,3 +2085,4 @@ impl Clone for IntegratedBatchSystem {
 }
 
 use std::collections::VecDeque;
+use crate::core::protocol::server::heartbeat::types::ConnectionHeartbeatManager;

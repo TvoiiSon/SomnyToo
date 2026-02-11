@@ -22,17 +22,13 @@ impl PacketType {
     /// Получить приоритет для типа пакета
     pub fn priority(&self) -> Priority {
         match self {
-            // 🔧 CRITICAL - управляющие пакеты
             PacketType::Ping | PacketType::Heartbeat => Priority::Critical,
         }
     }
 
     /// Требует ли пакет немедленной отправки (flush)
     pub fn requires_immediate_flush(&self) -> bool {
-        matches!(self,
-            PacketType::Ping |
-            PacketType::Heartbeat
-        )
+        matches!(self, PacketType::Ping | PacketType::Heartbeat)
     }
 
     /// Является ли пакет критическим
@@ -52,8 +48,8 @@ impl PacketType {
     /// Получить описание пакета
     pub fn description(&self) -> &'static str {
         match self {
-            PacketType::Ping => "Ping запрос",
-            PacketType::Heartbeat => "Heartbeat сигнал",
+            PacketType::Ping => "Ping request",
+            PacketType::Heartbeat => "Heartbeat signal",
         }
     }
 }

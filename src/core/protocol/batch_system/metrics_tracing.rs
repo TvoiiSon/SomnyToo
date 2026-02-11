@@ -36,32 +36,24 @@ pub struct AggregatedMetric {
 
 #[derive(Debug, thiserror::Error)]
 pub enum MetricsError {
-    #[error("Ошибка инициализации: {0}")]
+    #[error("Initialization error: {0}")]
     InitializationError(String),
 }
 
 impl MetricsTracingSystem {
     pub fn new(config: MetricsConfig) -> Result<Self, MetricsError> {
-        info!("📊 Инициализация системы метрик и трассировки");
+        info!("📊 Initializing metrics and tracing system");
 
-        if config.enabled {
-            if !tracing::dispatcher::has_been_set() {
-                return Err(MetricsError::InitializationError(
-                    "Tracing не инициализирован. Нужно вызвать init_tracing() в основном приложении".to_string()
-                ));
-            }
-
-            Ok(Self {
-                metrics_store: Arc::new(DashMap::new()),
-                _config: config,
-            })
-        } else {
-            info!("📊 Система метрик отключена");
-            Ok(Self {
-                metrics_store: Arc::new(DashMap::new()),
-                _config: config,
-            })
+        if config.enabled && !tracing::dispatcher::has_been_set() {
+            return Err(MetricsError::InitializationError(
+                "Tracing not initialized".to_string()
+            ));
         }
+
+        Ok(Self {
+            metrics_store: Arc::new(DashMap::new()),
+            _config: config,
+        })
     }
 
     /// Запись метрики
@@ -69,14 +61,6 @@ impl MetricsTracingSystem {
         let key = name.to_string();
 
         if let Some(mut metric) = self.metrics_store.get_mut(&key) {
-            // Обновляем существующую метрику
-            if let Some(last) = metric.last_updated {
-                if last.elapsed() < Duration::from_secs(60) {
-                    // Сохраняем только последние значения для агрегации
-                    // В реальном коде здесь должно быть окно
-                }
-            }
-
             metric.count += 1;
             metric.sum += value;
             metric.avg = metric.sum / metric.count as f64;
@@ -84,12 +68,10 @@ impl MetricsTracingSystem {
             metric.max = metric.max.max(value);
             metric.last_updated = Some(Instant::now());
 
-            // Процентили (упрощенно)
             metric.p50 = metric.avg;
-            metric.p95 = metric.avg * 1.2; // Аппроксимация
-            metric.p99 = metric.avg * 1.5; // Аппроксимация
+            metric.p95 = metric.avg * 1.2;
+            metric.p99 = metric.avg * 1.5;
         } else {
-            // Создаем новую метрику
             self.metrics_store.insert(key, AggregatedMetric {
                 name: name.to_string(),
                 count: 1,

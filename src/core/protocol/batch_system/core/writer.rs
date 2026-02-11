@@ -6,7 +6,6 @@ use bytes::Bytes;
 use tracing::{info, debug, error, warn};
 
 use crate::core::protocol::packets::frame_writer;
-
 use crate::core::protocol::batch_system::config::BatchConfig;
 use crate::core::protocol::batch_system::types::error::BatchError;
 use crate::core::protocol::batch_system::types::priority::Priority;
@@ -25,7 +24,7 @@ pub struct WriteTask {
 pub struct BatchWriter {
     config: BatchConfig,
     connections: Arc<RwLock<Vec<ConnectionWriter>>>,
-    task_tx: broadcast::Sender<WriteTask>,  // broadcast вместо mpsc
+    task_tx: broadcast::Sender<WriteTask>,
     backpressure: Arc<Semaphore>,
     is_running: Arc<std::sync::atomic::AtomicBool>,
 }
@@ -71,7 +70,6 @@ impl BatchWriter {
         }
 
         self.start_writer_for_connection(destination_addr).await?;
-
         Ok(())
     }
 
@@ -83,7 +81,6 @@ impl BatchWriter {
         priority: Priority,
         requires_flush: bool,
     ) -> Result<(), BatchError> {
-        // Проверяем backpressure
         let permit = self.backpressure.clone()
             .try_acquire_owned()
             .map_err(|_| {
@@ -99,25 +96,22 @@ impl BatchWriter {
             requires_flush,
         };
 
-        info!("📊 Priority: {:?}, requires_flush: {}", priority, requires_flush);
-
-        // Немедленная запись для критических пакетов
-        if priority.is_critical() {
+        if priority.is_critical() || requires_flush {
             let result = self.write_immediate(task).await;
             drop(permit);
             return result;
-        } else {
-            // Буферизированная запись через broadcast
-            match self.task_tx.send(task) {
-                Ok(_) => {
-                    info!("✅ Task sent to writer broadcast channel");
-                    Ok(())
-                }
-                Err(e) => {
-                    error!("❌ Failed to send task: {}", e);
-                    drop(permit);
-                    Err(BatchError::ProcessingError(e.to_string()))
-                }
+        }
+
+        match self.task_tx.send(task) {
+            Ok(_) => {
+                debug!("✅ Task sent to writer broadcast channel");
+                drop(permit);
+                Ok(())
+            }
+            Err(e) => {
+                error!("❌ Failed to send task: {}", e);
+                drop(permit);
+                Err(BatchError::ProcessingError(e.to_string()))
             }
         }
     }
@@ -125,11 +119,10 @@ impl BatchWriter {
     async fn write_immediate(&self, task: WriteTask) -> Result<(), BatchError> {
         let mut connections = self.connections.write().await;
 
-        // ИЩЕМ ПО session_id, а не по адресу!
         if let Some(writer) = connections.iter_mut()
             .find(|w| w.session_id == task.session_id && w.is_active) {
 
-            info!("✅ Found connection for session {} to {}",
+            debug!("✅ Found connection for session {} to {}",
               hex::encode(&task.session_id), task.destination_addr);
 
             match tokio::time::timeout(
@@ -143,33 +136,24 @@ impl BatchWriter {
                     }
 
                     writer.last_write_time = Instant::now();
-
                     Ok(())
                 }
                 Ok(Err(e)) => {
                     writer.is_active = false;
                     error!("❌ Immediate write failed for session {}: {}",
-                hex::encode(&writer.session_id), e);
+                        hex::encode(&writer.session_id), e);
                     Err(BatchError::ProcessingError(e.to_string()))
                 }
                 Err(_) => {
                     writer.is_active = false;
                     error!("⏰ Immediate write timeout for session {}",
-                hex::encode(&writer.session_id));
+                        hex::encode(&writer.session_id));
                     Err(BatchError::Timeout)
                 }
             }
         } else {
             error!("❌ Connection not found for session {} to {}",
                hex::encode(&task.session_id), task.destination_addr);
-
-            // Дополнительная отладка: выведем все доступные соединения
-            debug!("Available connections:");
-            for conn in connections.iter() {
-                debug!("  - Session: {}, Addr: {}, Active: {}",
-                   hex::encode(&conn.session_id), conn.destination_addr, conn.is_active);
-            }
-
             Err(BatchError::ConnectionError("Connection not found".to_string()))
         }
     }
@@ -180,7 +164,6 @@ impl BatchWriter {
         let is_running = self.is_running.clone();
         let backpressure = self.backpressure.clone();
 
-        // Создаем отдельный receiver для этого writer task
         let mut task_rx = self.task_tx.subscribe();
 
         tokio::spawn(async move {
@@ -192,7 +175,6 @@ impl BatchWriter {
                         if task.destination_addr == destination_addr {
                             pending_tasks.push(task);
 
-                            // Проверяем, нужно ли сбрасывать батч
                             if pending_tasks.len() >= config.batch_size {
                                 if let Err(e) = Self::process_batch(
                                     &connections,
@@ -202,11 +184,12 @@ impl BatchWriter {
                                 ).await {
                                     error!("Batch write error: {}", e);
                                 }
+                                backpressure.add_permits(pending_tasks.len());
+                                pending_tasks.clear();
                             }
                         }
                     }
                     _ = tokio::time::sleep(config.flush_interval) => {
-                        // Таймер сброса
                         if !pending_tasks.is_empty() {
                             if let Err(e) = Self::process_batch(
                                 &connections,
@@ -216,14 +199,10 @@ impl BatchWriter {
                             ).await {
                                 error!("Batch write error: {}", e);
                             }
+                            backpressure.add_permits(pending_tasks.len());
+                            pending_tasks.clear();
                         }
                     }
-                }
-
-                // Освобождаем backpressure permits для обработанных задач
-                if !pending_tasks.is_empty() {
-                    backpressure.add_permits(pending_tasks.len());
-                    pending_tasks.clear();
                 }
             }
         });
@@ -246,15 +225,11 @@ impl BatchWriter {
             .find(|w| w.destination_addr == destination_addr && w.is_active);
 
         if let Some(writer) = writer_opt {
-            // Логируем session_id для отладки
             let session_id_hex = hex::encode(&writer.session_id);
-            debug!("Batch writing to {} session: {}",
-                destination_addr, session_id_hex);
+            debug!("Batch writing to {} session: {}", destination_addr, session_id_hex);
 
-            // Сортируем задачи по приоритету (Critical first)
             tasks.sort_by(|a, b| b.priority.cmp(&a.priority));
 
-            // Объединяем данные
             let mut combined_data = Vec::new();
             let mut requires_flush = false;
             let mut total_bytes = 0;
@@ -269,11 +244,6 @@ impl BatchWriter {
 
             let data_bytes = Bytes::from(combined_data);
 
-            // Логируем информацию о батче с session_id
-            debug!("Batch for session {}: {} tasks, {} bytes, highest priority: {:?}",
-                session_id_hex, tasks.len(), total_bytes,
-                tasks.first().map(|t| t.priority).unwrap_or(Priority::Normal));
-
             match tokio::time::timeout(
                 config.write_timeout * (tasks.len() as u32).max(1),
                 frame_writer::write_frame(&mut writer.write_stream, &data_bytes),
@@ -281,35 +251,29 @@ impl BatchWriter {
                 Ok(Ok(_)) => {
                     writer.last_write_time = Instant::now();
 
-                    // Flush если требуется
                     if requires_flush {
                         debug!("🌀 Flushing batch for session {}", session_id_hex);
                         writer.write_stream.flush().await
                             .map_err(BatchError::Io)?;
-                        debug!("✅ Batch flushed for session {}", session_id_hex);
                     }
 
                     debug!("✅ Batch write to {} session {}: {} tasks, {} bytes",
                         destination_addr, session_id_hex, tasks.len(), total_bytes);
-
                     Ok(())
                 }
                 Ok(Err(e)) => {
                     writer.is_active = false;
-                    error!("❌ Batch write failed for session {}: {}",
-                        session_id_hex, e);
+                    error!("❌ Batch write failed for session {}: {}", session_id_hex, e);
                     Err(BatchError::ProcessingError(e.to_string()))
                 }
                 Err(_) => {
                     writer.is_active = false;
-                    error!("⏰ Batch write timeout for session {}",
-                        session_id_hex);
+                    error!("⏰ Batch write timeout for session {}", session_id_hex);
                     Err(BatchError::Timeout)
                 }
             }
         } else {
-            error!("Connection not found for batch write to {}",
-                destination_addr);
+            error!("Connection not found for batch write to {}", destination_addr);
             Err(BatchError::ConnectionError("Connection not found".to_string()))
         }
     }
@@ -322,7 +286,6 @@ impl BatchWriter {
             connection.is_active = false;
         }
 
-        info!("BatchWriter shutdown completed with {} connections",
-            connections.len());
+        info!("BatchWriter shutdown completed with {} connections", connections.len());
     }
 }
