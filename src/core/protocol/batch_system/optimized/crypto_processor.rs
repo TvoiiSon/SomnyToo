@@ -1,9 +1,8 @@
 use std::sync::Arc;
 use std::time::{Instant, Duration};
-use std::collections::VecDeque;
 use dashmap::DashMap;
 use tracing::info;
-use tokio::sync::{mpsc, Mutex};
+use flume::{Sender, Receiver, bounded};
 
 use crate::core::protocol::batch_system::types::error::BatchError;
 
@@ -57,11 +56,15 @@ pub struct CryptoResult {
     pub worker_id: usize,
 }
 
-/// Оптимизированный криптопроцессор
+/// Оптимизированный криптопроцессор с атомарными очередями
 pub struct OptimizedCryptoProcessor {
-    // Каналы для worker'ов
-    _worker_senders: Arc<Vec<mpsc::Sender<CryptoTask>>>,
-    worker_receivers: Arc<Vec<Mutex<mpsc::Receiver<CryptoTask>>>>,
+    // Атомарные каналы для worker'ов
+    worker_senders: Arc<Vec<Sender<CryptoTask>>>,
+    worker_receivers: Arc<Vec<Receiver<CryptoTask>>>,
+
+    // Канал для инжектора
+    injector_sender: Sender<CryptoTask>,
+    injector_receiver: Receiver<CryptoTask>,
 
     // Результаты
     results: Arc<DashMap<u64, CryptoResult>>,
@@ -76,20 +79,24 @@ pub struct OptimizedCryptoProcessor {
 
 impl OptimizedCryptoProcessor {
     pub fn new(num_workers: usize) -> Self {
-        info!("🚀 Creating optimized crypto processor with {} workers", num_workers);
+        info!("🚀 Creating optimized crypto processor with {} workers and atomарными очередями", num_workers);
 
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut worker_receivers = Vec::with_capacity(num_workers);
 
         for _ in 0..num_workers {
-            let (tx, rx) = mpsc::channel(1000);
+            let (tx, rx) = bounded(1000);
             worker_senders.push(tx);
-            worker_receivers.push(Mutex::new(rx));
+            worker_receivers.push(rx);
         }
 
+        let (injector_sender, injector_receiver) = bounded(2000);
+
         let processor = Self {
-            _worker_senders: Arc::new(worker_senders),
+            worker_senders: Arc::new(worker_senders),
             worker_receivers: Arc::new(worker_receivers),
+            injector_sender,
+            injector_receiver,
             results: Arc::new(DashMap::new()),
             stats: Arc::new(DashMap::new()),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
@@ -105,82 +112,67 @@ impl OptimizedCryptoProcessor {
         let num_workers = self.worker_receivers.len();
 
         for worker_id in 0..num_workers {
-            let worker_receivers = self.worker_receivers.clone();
+            let worker_receiver = self.worker_receivers[worker_id].clone();
+            let injector_receiver = self.injector_receiver.clone();
             let results = self.results.clone();
             let stats = self.stats.clone();
             let is_running = self.is_running.clone();
 
-            let worker_task = async move {
+            tokio::spawn(async move {
                 Self::crypto_worker_loop(
                     worker_id,
-                    worker_receivers,
+                    worker_receiver,
+                    injector_receiver,
                     results,
                     stats,
                     is_running,
                 ).await;
-            };
-
-            tokio::spawn(worker_task);
+            });
         }
 
-        info!("✅ Started {} crypto workers", num_workers);
+        info!("✅ Started {} crypto workers with atomарными очередями", num_workers);
     }
 
     async fn crypto_worker_loop(
         worker_id: usize,
-        worker_receivers: Arc<Vec<Mutex<mpsc::Receiver<CryptoTask>>>>,
+        worker_receiver: Receiver<CryptoTask>,
+        injector_receiver: Receiver<CryptoTask>,
         results: Arc<DashMap<u64, CryptoResult>>,
         stats: Arc<DashMap<String, u64>>,
         is_running: Arc<std::sync::atomic::AtomicBool>,
     ) {
-        info!("🔐 Crypto worker #{} started", worker_id);
+        info!("🔐 Crypto worker #{} started with atomарными очередями", worker_id);
 
         let mut processed = 0;
-        let mut local_queue = VecDeque::new();
 
         while is_running.load(std::sync::atomic::Ordering::Relaxed) {
             tokio::select! {
                 // Берем из своей очереди
-                task = async {
-                    if let Some(receiver_mutex) = worker_receivers.get(worker_id) {
-                        let mut receiver = receiver_mutex.lock().await;
-                        receiver.recv().await
-                    } else {
-                        None
-                    }
-                } => {
-                    if let Some(task) = task {
-                        local_queue.push_back(task);
-                    }
+                Ok(task) = worker_receiver.recv_async() => {
+                    Self::process_crypto_task(
+                        worker_id,
+                        task,
+                        &results,
+                        &stats,
+                    );
+                    processed += 1;
                 }
 
-                // Work-stealing
-                _ = tokio::time::sleep(Duration::from_millis(5)) => {
-                    let num_workers = worker_receivers.len();
-                    for offset in 1..num_workers {
-                        let victim_id = (worker_id + offset) % num_workers;
-
-                        if let Some(victim_mutex) = worker_receivers.get(victim_id) {
-                            let mut victim_receiver = victim_mutex.lock().await;
-                            if let Ok(task) = victim_receiver.try_recv() {
-                                local_queue.push_back(task);
-                                *stats.entry("crypto_steals".to_string()).or_insert(0) += 1;
-                                break;
-                            }
-                        }
-                    }
+                // Work-stealing из инжектора
+                Ok(task) = injector_receiver.recv_async() => {
+                    *stats.entry("crypto_steals".to_string()).or_insert(0) += 1;
+                    Self::process_crypto_task(
+                        worker_id,
+                        task,
+                        &results,
+                        &stats,
+                    );
+                    processed += 1;
                 }
-            }
 
-            // Обработка задач
-            while let Some(task) = local_queue.pop_front() {
-                Self::process_crypto_task(
-                    worker_id,
-                    task,
-                    &results,
-                    &stats,
-                    &mut processed,
-                );
+                _ = tokio::time::sleep(Duration::from_micros(5)) => {
+                    // Короткая пауза
+                }
             }
 
             // Статистика
@@ -188,8 +180,6 @@ impl OptimizedCryptoProcessor {
                 stats.insert(format!("crypto_worker_{}_processed", worker_id), processed as u64);
                 processed = 0;
             }
-
-            tokio::time::sleep(Duration::from_micros(5)).await;
         }
 
         info!("👋 Crypto worker #{} stopped", worker_id);
@@ -200,7 +190,6 @@ impl OptimizedCryptoProcessor {
         task: CryptoTask,
         results: &Arc<DashMap<u64, CryptoResult>>,
         stats: &Arc<DashMap<String, u64>>,
-        processed: &mut u64,
     ) {
         let start_time = Instant::now();
 
@@ -229,7 +218,6 @@ impl OptimizedCryptoProcessor {
         };
 
         results.insert(task.id, crypto_result);
-        *processed += 1;
 
         // Статистика
         *stats.entry("crypto_tasks_processed".to_string()).or_insert(0) += 1;
@@ -323,7 +311,7 @@ impl OptimizedCryptoProcessor {
         }
     }
 
-    /// Отправка криптозадачи
+    /// Отправка криптозадачи с атомарными очередями
     pub async fn submit_crypto_task(&self, operation: CryptoOperation, session_id: Vec<u8>, priority: u8) -> Result<u64, BatchError> {
         let task_id = self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -335,14 +323,24 @@ impl OptimizedCryptoProcessor {
         };
 
         // Round-robin распределение
-        let worker_idx = task_id as usize % self._worker_senders.len();
+        let worker_idx = task_id as usize % self.worker_senders.len();
 
-        match self._worker_senders[worker_idx].send(task).await {
+        // Пытаемся отправить в очередь worker'а
+        match self.worker_senders[worker_idx].try_send(task.clone()) {
             Ok(_) => {
                 *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
                 Ok(task_id)
             }
-            Err(e) => Err(BatchError::ProcessingError(format!("Failed to submit crypto task: {}", e))),
+            Err(_) => {
+                // Очередь worker'а переполнена, отправляем в инжектор
+                match self.injector_sender.try_send(task) {
+                    Ok(_) => {
+                        *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
+                        Ok(task_id)
+                    }
+                    Err(_) => Err(BatchError::ProcessingError("All crypto queues are full".to_string())),
+                }
+            }
         }
     }
 

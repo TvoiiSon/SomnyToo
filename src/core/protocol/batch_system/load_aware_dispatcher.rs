@@ -3,7 +3,7 @@ use std::time::{Instant, Duration};
 use dashmap::DashMap;
 use tracing::{info, debug, error, warn};
 use bytes::Bytes;
-use tokio::sync::{mpsc, broadcast, Mutex, RwLock};
+use flume::{Sender, Receiver, bounded};
 
 use crate::core::protocol::batch_system::types::error::BatchError;
 use crate::core::protocol::batch_system::types::priority::Priority;
@@ -41,17 +41,21 @@ pub struct WorkerLoadInfo {
     pub current_complexity: u32,
 }
 
-/// Диспетчер с учетом нагрузки
+/// Диспетчер с учетом нагрузки с атомарными очередями
 pub struct LoadAwareDispatcher {
-    // Базовые компоненты
-    worker_senders: Arc<Vec<mpsc::Sender<LoadAwareTask>>>,
-    worker_receivers: Arc<Vec<Mutex<mpsc::Receiver<LoadAwareTask>>>>,
-    injector_tx: broadcast::Sender<LoadAwareTask>,
+    // Атомарные каналы для worker'ов
+    worker_senders: Arc<Vec<Sender<LoadAwareTask>>>,
+    worker_receivers: Arc<Vec<Receiver<LoadAwareTask>>>,
+
+    // Канал для инжектора
+    injector_sender: Sender<LoadAwareTask>,
+    injector_receiver: Receiver<LoadAwareTask>,
+
     results: Arc<DashMap<u64, WorkStealingResult>>,
     stats: Arc<DashMap<String, u64>>,
 
     // Новые компоненты
-    worker_loads: Arc<RwLock<Vec<WorkerLoadInfo>>>,
+    worker_loads: Arc<parking_lot::RwLock<Vec<WorkerLoadInfo>>>,
     circuit_breaker: Arc<CircuitBreaker>,
     qos_manager: Arc<QosManager>,
     adaptive_batcher: Arc<AdaptiveBatcher>,
@@ -73,18 +77,18 @@ impl LoadAwareDispatcher {
         qos_manager: Arc<QosManager>,
         adaptive_batcher: Arc<AdaptiveBatcher>,
     ) -> Self {
-        info!("🚀 Создание LoadAwareDispatcher с {} workers", num_workers);
+        info!("🚀 Создание LoadAwareDispatcher с {} workers и атомарными очередями", num_workers);
 
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut worker_receivers = Vec::with_capacity(num_workers);
 
         for _ in 0..num_workers {
-            let (tx, rx) = mpsc::channel(queue_capacity);
+            let (tx, rx) = bounded(queue_capacity);
             worker_senders.push(tx);
-            worker_receivers.push(Mutex::new(rx));
+            worker_receivers.push(rx);
         }
 
-        let (injector_tx, _) = broadcast::channel(queue_capacity * 2);
+        let (injector_sender, injector_receiver) = bounded(queue_capacity * 2);
 
         // Инициализируем информацию о загрузке worker'ов
         let mut worker_loads = Vec::new();
@@ -103,10 +107,11 @@ impl LoadAwareDispatcher {
         let dispatcher = Self {
             worker_senders: Arc::new(worker_senders),
             worker_receivers: Arc::new(worker_receivers),
-            injector_tx,
+            injector_sender,
+            injector_receiver,
             results: Arc::new(DashMap::new()),
             stats: Arc::new(DashMap::new()),
-            worker_loads: Arc::new(RwLock::new(worker_loads)),
+            worker_loads: Arc::new(parking_lot::RwLock::new(worker_loads)),
             circuit_breaker,
             qos_manager,
             adaptive_batcher,
@@ -124,13 +129,14 @@ impl LoadAwareDispatcher {
         dispatcher
     }
 
-    /// Запуск worker'ов
+    /// Запуск worker'ов с атомарными очередями
     fn start_workers(&self, session_manager: Arc<PhantomSessionManager>) {
         let packet_processor = PhantomPacketProcessor::new();
         let num_workers = self.worker_senders.len();
 
         for worker_id in 0..num_workers {
-            let worker_receivers = self.worker_receivers.clone();
+            let worker_receiver = self.worker_receivers[worker_id].clone();
+            let injector_receiver = self.injector_receiver.clone();
             let results = self.results.clone();
             let stats = self.stats.clone();
             let is_running = self.is_running.clone();
@@ -142,7 +148,8 @@ impl LoadAwareDispatcher {
             tokio::spawn(async move {
                 Self::worker_loop(
                     worker_id,
-                    worker_receivers,
+                    worker_receiver,
+                    injector_receiver,
                     results,
                     stats,
                     is_running,
@@ -153,77 +160,98 @@ impl LoadAwareDispatcher {
             });
         }
 
-        info!("👷 Запущено {} worker'ов", num_workers);
+        info!("👷 Запущено {} worker'ов с атомарными очередями", num_workers);
     }
 
     async fn worker_loop(
         worker_id: usize,
-        worker_receivers: Arc<Vec<Mutex<mpsc::Receiver<LoadAwareTask>>>>,
+        worker_receiver: Receiver<LoadAwareTask>,
+        injector_receiver: Receiver<LoadAwareTask>,
         results: Arc<DashMap<u64, WorkStealingResult>>,
         stats: Arc<DashMap<String, u64>>,
         is_running: Arc<std::sync::atomic::AtomicBool>,
-        worker_loads: Arc<RwLock<Vec<WorkerLoadInfo>>>,
+        worker_loads: Arc<parking_lot::RwLock<Vec<WorkerLoadInfo>>>,
         _packet_processor: PhantomPacketProcessor,
         _session_manager: Arc<PhantomSessionManager>,
     ) {
-        info!("👷 Worker #{} запущен", worker_id);
+        info!("👷 Worker #{} запущен с атомарными очередями", worker_id);
 
         while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-            // Получаем задачу
-            let task = if let Some(receiver_mutex) = worker_receivers.get(worker_id) {
-                let mut receiver = receiver_mutex.lock().await;
-                match receiver.recv().await {
-                    Some(task) => task,
-                    None => {
-                        tokio::time::sleep(Duration::from_millis(10)).await;
-                        continue;
-                    }
+            tokio::select! {
+                // Берем из своей очереди
+                Ok(task) = worker_receiver.recv_async() => {
+                    Self::process_task(
+                        worker_id,
+                        task,
+                        &results,
+                        &stats,
+                        &worker_loads,
+                    ).await;
                 }
-            } else {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-                continue;
-            };
 
-            // Обрабатываем задачу
-            let start_time = Instant::now();
+                // Work-stealing из инжектора
+                Ok(task) = injector_receiver.recv_async() => {
+                    *stats.entry("work_steals".to_string()).or_insert(0) += 1;
+                    Self::process_task(
+                        worker_id,
+                        task,
+                        &results,
+                        &stats,
+                        &worker_loads,
+                    ).await;
+                }
 
-            // Здесь должна быть реальная обработка задачи
-            // Для примера просто имитируем обработку
-            tokio::time::sleep(Duration::from_millis(1)).await;
-
-            let processing_time = start_time.elapsed();
-
-            // Обновляем метрики загрузки
-            {
-                let mut loads = worker_loads.write().await;
-                if let Some(worker) = loads.get_mut(worker_id) {
-                    worker.queue_size = worker.queue_size.saturating_sub(1);
-                    worker.current_complexity = worker.current_complexity.saturating_sub(task.estimated_complexity);
-                    worker.avg_processing_time = Duration::from_nanos(
-                        (worker.avg_processing_time.as_nanos() as f64 * 0.9 +
-                            processing_time.as_nanos() as f64 * 0.1) as u64
-                    );
-                    worker.last_update = Instant::now();
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    // Короткая пауза
                 }
             }
-
-            // Сохраняем результат
-            let result = WorkStealingResult {
-                task_id: task.id,
-                session_id: task.session_id.clone(),
-                result: Ok(vec![]), // Упрощенный результат
-                processing_time,
-                worker_id,
-            };
-
-            results.insert(task.id, result);
-
-            // Обновляем статистику
-            *stats.entry(format!("worker_{}_processed", worker_id)).or_insert(0) += 1;
-            *stats.entry("total_tasks_processed".to_string()).or_insert(0) += 1;
         }
 
         info!("👋 Worker #{} остановлен", worker_id);
+    }
+
+    async fn process_task(
+        worker_id: usize,
+        task: LoadAwareTask,
+        results: &Arc<DashMap<u64, WorkStealingResult>>,
+        stats: &Arc<DashMap<String, u64>>,
+        worker_loads: &Arc<parking_lot::RwLock<Vec<WorkerLoadInfo>>>,
+    ) {
+        let start_time = Instant::now();
+
+        // Имитация обработки задачи
+        tokio::time::sleep(Duration::from_millis(1)).await;
+
+        let processing_time = start_time.elapsed();
+
+        // Обновляем метрики загрузки
+        {
+            let mut loads = worker_loads.write();
+            if let Some(worker) = loads.get_mut(worker_id) {
+                worker.queue_size = worker.queue_size.saturating_sub(1);
+                worker.current_complexity = worker.current_complexity.saturating_sub(task.estimated_complexity);
+                worker.avg_processing_time = Duration::from_nanos(
+                    (worker.avg_processing_time.as_nanos() as f64 * 0.9 +
+                        processing_time.as_nanos() as f64 * 0.1) as u64
+                );
+                worker.last_update = Instant::now();
+            }
+        }
+
+        // Сохраняем результат
+        let result = WorkStealingResult {
+            task_id: task.id,
+            session_id: task.session_id.clone(),
+            result: Ok(vec![]), // Упрощенный результат
+            processing_time,
+            worker_id,
+        };
+
+        results.insert(task.id, result);
+
+        // Обновляем статистику
+        *stats.entry(format!("worker_{}_processed", worker_id)).or_insert(0) += 1;
+        *stats.entry("total_tasks_processed".to_string()).or_insert(0) += 1;
     }
 
     /// Мониторинг загрузки worker'ов
@@ -238,7 +266,7 @@ impl LoadAwareDispatcher {
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
 
-                let loads = worker_loads.read().await;
+                let loads = worker_loads.read();
 
                 let total_queue: usize = loads.iter().map(|w| w.queue_size).sum();
                 let avg_processing_time: Duration = loads.iter()
@@ -291,7 +319,7 @@ impl LoadAwareDispatcher {
 
     /// Выбор оптимального worker'а
     async fn select_optimal_worker(&self, task: &LoadAwareTask) -> Option<usize> {
-        let loads = self.worker_loads.read().await;
+        let loads = self.worker_loads.read();
 
         if loads.is_empty() {
             return None;
@@ -335,7 +363,7 @@ impl LoadAwareDispatcher {
         processing_time: Option<Duration>,
         complexity_delta: i32,
     ) {
-        let mut loads = self.worker_loads.write().await;
+        let mut loads = self.worker_loads.write();
 
         if let Some(worker) = loads.get_mut(worker_id) {
             if queue_delta > 0 {
@@ -370,7 +398,7 @@ impl LoadAwareDispatcher {
         }
     }
 
-    /// Отправка задачи
+    /// Отправка задачи с атомарными очередями
     pub async fn submit_task(&self, mut task: LoadAwareTask) -> Result<u64, BatchError> {
         if !self.circuit_breaker.allow_request().await {
             warn!("🚨 Circuit breaker блокирует задачу");
@@ -407,18 +435,30 @@ impl LoadAwareDispatcher {
             task.estimated_complexity as i32,
         ).await;
 
-        match self.worker_senders[worker_id].send(task.clone()).await {
+        // Пытаемся отправить задачу в очередь worker'а
+        match self.worker_senders[worker_id].try_send(task.clone()) {
             Ok(_) => {
                 debug!("✅ Задача {} отправлена worker {}", task_id, worker_id);
                 *self.stats.entry("tasks_submitted".to_string()).or_insert(0) += 1;
                 self.circuit_breaker.record_success().await;
                 Ok(task_id)
             }
-            Err(e) => {
-                self.update_worker_load(worker_id, -1, None, -(task.estimated_complexity as i32)).await;
-                self.circuit_breaker.record_failure().await;
-                error!("❌ Ошибка отправки задачи: {}", e);
-                Err(BatchError::ProcessingError(e.to_string()))
+            Err(_) => {
+                // Очередь worker'а переполнена, пытаемся отправить в инжектор
+                match self.injector_sender.try_send(task.clone()) {
+                    Ok(_) => {
+                        debug!("✅ Задача {} отправлена в инжектор", task_id);
+                        *self.stats.entry("tasks_submitted".to_string()).or_insert(0) += 1;
+                        self.circuit_breaker.record_success().await;
+                        Ok(task_id)
+                    }
+                    Err(_) => {
+                        self.update_worker_load(worker_id, -1, None, -(task.estimated_complexity as i32)).await;
+                        self.circuit_breaker.record_failure().await;
+                        error!("❌ Ошибка отправки задачи: все очереди переполнены");
+                        Err(BatchError::Backpressure)
+                    }
+                }
             }
         }
     }
@@ -440,7 +480,7 @@ impl LoadAwareDispatcher {
 
     /// Получение расширенных метрик
     pub async fn get_advanced_metrics(&self) -> AdvancedDispatcherMetrics {
-        let loads = self.worker_loads.read().await;
+        let loads = self.worker_loads.read();
         let circuit_state = self.circuit_breaker.get_state().await;
         let (high_q, normal_q, low_q) = self.qos_manager.get_quotas().await;
         let (high_u, normal_u, low_u) = self.qos_manager.get_utilization().await;
@@ -476,6 +516,11 @@ impl LoadAwareDispatcher {
 
         variance.sqrt() / (avg_load + 1.0)
     }
+
+    pub async fn shutdown(&self) {
+        self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
+        info!("LoadAwareDispatcher остановлен");
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -490,11 +535,4 @@ pub struct AdvancedDispatcherMetrics {
     pub current_batch_size: usize,
     pub batch_metrics: super::adaptive_batcher::BatchMetrics,
     pub imbalance: f64,
-}
-
-impl LoadAwareDispatcher {
-    pub async fn shutdown(&self) {
-        self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-        info!("LoadAwareDispatcher остановлен");
-    }
 }
