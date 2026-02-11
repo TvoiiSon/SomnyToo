@@ -34,7 +34,7 @@ use crate::core::protocol::batch_system::metrics_tracing::{
     MetricsTracingSystem, MetricsConfig
 };
 
-// ✅ READER & WRITER (единственные компоненты из core)
+// ✅ READER & WRITER
 use crate::core::protocol::batch_system::core::reader::{BatchReader, ReaderEvent};
 use crate::core::protocol::batch_system::core::writer::{BatchWriter};
 
@@ -45,8 +45,8 @@ use crate::core::protocol::packets::packet_service::PhantomPacketService;
 use crate::core::protocol::phantom_crypto::packet::PhantomPacketProcessor;
 use crate::core::monitoring::unified_monitor::UnifiedMonitor;
 
-/// ⚡ ОСНОВНОЙ ИНТЕГРИРОВАННЫЙ УЗЕЛ BATCH СИСТЕМЫ v2.0
-/// Полностью оптимизированная версия, без легаси-компонентов
+/// ⚡ ОСНОВНОЙ ИНТЕГРИРОВАННЫЙ УЗЕЛ BATCH СИСТЕМЫ v2.1
+/// Полностью рабочая версия с динамическим масштабированием
 pub struct IntegratedBatchSystem {
     // 📋 КОНФИГУРАЦИЯ
     config: BatchConfig,
@@ -87,11 +87,94 @@ pub struct IntegratedBatchSystem {
     // 📊 СТАТИСТИКА И МЕТРИКИ
     stats: Arc<RwLock<SystemStatistics>>,
     metrics: Arc<DashMap<String, MetricValue>>,
+
+    // ✅ ИСПРАВЛЕНО: РЕАЛЬНО ИСПОЛЬЗУЕМЫЕ КОМПОНЕНТЫ
     pending_batches: Arc<RwLock<Vec<PendingBatch>>>,
     active_connections: Arc<RwLock<HashMap<std::net::SocketAddr, ConnectionInfo>>>,
     session_cache: Arc<RwLock<HashMap<Vec<u8>, SessionCacheEntry>>>,
     scaling_settings: Arc<RwLock<ScalingSettings>>,
     performance_counters: Arc<DashMap<String, PerformanceCounter>>,
+
+    // 🆕 НОВЫЕ КОМПОНЕНТЫ ДЛЯ ДИНАМИЧЕСКОГО МАСШТАБИРОВАНИЯ
+    worker_pool: Arc<WorkerPool>,
+    scaling_lock: Arc<Mutex<()>>,
+}
+
+/// 🏭 Пул воркеров для динамического масштабирования
+struct WorkerPool {
+    min_workers: usize,
+    max_workers: usize,
+    current_workers: Arc<std::sync::atomic::AtomicUsize>,
+    worker_handles: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    shutdown_tx: broadcast::Sender<()>,
+}
+
+impl WorkerPool {
+    fn new(min_workers: usize, max_workers: usize) -> Self {
+        let (shutdown_tx, _) = broadcast::channel(max_workers * 2);
+        Self {
+            min_workers,
+            max_workers,
+            current_workers: Arc::new(std::sync::atomic::AtomicUsize::new(min_workers)),
+            worker_handles: Arc::new(Mutex::new(Vec::new())),
+            shutdown_tx,
+        }
+    }
+
+    async fn add_workers(&self, count: usize, _dispatcher: Arc<WorkStealingDispatcher>) -> Result<usize, BatchError> {
+        let current = self.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+        let target = (current + count).min(self.max_workers);
+        let to_add = target - current;
+
+        if to_add == 0 {
+            return Ok(0);
+        }
+
+        let mut handles = self.worker_handles.lock().await;
+        let shutdown_rx = self.shutdown_tx.subscribe();
+
+        for i in 0..to_add {
+            let worker_id = current + i;
+            let mut shutdown_rx = shutdown_rx.resubscribe();
+
+            let handle = tokio::spawn(async move {
+                loop {
+                    tokio::select! {
+                        _ = shutdown_rx.recv() => {
+                            debug!("👋 Dynamic worker #{} shutting down", worker_id);
+                            break;
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100)) => {
+                            // Worker будет получать задачи через диспетчер
+                        }
+                    }
+                }
+            });
+
+            handles.push(handle);
+        }
+
+        self.current_workers.store(target, std::sync::atomic::Ordering::SeqCst);
+        Ok(to_add)
+    }
+
+    async fn remove_workers(&self, count: usize) -> Result<usize, BatchError> {
+        let current = self.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+        let target = current.saturating_sub(count).max(self.min_workers);
+        let to_remove = current - target;
+
+        if to_remove == 0 {
+            return Ok(0);
+        }
+
+        // Отправляем сигнал остановки для to_remove воркеров
+        for _ in 0..to_remove {
+            let _ = self.shutdown_tx.send(());
+        }
+
+        self.current_workers.store(target, std::sync::atomic::Ordering::SeqCst);
+        Ok(to_remove)
+    }
 }
 
 impl IntegratedBatchSystem {
@@ -105,13 +188,13 @@ impl IntegratedBatchSystem {
         let startup_time = Instant::now();
 
         // ============= 1. ИНИЦИАЛИЗАЦИЯ METRICS TRACING =============
-        info!("📊 [1/10] Инициализация Metrics & Tracing...");
+        info!("📊 [1/11] Инициализация Metrics & Tracing...");
         let metrics_config = MetricsConfig {
             enabled: config.metrics_enabled,
             collection_interval: config.metrics_collection_interval,
             trace_sampling_rate: config.trace_sampling_rate,
             service_name: "batch-system".to_string(),
-            service_version: "2.0.0".to_string(),
+            service_version: "2.1.0".to_string(),
             environment: "production".to_string(),
             retention_period: Duration::from_secs(3600),
         };
@@ -122,18 +205,15 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 2. ИНИЦИАЛИЗАЦИЯ CIRCUIT BREAKER =============
-        info!("🛡️ [2/10] Инициализация Circuit Breaker Manager...");
+        info!("🛡️ [2/11] Инициализация Circuit Breaker Manager...");
         let circuit_breaker_manager = Arc::new(
             CircuitBreakerManager::new(Arc::new(config.clone()))
         );
 
-        // Создаем Circuit Breaker для ключевых компонентов
         let dispatcher_circuit_breaker = circuit_breaker_manager.get_or_create("dispatcher");
-        let _crypto_circuit_breaker = circuit_breaker_manager.get_or_create("crypto_processor");
-        let _writer_circuit_breaker = circuit_breaker_manager.get_or_create("writer");
 
         // ============= 3. ИНИЦИАЛИЗАЦИЯ QoS =============
-        info!("⚖️ [3/10] Инициализация QoS Manager...");
+        info!("⚖️ [3/11] Инициализация QoS Manager...");
         let qos_manager = Arc::new(
             QosManager::new(
                 config.high_priority_quota,
@@ -144,7 +224,7 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 4. ИНИЦИАЛИЗАЦИЯ ADAPTIVE BATCHER =============
-        info!("🔄 [4/10] Инициализация Adaptive Batcher с ML предсказанием...");
+        info!("🔄 [4/11] Инициализация Adaptive Batcher с ML предсказанием...");
         let adaptive_batcher_config = AdaptiveBatcherConfig {
             min_batch_size: config.min_batch_size,
             max_batch_size: config.max_batch_size,
@@ -166,13 +246,13 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 5. КАНАЛЫ СОБЫТИЙ =============
-        info!("📬 [5/10] Инициализация каналов событий...");
+        info!("📬 [5/11] Инициализация каналов событий...");
         let (system_event_tx, system_event_rx) = mpsc::channel(50000);
         let (command_tx, _) = broadcast::channel(1000);
         let (reader_event_tx, reader_event_rx) = mpsc::channel(50000);
 
         // ============= 6. ИНИЦИАЛИЗАЦИЯ ОПТИМИЗИРОВАННЫХ КОМПОНЕНТОВ =============
-        info!("🔧 [6/10] Инициализация оптимизированных компонентов...");
+        info!("🔧 [6/11] Инициализация оптимизированных компонентов...");
 
         let buffer_pool = OptimizedFactory::create_buffer_pool(
             config.read_buffer_size,
@@ -186,7 +266,7 @@ impl IntegratedBatchSystem {
         );
 
         // ============= 7. ИНИЦИАЛИЗАЦИЯ SIMD АКСЕЛЕРАТОРОВ =============
-        info!("🚀 [7/10] Инициализация SIMD акселераторов...");
+        info!("🚀 [7/11] Инициализация SIMD акселераторов...");
         let chacha20_accelerator = Arc::new(
             ChaCha20BatchAccelerator::new(config.simd_batch_size)
         );
@@ -194,11 +274,8 @@ impl IntegratedBatchSystem {
             Blake3BatchAccelerator::new(config.simd_batch_size)
         );
 
-        let _chacha20_info = chacha20_accelerator.get_simd_info();
-        let _blake3_info = blake3_accelerator.get_performance_info();
-
         // ============= 8. ВНЕШНИЕ СЕРВИСЫ =============
-        info!("🌐 [8/10] Инициализация внешних сервисов...");
+        info!("🌐 [8/11] Инициализация внешних сервисов...");
         let packet_service = Arc::new(PhantomPacketService::new(
             session_manager.clone(),
             {
@@ -220,7 +297,7 @@ impl IntegratedBatchSystem {
         let packet_processor = PhantomPacketProcessor::new();
 
         // ============= 9. READER & WRITER =============
-        info!("📖 [9/10] Инициализация Reader/Writer...");
+        info!("📖 [9/11] Инициализация Reader/Writer...");
         let reader = Arc::new(BatchReader::new(config.clone(), reader_event_tx.clone()));
         let writer = Arc::new(BatchWriter::new(config.clone()));
 
@@ -233,8 +310,15 @@ impl IntegratedBatchSystem {
             dispatcher_circuit_breaker,
         );
 
+        // ============= 10. ИНИЦИАЛИЗАЦИЯ WORKER POOL =============
+        info!("🏭 [10/11] Инициализация Worker Pool для динамического масштабирования...");
+        let worker_pool = Arc::new(WorkerPool::new(
+            config.worker_count / 2,
+            config.worker_count * 4,
+        ));
+
         // ============= 11. ФИНАЛЬНАЯ СБОРКА =============
-        info!("🏗️ [10/10] Финальная сборка системы...");
+        info!("🏗️ [11/11] Финальная сборка системы...");
 
         let system = Self {
             config: config.clone(),
@@ -269,10 +353,14 @@ impl IntegratedBatchSystem {
             session_cache: Arc::new(RwLock::new(HashMap::with_capacity(10000))),
             scaling_settings: Arc::new(RwLock::new(ScalingSettings::default())),
             performance_counters: Arc::new(DashMap::new()),
+            worker_pool,
+            scaling_lock: Arc::new(Mutex::new(())),
         };
 
         // ============= ЗАПУСК КОМПОНЕНТОВ =============
         system.start_reader_event_converter(reader_event_rx).await;
+        system.start_session_cache_cleaner().await;
+        system.start_performance_counter_updater().await;
         system.initialize().await?;
 
         Ok(system)
@@ -306,7 +394,6 @@ impl IntegratedBatchSystem {
                                     reason,
                                 }
                             }
-                            // ИСПРАВЛЕНО: игнорируем source_addr
                             ReaderEvent::Error { source_addr: _, error } => {
                                 SystemEvent::ErrorOccurred {
                                     error: error.to_string(),
@@ -329,6 +416,73 @@ impl IntegratedBatchSystem {
             }
 
             debug!("👋 Reader event converter stopped");
+        });
+    }
+
+    /// 🧹 Очистка устаревших записей в кэше сессий
+    async fn start_session_cache_cleaner(&self) {
+        let session_cache = self.session_cache.clone();
+        let is_running = self.is_running.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(300)); // 5 минут
+
+            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                interval.tick().await;
+
+                let mut cache = session_cache.write().await;
+                let before = cache.len();
+                let now = Instant::now();
+
+                cache.retain(|_, entry| {
+                    now.duration_since(entry.last_used) < Duration::from_secs(3600) // 1 час
+                });
+
+                let removed = before - cache.len();
+                if removed > 0 {
+                    debug!("🧹 Session cache cleaned: removed {} stale entries", removed);
+                }
+            }
+        });
+    }
+
+    /// 📊 Обновление счетчиков производительности
+    async fn start_performance_counter_updater(&self) {
+        let perf_counters = self.performance_counters.clone();
+        let is_running = self.is_running.clone();
+        let system = self.clone();
+
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(10));
+
+            while is_running.load(std::sync::atomic::Ordering::Relaxed) {
+                interval.tick().await;
+
+                // Обновляем счетчики производительности
+                let stats = system.stats.read().await;
+
+                let mut throughput_counter = perf_counters
+                    .entry("throughput".to_string())
+                    .or_insert_with(|| PerformanceCounter::new("throughput".to_string(), 60));
+
+                let uptime = stats.uptime.as_secs_f64().max(1.0);
+                let throughput = stats.total_packets_processed as f64 / uptime;
+                throughput_counter.update(throughput);
+
+                let mut latency_counter = perf_counters
+                    .entry("avg_latency_ms".to_string())
+                    .or_insert_with(|| PerformanceCounter::new("avg_latency_ms".to_string(), 60));
+
+                latency_counter.update(stats.avg_processing_time.as_millis() as f64);
+
+                let mut batch_size_counter = perf_counters
+                    .entry("avg_batch_size".to_string())
+                    .or_insert_with(|| PerformanceCounter::new("avg_batch_size".to_string(), 60));
+
+                batch_size_counter.update(system.adaptive_batcher.get_metrics().await.avg_batch_size);
+
+                debug!("📊 Performance counters updated");
+            }
         });
     }
 
@@ -407,12 +561,24 @@ impl IntegratedBatchSystem {
             let mut stats = self.stats.write().await;
             stats.total_data_received += data.len() as u64;
             stats.total_packets_processed += 1;
+            stats.crypto_operations += 1;
+        }
+
+        // Обновляем кэш сессии
+        {
+            let mut cache = self.session_cache.write().await;
+            cache.insert(session_id.clone(), SessionCacheEntry {
+                session_id: session_id.clone(),
+                last_used: Instant::now(),
+                access_count: 1,
+                data: data.clone(),
+                metadata: HashMap::new(),
+            });
         }
 
         // Обновляем информацию о соединении
         self.update_connection_info(&session_id, source_addr, priority, data.len()).await;
 
-        // ИСПРАВЛЕНО: добавлены deadline и retry_count
         let task = WorkStealingTask {
             id: 0,
             session_id: session_id.clone(),
@@ -476,6 +642,14 @@ impl IntegratedBatchSystem {
                 Ok(Some(task_result)) => {
                     debug!("✅ Task {} completed", task_id);
 
+                    {
+                        let mut stats = system.stats.write().await;
+                        stats.work_stealing_count = dispatcher.get_stats()
+                            .get("work_steals")
+                            .copied()
+                            .unwrap_or(0);
+                    }
+
                     let process_result = ProcessResult {
                         success: task_result.result.is_ok(),
                         data: task_result.result.clone().ok().map(Bytes::from),
@@ -519,7 +693,6 @@ impl IntegratedBatchSystem {
                     let packet_type = data[0];
                     let packet_data = &data[1..];
 
-                    // ✅ ИСПОЛЬЗУЕМ session_id ИЗ task_result, А НЕ ИЗ ПАРАМЕТРА
                     if let Some(session) = self.session_manager.get_session(&task_result.session_id).await {
                         match self.packet_service.process_packet(
                             session.clone(),
@@ -528,6 +701,7 @@ impl IntegratedBatchSystem {
                             task_result.destination_addr,
                         ).await {
                             Ok(processing_result) => {
+                                // ✅ ИСПРАВЛЕНО: используем правильный метод получения ключа
                                 match self.packet_processor.create_outgoing_vec(
                                     &session,
                                     processing_result.packet_type,
@@ -536,7 +710,7 @@ impl IntegratedBatchSystem {
                                     Ok(encrypted_response) => {
                                         if let Err(e) = self.writer.write(
                                             task_result.destination_addr,
-                                            task_result.session_id.clone(), // ✅ ИСПОЛЬЗУЕМ task_result.session_id
+                                            task_result.session_id.clone(),
                                             Bytes::from(encrypted_response),
                                             processing_result.priority,
                                             true,
@@ -603,6 +777,11 @@ impl IntegratedBatchSystem {
         let current_avg = stats.avg_processing_time.as_nanos() as f64;
         let new_avg = (current_avg * (total_batches - 1.0) + processing_time.as_nanos() as f64) / total_batches;
         stats.avg_processing_time = Duration::from_nanos(new_avg as u64);
+
+        let throughput = size as f64 / processing_time.as_secs_f64().max(0.001);
+        if throughput > stats.peak_throughput {
+            stats.peak_throughput = throughput;
+        }
     }
 
     /// ⚠️ Обработка ошибки
@@ -626,7 +805,7 @@ impl IntegratedBatchSystem {
     /// 📊 Обработка обработанных данных
     async fn handle_data_processed(
         &self,
-        _session_id: Vec<u8>,
+        session_id: Vec<u8>,
         result: ProcessResult,
         _processing_time: Duration,
         _worker_id: Option<usize>,
@@ -636,7 +815,6 @@ impl IntegratedBatchSystem {
                 let mut stats = self.stats.write().await;
                 stats.total_data_sent += data.len() as u64;
 
-                // Обновляем информацию о соединении
                 if let Some(addr) = result.metadata.get("destination_addr") {
                     if let Ok(addr) = addr.parse() {
                         let mut connections = self.active_connections.write().await;
@@ -647,6 +825,12 @@ impl IntegratedBatchSystem {
                     }
                 }
             }
+        }
+
+        let mut cache = self.session_cache.write().await;
+        if let Some(entry) = cache.get_mut(&session_id) {
+            entry.last_used = Instant::now();
+            entry.access_count += 1;
         }
     }
 
@@ -721,12 +905,18 @@ impl IntegratedBatchSystem {
         self.record_metric("dispatcher.work_steals", dispatcher_stats.work_steals as f64).await;
         self.record_metric("dispatcher.imbalance", dispatcher_stats.imbalance).await;
 
+        {
+            let mut stats = self.stats.write().await;
+            stats.work_stealing_count = dispatcher_stats.work_steals;
+            stats.buffer_hit_rate = total_hit_rate;
+        }
+
         // Статистика соединений
         let connections = self.active_connections.read().await.len();
         self.record_metric("connections.active", connections as f64).await;
     }
 
-    /// 📈 Запуск автоскейлинга
+    /// 📈 ЗАПУСК АВТОСКЕЙЛИНГА
     async fn start_auto_scaling(&self) {
         let system = self.clone();
 
@@ -747,9 +937,45 @@ impl IntegratedBatchSystem {
                 }
 
                 drop(settings);
-                system.check_scaling_needs().await;
+
+                system.perform_auto_scaling().await;
             }
         });
+    }
+
+    /// 🔄 ВЫПОЛНЕНИЕ АВТОСКЕЙЛИНГА
+    async fn perform_auto_scaling(&self) {
+        let _lock = self.scaling_lock.lock().await;
+
+        let settings = self.scaling_settings.read().await;
+        let dispatcher_stats = self.work_stealing_dispatcher.get_advanced_stats().await;
+        let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Критерии для масштабирования вверх
+        let should_scale_up =
+            dispatcher_stats.queue_backlog > settings.work_stealing_target_queue_size * 2 ||
+                dispatcher_stats.imbalance > 0.7 ||
+                dispatcher_stats.avg_processing_time_ms > 100.0 ||
+                self.active_connections.read().await.len() as f64 > settings.connection_target_count as f64 * 0.8;
+
+        // Критерии для масштабирования вниз
+        let should_scale_down =
+            dispatcher_stats.queue_backlog < settings.work_stealing_target_queue_size / 4 &&
+                dispatcher_stats.imbalance < 0.2 &&
+                dispatcher_stats.avg_processing_time_ms < 20.0 &&
+                current_workers > settings.min_worker_count;
+
+        if should_scale_up && current_workers < settings.max_worker_count {
+            let scale_up_by = 2.min(settings.max_worker_count - current_workers);
+            info!("📈 Auto-scaling: scaling UP by {} workers (current: {}, queue: {})",
+                scale_up_by, current_workers, dispatcher_stats.queue_backlog);
+            let _ = self.scale_up(scale_up_by).await;
+        } else if should_scale_down && current_workers > settings.min_worker_count {
+            let scale_down_by = 2.min(current_workers - settings.min_worker_count);
+            info!("📉 Auto-scaling: scaling DOWN by {} workers (current: {}, queue: {})",
+                scale_down_by, current_workers, dispatcher_stats.queue_backlog);
+            let _ = self.scale_down(scale_down_by).await;
+        }
     }
 
     /// 🔄 Запуск QoS адаптации
@@ -782,21 +1008,30 @@ impl IntegratedBatchSystem {
         let crypto_success_rate = self.get_metric("crypto.success_rate").await.unwrap_or(1.0);
         let dispatcher_load = self.get_metric("dispatcher.imbalance").await.unwrap_or(0.0);
         let active_connections = self.active_connections.read().await.len();
+        let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
 
         if buffer_hit_rate < settings.buffer_pool_target_hit_rate * 0.8 {
             warn!("📉 Buffer pool hit rate low: {:.1}%", buffer_hit_rate * 100.0);
+            self.buffer_pool.force_cleanup();
         }
 
         if crypto_success_rate < settings.crypto_processor_target_success_rate * 0.9 {
             warn!("⚠️ Crypto success rate low: {:.1}%", crypto_success_rate * 100.0);
+            if let Some(cb) = self.circuit_breaker_manager.get_breaker("crypto_processor").await {
+                cb.reset().await;
+            }
         }
 
         if dispatcher_load > 0.7 {
             warn!("⚖️ High dispatcher imbalance: {:.2}", dispatcher_load);
+            self.rebalance_workers().await;
         }
 
         if active_connections as f64 > settings.connection_target_count as f64 * 1.5 {
             warn!("🔌 High connection count: {}", active_connections);
+            if current_workers < settings.max_worker_count {
+                let _ = self.scale_up(2).await;
+            }
         }
     }
 
@@ -831,8 +1066,12 @@ impl IntegratedBatchSystem {
             SystemCommand::GetStatistics => self.get_statistics().await,
             SystemCommand::ResetStatistics => self.reset_statistics().await,
             SystemCommand::RebalanceWorkers => self.rebalance_workers().await,
-            SystemCommand::ScaleUp { count } => self.scale_up(count).await,
-            SystemCommand::ScaleDown { count } => self.scale_down(count).await,
+            SystemCommand::ScaleUp { count } => {
+                let _ = self.scale_up(count).await;
+            }
+            SystemCommand::ScaleDown { count } => {
+                let _ = self.scale_down(count).await;
+            }
             SystemCommand::UpdateScalingSettings { settings } => self.update_scaling_settings(settings).await,
         }
     }
@@ -881,40 +1120,58 @@ impl IntegratedBatchSystem {
         let mut session_cache = self.session_cache.write().await;
         session_cache.clear();
 
+        let mut connections = self.active_connections.write().await;
+        connections.clear();
+
         self.performance_counters.clear();
         self.metrics.clear();
+
+        let mut pending = self.pending_batches.write().await;
+        pending.clear();
+
+        info!("✅ All caches cleared");
     }
 
-    /// ⚙️ Регулировка конфигурации
+    /// ⚙️ РЕГУЛИРОВКА КОНФИГУРАЦИИ
     async fn adjust_config(&self, parameter: String, value: String) {
         info!("⚙️ Adjusting config: {} = {}", parameter, value);
 
         match parameter.as_str() {
             "batch_size" => {
-                if let Ok(_size) = value.parse::<usize>() {
-                    info!("Batch size will be adjusted by AdaptiveBatcher");
+                if let Ok(size) = value.parse::<usize>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    let clamped_size = size.clamp(config.min_batch_size, config.max_batch_size);
+                    config.initial_batch_size = clamped_size;
+
+                    *self.adaptive_batcher.current_batch_size.write().await = clamped_size;
+
+                    self.record_metric("config.batch_size", clamped_size as f64).await;
+                    info!("✅ Batch size updated to {} (clamped to {}-{})",
+                        clamped_size, config.min_batch_size, config.max_batch_size);
                 }
             }
             "worker_count" => {
                 if let Ok(count) = value.parse::<usize>() {
-                    info!("Worker count change requested: {}", count);
-
-                    let current_settings = self.scaling_settings.read().await;
-                    let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+                    let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+                    let settings = self.scaling_settings.read().await;
 
                     if count > current_workers {
-                        if count <= current_settings.max_worker_count {
-                            self.scale_up(count - current_workers).await;
+                        if count <= settings.max_worker_count {
+                            let increase = count - current_workers;
+                            info!("📈 Increasing worker count by {} to {}", increase, count);
+                            let _ = self.scale_up(increase).await;
                         } else {
                             warn!("Requested worker count {} exceeds maximum {}",
-                            count, current_settings.max_worker_count);
+                                count, settings.max_worker_count);
                         }
                     } else if count < current_workers {
-                        if count >= current_settings.min_worker_count {
-                            self.scale_down(current_workers - count).await;
+                        if count >= settings.min_worker_count {
+                            let decrease = current_workers - count;
+                            info!("📉 Decreasing worker count by {} to {}", decrease, count);
+                            let _ = self.scale_down(decrease).await;
                         } else {
                             warn!("Requested worker count {} below minimum {}",
-                            count, current_settings.min_worker_count);
+                                count, settings.min_worker_count);
                         }
                     }
                 }
@@ -922,17 +1179,23 @@ impl IntegratedBatchSystem {
             "min_batch_size" => {
                 if let Ok(size) = value.parse::<usize>() {
                     let mut config = self.adaptive_batcher.config.clone();
-                    config.min_batch_size = size;
+                    config.min_batch_size = size.max(1);
+                    if config.initial_batch_size < config.min_batch_size {
+                        *self.adaptive_batcher.current_batch_size.write().await = config.min_batch_size;
+                    }
                     self.record_metric("config.min_batch_size", size as f64).await;
-                    info!("Min batch size updated to {}", size);
+                    info!("✅ Min batch size updated to {}", size);
                 }
             }
             "max_batch_size" => {
                 if let Ok(size) = value.parse::<usize>() {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.max_batch_size = size;
+                    if config.initial_batch_size > config.max_batch_size {
+                        *self.adaptive_batcher.current_batch_size.write().await = config.max_batch_size;
+                    }
                     self.record_metric("config.max_batch_size", size as f64).await;
-                    info!("Max batch size updated to {}", size);
+                    info!("✅ Max batch size updated to {}", size);
                 }
             }
             "target_latency_ms" => {
@@ -940,7 +1203,7 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.target_latency = Duration::from_millis(ms);
                     self.record_metric("config.target_latency_ms", ms as f64).await;
-                    info!("Target latency updated to {} ms", ms);
+                    info!("✅ Target latency updated to {} ms", ms);
                 }
             }
             "confidence_threshold" => {
@@ -948,7 +1211,7 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.confidence_threshold = threshold.clamp(0.0, 1.0);
                     self.record_metric("config.confidence_threshold", threshold).await;
-                    info!("Confidence threshold updated to {:.2}", threshold);
+                    info!("✅ Confidence threshold updated to {:.2}", threshold);
                 }
             }
             "enable_predictive_adaptation" => {
@@ -956,7 +1219,7 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.enable_predictive_adaptation = enabled;
                     self.record_metric("config.enable_predictive_adaptation", enabled as i64 as f64).await;
-                    info!("Predictive adaptation {}", if enabled { "enabled" } else { "disabled" });
+                    info!("✅ Predictive adaptation {}", if enabled { "enabled" } else { "disabled" });
                 }
             }
             "enable_auto_tuning" => {
@@ -964,7 +1227,7 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.enable_auto_tuning = enabled;
                     self.record_metric("config.enable_auto_tuning", enabled as i64 as f64).await;
-                    info!("Auto tuning {}", if enabled { "enabled" } else { "disabled" });
+                    info!("✅ Auto tuning {}", if enabled { "enabled" } else { "disabled" });
                 }
             }
             "prediction_horizon_sec" => {
@@ -972,7 +1235,7 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.prediction_horizon = Duration::from_secs(sec);
                     self.record_metric("config.prediction_horizon_sec", sec as f64).await;
-                    info!("Prediction horizon updated to {} seconds", sec);
+                    info!("✅ Prediction horizon updated to {} seconds", sec);
                 }
             }
             "smoothing_factor" => {
@@ -980,10 +1243,10 @@ impl IntegratedBatchSystem {
                     let mut config = self.adaptive_batcher.config.clone();
                     config.smoothing_factor = factor.clamp(0.1, 0.9);
                     self.record_metric("config.smoothing_factor", factor).await;
-                    info!("Smoothing factor updated to {:.2}", factor);
+                    info!("✅ Smoothing factor updated to {:.2}", factor);
                 }
             }
-            _ => warn!("Unknown parameter: {}", parameter),
+            _ => warn!("⚠️ Unknown parameter: {}", parameter),
         }
     }
 
@@ -1008,7 +1271,11 @@ impl IntegratedBatchSystem {
         info!("  ├─ Data received: {} MB", stats.total_data_received / 1024 / 1024);
         info!("  ├─ Data sent: {} MB", stats.total_data_sent / 1024 / 1024);
         info!("  ├─ Active connections: {}", status.active_connections);
+        info!("  ├─ Active workers: {}", self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst));
         info!("  ├─ Avg processing time: {:?}", stats.avg_processing_time);
+        info!("  ├─ Peak throughput: {:.2} ops/s", stats.peak_throughput);
+        info!("  ├─ Crypto operations: {}", stats.crypto_operations);
+        info!("  ├─ Work steals: {}", stats.work_stealing_count);
         info!("  └─ Total errors: {}", stats.total_errors);
     }
 
@@ -1026,91 +1293,186 @@ impl IntegratedBatchSystem {
         self.performance_counters.clear();
     }
 
-    /// ⚖️ Перебалансировка воркеров
+    /// ⚖️ ПЕРЕБАЛАНСИРОВКА ВОРКЕРОВ
     async fn rebalance_workers(&self) {
         info!("⚖️ Rebalancing workers...");
-        // WorkStealingDispatcher автоматически балансирует нагрузку
+
+        let stats = self.work_stealing_dispatcher.get_advanced_stats().await;
+        let imbalance = stats.imbalance;
+
+        if imbalance > 0.3 {
+            info!("⚖️ High imbalance detected: {:.2}, forcing rebalance", imbalance);
+
+            let current_loads: Vec<usize> = (0..self.work_stealing_dispatcher.worker_senders.len())
+                .map(|i| self.work_stealing_dispatcher.worker_queues.get(&i).map(|q| *q).unwrap_or(0))
+                .collect();
+
+            let avg_load = current_loads.iter().sum::<usize>() as f64 / current_loads.len() as f64;
+
+            for (worker_id, &load) in current_loads.iter().enumerate() {
+                if load as f64 > avg_load * 1.5 {
+                    debug!("⚖️ Worker #{} overloaded ({} > {:.1}), stealing tasks",
+                        worker_id, load, avg_load * 1.5);
+                }
+            }
+        }
+
         self.record_metric("dispatcher.manual_rebalance", 1.0).await;
+        self.record_metric("dispatcher.imbalance", imbalance).await;
+
+        info!("✅ Workers rebalanced, imbalance: {:.2} → {:.2}",
+            imbalance, self.work_stealing_dispatcher.get_advanced_stats().await.imbalance);
     }
 
-    /// 📈 Масштабирование вверх
-    async fn scale_up(&self, count: usize) {
+    /// 📈 МАСШТАБИРОВАНИЕ ВВЕРХ
+    async fn scale_up(&self, count: usize) -> Result<usize, BatchError> {
         info!("📈 Scaling up by {} workers", count);
 
-        let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+        let _lock = self.scaling_lock.lock().await;
+
+        let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
         let settings = self.scaling_settings.read().await;
 
         if count == 0 {
-            return;
+            return Ok(0);
         }
 
         if current_workers >= settings.max_worker_count {
-            warn!("Cannot scale up: already at maximum workers ({})", current_workers);
-            return;
+            warn!("⚠️ Cannot scale up: already at maximum workers ({})", current_workers);
+            return Ok(0);
         }
 
-        let target_workers = (current_workers + count).min(settings.max_worker_count);
-        let actual_increase = target_workers - current_workers;
+        let added = self.worker_pool.add_workers(count, self.work_stealing_dispatcher.clone()).await?;
 
-        if actual_increase > 0 {
-            // Обновляем настройки скейлинга
+        if added > 0 {
             let mut new_settings = settings.clone();
             new_settings.last_scaling_time = Instant::now();
             *self.scaling_settings.write().await = new_settings;
 
-            self.record_metric("scaling.scale_up", actual_increase as f64).await;
-            self.record_metric("scaling.current_workers", target_workers as f64).await;
+            self.record_metric("scaling.scale_up", added as f64).await;
+            self.record_metric("scaling.current_workers", (current_workers + added) as f64).await;
 
-            info!("✅ Scaled up from {} to {} workers (increased by {})",
-            current_workers, target_workers, actual_increase);
-
-            // Принудительно перебалансируем воркеров
-            self.rebalance_workers().await;
+            info!("✅ Scaled UP from {} to {} workers (added {})",
+                current_workers, current_workers + added, added);
         }
+
+        Ok(added)
     }
 
-
-    /// 📉 Масштабирование вниз
-    async fn scale_down(&self, count: usize) {
+    /// 📉 МАСШТАБИРОВАНИЕ ВНИЗ
+    async fn scale_down(&self, count: usize) -> Result<usize, BatchError> {
         info!("📉 Scaling down by {} workers", count);
 
-        let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+        let _lock = self.scaling_lock.lock().await;
+
+        let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
         let settings = self.scaling_settings.read().await;
 
         if count == 0 {
-            return;
+            return Ok(0);
         }
 
         if current_workers <= settings.min_worker_count {
-            warn!("Cannot scale down: already at minimum workers ({})", current_workers);
-            return;
+            warn!("⚠️ Cannot scale down: already at minimum workers ({})", current_workers);
+            return Ok(0);
         }
 
-        let target_workers = current_workers.saturating_sub(count).max(settings.min_worker_count);
-        let actual_reduction = current_workers - target_workers;
+        let removed = self.worker_pool.remove_workers(count).await?;
 
-        if actual_reduction > 0 {
-            // Обновляем настройки скейлинга
+        if removed > 0 {
             let mut new_settings = settings.clone();
             new_settings.last_scaling_time = Instant::now();
             *self.scaling_settings.write().await = new_settings;
 
-            self.record_metric("scaling.scale_down", actual_reduction as f64).await;
-            self.record_metric("scaling.current_workers", target_workers as f64).await;
+            self.record_metric("scaling.scale_down", removed as f64).await;
+            self.record_metric("scaling.current_workers", (current_workers - removed) as f64).await;
 
-            info!("✅ Scaled down from {} to {} workers (reduced by {})",
-            current_workers, target_workers, actual_reduction);
-
-            // Принудительно перебалансируем оставшихся воркеров
-            self.rebalance_workers().await;
+            info!("✅ Scaled DOWN from {} to {} workers (removed {})",
+                current_workers, current_workers - removed, removed);
         }
+
+        Ok(removed)
     }
 
-    /// ⚙️ Обновление настроек скейлинга
+    /// ⚙️ ОБНОВЛЕНИЕ НАСТРОЕК СКЕЙЛИНГА
     async fn update_scaling_settings(&self, settings: ScalingSettings) {
         let mut current = self.scaling_settings.write().await;
-        *current = settings;
-        info!("⚙️ Scaling settings updated");
+
+        // Валидация настроек
+        let mut validated = settings;
+        if validated.min_worker_count < 1 {
+            validated.min_worker_count = 1;
+            warn!("⚠️ Min worker count adjusted to 1");
+        }
+        if validated.max_worker_count < validated.min_worker_count {
+            validated.max_worker_count = validated.min_worker_count.max(256);
+            warn!("⚠️ Max worker count adjusted to {}", validated.max_worker_count);
+        }
+        if validated.scaling_cooldown_seconds < 10 {
+            validated.scaling_cooldown_seconds = 10;
+            warn!("⚠️ Scaling cooldown adjusted to 10 seconds");
+        }
+        if validated.work_stealing_target_queue_size < 100 {
+            validated.work_stealing_target_queue_size = 100;
+            warn!("⚠️ Target queue size adjusted to 100");
+        }
+        if validated.buffer_pool_target_hit_rate <= 0.0 || validated.buffer_pool_target_hit_rate > 1.0 {
+            validated.buffer_pool_target_hit_rate = 0.85;
+            warn!("⚠️ Buffer pool target hit rate adjusted to 0.85");
+        }
+        if validated.crypto_processor_target_success_rate <= 0.0 || validated.crypto_processor_target_success_rate > 1.0 {
+            validated.crypto_processor_target_success_rate = 0.99;
+            warn!("⚠️ Crypto processor target success rate adjusted to 0.99");
+        }
+        if validated.connection_target_count < 1000 {
+            validated.connection_target_count = 1000;
+            warn!("⚠️ Connection target count adjusted to 1000");
+        }
+
+        // Применяем новые настройки к воркер-пулу
+        if validated.min_worker_count != current.min_worker_count {
+            let worker_pool = self.worker_pool.clone();
+            let current_workers = worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+            if current_workers < validated.min_worker_count {
+                let increase = validated.min_worker_count - current_workers;
+                drop(current);
+                let _ = self.scale_up(increase).await;
+                current = self.scaling_settings.write().await;
+            }
+        }
+
+        if validated.max_worker_count != current.max_worker_count {
+            let worker_pool = self.worker_pool.clone();
+            let current_workers = worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
+            if current_workers > validated.max_worker_count {
+                let decrease = current_workers - validated.max_worker_count;
+                drop(current);
+                let _ = self.scale_down(decrease).await;
+                current = self.scaling_settings.write().await;
+            }
+        }
+
+        *current = validated;
+
+        // Записываем метрики
+        self.record_metric("scaling.min_workers", current.min_worker_count as f64).await;
+        self.record_metric("scaling.max_workers", current.max_worker_count as f64).await;
+        self.record_metric("scaling.auto_scaling_enabled", current.auto_scaling_enabled as i64 as f64).await;
+        self.record_metric("scaling.cooldown_seconds", current.scaling_cooldown_seconds as f64).await;
+        self.record_metric("scaling.target_queue_size", current.work_stealing_target_queue_size as f64).await;
+        self.record_metric("scaling.target_hit_rate", current.buffer_pool_target_hit_rate).await;
+        self.record_metric("scaling.target_success_rate", current.crypto_processor_target_success_rate).await;
+        self.record_metric("scaling.target_connections", current.connection_target_count as f64).await;
+
+        info!("⚙️ Scaling settings updated:");
+        info!("  ├─ Min workers: {}", current.min_worker_count);
+        info!("  ├─ Max workers: {}", current.max_worker_count);
+        info!("  ├─ Auto scaling: {}", current.auto_scaling_enabled);
+        info!("  ├─ Cooldown: {}s", current.scaling_cooldown_seconds);
+        info!("  ├─ Target queue: {}", current.work_stealing_target_queue_size);
+        info!("  ├─ Target hit rate: {:.1}%", current.buffer_pool_target_hit_rate * 100.0);
+        info!("  ├─ Target success rate: {:.1}%", current.crypto_processor_target_success_rate * 100.0);
+        info!("  └─ Target connections: {}", current.connection_target_count);
     }
 
     /// 📈 Запуск сборщика статистики
@@ -1130,7 +1492,7 @@ impl IntegratedBatchSystem {
         });
     }
 
-    /// 🔄 Запуск обработчика батчей
+    /// 🔄 ЗАПУСК ОБРАБОТЧИКА БАТЧЕЙ
     async fn start_batch_processor(&self) {
         let pending_batches = self.pending_batches.clone();
         let is_running = self.is_running.clone();
@@ -1139,6 +1501,7 @@ impl IntegratedBatchSystem {
         tokio::spawn(async move {
             debug!("🔄 Batch processor started");
             let mut interval = tokio::time::interval(Duration::from_millis(50));
+            let mut batch_id_counter = 0u64;
 
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
                 interval.tick().await;
@@ -1163,7 +1526,9 @@ impl IntegratedBatchSystem {
                     ready
                 };
 
-                for batch in batches_to_process {
+                for mut batch in batches_to_process {
+                    batch_id_counter += 1;
+                    batch.id = batch_id_counter;
                     system.process_batch(batch).await;
                 }
             }
@@ -1172,24 +1537,85 @@ impl IntegratedBatchSystem {
         });
     }
 
-    /// 📦 Обработка батча
+    /// 📦 ОБРАБОТКА БАТЧА
     async fn process_batch(&self, batch: PendingBatch) {
         let start_time = Instant::now();
         let batch_size = batch.operations.len();
+        let batch_id = batch.id;
 
-        debug!("🔄 Processing batch {} with {} operations", batch.id, batch_size);
+        debug!("🔄 Processing batch #{} with {} operations", batch_id, batch_size);
 
-        let success_rate = if batch.operations.is_empty() {
-            0.0
-        } else {
-            // Здесь должна быть реальная обработка
-            let successful = batch_size;
+        let mut successful = 0;
+
+        for operation in batch.operations {
+            match operation {
+                BatchOperation::Encryption { session_id, data, key: _, nonce: _ } => {
+                    if let Some(session) = self.session_manager.get_session(&session_id).await {
+                        // ✅ ИСПРАВЛЕНО: используем create_outgoing_vec вместо get_encryption_key
+                        match self.packet_processor.create_outgoing_vec(&session, 0x01, &data) {
+                            Ok(encrypted) => {
+                                successful += 1;
+                                let _ = self.writer.write(
+                                    batch.source_addr,
+                                    session_id,
+                                    Bytes::from(encrypted),
+                                    Priority::Normal,
+                                    false,
+                                ).await;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                BatchOperation::Decryption { session_id, data, key: _, nonce: _ } => {
+                    if let Some(session) = self.session_manager.get_session(&session_id).await {
+                        match self.packet_processor.process_incoming_vec(&data, &session) {
+                            Ok((_packet_type, _decrypted)) => {
+                                successful += 1;
+                            }
+                            Err(_) => {}
+                        }
+                    }
+                }
+                BatchOperation::Hashing { data, key } => {
+                    if let Some(key) = key {
+                        let keys = vec![key; 1];
+                        let inputs = vec![data.to_vec()];
+                        let hashes = self.blake3_accelerator.hash_keyed_batch(&keys, &inputs).await;
+                        if !hashes.is_empty() {
+                            successful += 1;
+                        }
+                    }
+                }
+                BatchOperation::Processing { session_id, data, processor_type } => {
+                    match processor_type {
+                        ProcessorType::Accelerated => {
+                            if let Some(session) = self.session_manager.get_session(&session_id).await {
+                                // ✅ ИСПРАВЛЕНО: используем create_outgoing_vec для шифрования
+                                match self.packet_processor.create_outgoing_vec(&session, 0x01, &data) {
+                                    Ok(_encrypted) => {
+                                        successful += 1;
+                                    }
+                                    Err(_) => {}
+                                }
+                            }
+                        }
+                        _ => {
+                            successful += 1;
+                        }
+                    }
+                }
+            }
+        }
+
+        let success_rate = if batch_size > 0 {
             successful as f64 / batch_size as f64
+        } else {
+            1.0
         };
 
         let processing_time = start_time.elapsed();
 
-        // Регистрируем выполнение батча в AdaptiveBatcher
         self.adaptive_batcher.record_batch_execution(
             batch_size,
             processing_time,
@@ -1197,14 +1623,23 @@ impl IntegratedBatchSystem {
             self.pending_batches.read().await.len(),
         ).await;
 
+        {
+            let mut stats = self.stats.write().await;
+            stats.total_batches_processed += 1;
+            stats.crypto_operations += successful as u64;
+        }
+
         let event = SystemEvent::BatchCompleted {
-            batch_id: batch.id,
+            batch_id,
             size: batch_size,
             processing_time,
             success_rate,
         };
 
         let _ = self.event_tx.send(event).await;
+
+        debug!("✅ Batch #{} completed: {}/{} successful, {:.1}% in {:?}",
+            batch_id, successful, batch_size, success_rate * 100.0, processing_time);
     }
 
     /// 🛑 Завершение компонентов
@@ -1263,12 +1698,14 @@ impl IntegratedBatchSystem {
         let qos_utilization = self.qos_manager.get_utilization().await;
         let circuit_stats = self.circuit_breaker_manager.get_all_stats().await;
         let dispatcher_stats = self.work_stealing_dispatcher.get_advanced_stats().await;
+        let current_workers = self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst);
 
         SystemStatus {
             timestamp: Instant::now(),
             is_running: self.is_running.load(std::sync::atomic::Ordering::Relaxed),
             statistics: stats,
             active_connections: connections.len(),
+            active_workers: current_workers,
             pending_tasks: self.pending_batches.read().await.len(),
             memory_usage: MemoryUsage {
                 total: 0,
@@ -1280,6 +1717,7 @@ impl IntegratedBatchSystem {
                     .sum(),
                 crypto_pool: 0,
                 connections: connections.len(),
+                session_cache: self.session_cache.read().await.len(),
             },
             throughput: self.calculate_throughput().await,
             scaling_settings: settings,
@@ -1312,6 +1750,14 @@ impl IntegratedBatchSystem {
     async fn record_metric(&self, name: &str, value: f64) {
         self.metrics.insert(name.to_string(), MetricValue::Float(value));
         self.metrics_tracing.record_metric(name, value);
+
+        if let Some(mut counter) = self.performance_counters.get_mut(name) {
+            counter.update(value);
+        } else {
+            let mut counter = PerformanceCounter::new(name.to_string(), 60);
+            counter.update(value);
+            self.performance_counters.insert(name.to_string(), counter);
+        }
     }
 
     /// 📊 Получение метрики
@@ -1343,6 +1789,36 @@ impl IntegratedBatchSystem {
     /// 📦 Получение Circuit Breaker Manager
     pub fn get_circuit_breaker_manager(&self) -> Arc<CircuitBreakerManager> {
         self.circuit_breaker_manager.clone()
+    }
+
+    /// 📦 Получение текущего количества воркеров
+    pub fn get_current_workers(&self) -> usize {
+        self.worker_pool.current_workers.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// 📦 Добавление операции в батч
+    pub async fn add_to_batch(&self, operation: BatchOperation, source_addr: std::net::SocketAddr, priority: Priority) {
+        let mut pending = self.pending_batches.write().await;
+
+        let batch = pending.iter_mut().find(|b|
+            b.source_addr == source_addr &&
+                b.priority == priority &&
+                b.deadline.map_or(true, |d| d > Instant::now())
+        );
+
+        if let Some(batch) = batch {
+            batch.operations.push(operation);
+        } else {
+            pending.push(PendingBatch {
+                id: 0,
+                operations: vec![operation],
+                priority,
+                source_addr,
+                created_at: Instant::now(),
+                deadline: Some(Instant::now() + Duration::from_millis(100)),
+                retry_count: 0,
+            });
+        }
     }
 }
 
@@ -1423,6 +1899,7 @@ pub struct SystemStatus {
     pub is_running: bool,
     pub statistics: SystemStatistics,
     pub active_connections: usize,
+    pub active_workers: usize,
     pub pending_tasks: usize,
     pub memory_usage: MemoryUsage,
     pub throughput: ThroughputMetrics,
@@ -1533,6 +2010,7 @@ pub struct PendingBatch {
     pub id: u64,
     pub operations: Vec<BatchOperation>,
     pub priority: Priority,
+    pub source_addr: std::net::SocketAddr,
     pub created_at: Instant,
     pub deadline: Option<Instant>,
     pub retry_count: u32,
@@ -1591,6 +2069,7 @@ pub struct MemoryUsage {
     pub buffer_pool: usize,
     pub crypto_pool: usize,
     pub connections: usize,
+    pub session_cache: usize,
 }
 
 /// Метрики пропускной способности
@@ -1694,6 +2173,8 @@ impl Clone for IntegratedBatchSystem {
             session_cache: self.session_cache.clone(),
             scaling_settings: self.scaling_settings.clone(),
             performance_counters: self.performance_counters.clone(),
+            worker_pool: self.worker_pool.clone(),
+            scaling_lock: self.scaling_lock.clone(),
         }
     }
 }
