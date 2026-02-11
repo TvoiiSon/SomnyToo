@@ -200,10 +200,30 @@ impl Blake3BatchAccelerator {
 
     /// Получение информации о производительности
     pub fn get_performance_info(&self) -> Blake3PerformanceInfo {
+        // Используем detected_features для более точной оценки производительности
+        let base_throughput = if self.detected_features.avx512 {
+            2048.0  // AVX512 дает максимальную производительность
+        } else if self.detected_features.avx2 {
+            1024.0  // AVX2 - хорошая производительность
+        } else if self.detected_features.neon {
+            896.0   // NEON - хорошая производительность на ARM
+        } else if self.detected_features.sse4_2 {
+            512.0   // SSE4.2 - базовая SIMD
+        } else {
+            256.0   // Без SIMD
+        };
+
+        // Учитываем AES-NI для ключевого хеширования
+        let aes_bonus = if self.detected_features.aes_ni { 1.2 } else { 1.0 };
+
         Blake3PerformanceInfo {
             simd_capable: self.simd_capable,
             optimal_batch_size: self.config.simd_width * 4,
-            estimated_throughput: if self.simd_capable { 1024.0 } else { 256.0 }, // MB/s
+            estimated_throughput: base_throughput * aes_bonus,
+            avx512_enabled: self.detected_features.avx512,  // Новое поле
+            avx2_enabled: self.detected_features.avx2,      // Новое поле
+            neon_enabled: self.detected_features.neon,      // Новое поле
+            aes_ni_enabled: self.detected_features.aes_ni,  // Новое поле
         }
     }
 }
@@ -214,6 +234,10 @@ pub struct Blake3PerformanceInfo {
     pub simd_capable: bool,
     pub optimal_batch_size: usize,
     pub estimated_throughput: f64, // MB/s
+    pub avx512_enabled: bool,      // Добавляем поле
+    pub avx2_enabled: bool,        // Добавляем поле
+    pub neon_enabled: bool,        // Добавляем поле
+    pub aes_ni_enabled: bool,      // Добавляем поле
 }
 
 impl Default for Blake3BatchAccelerator {

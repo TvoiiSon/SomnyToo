@@ -100,9 +100,9 @@ pub struct DispatcherAdvancedStats {
 /// ⚡ Work-Stealing диспетчер с полной интеграцией
 pub struct WorkStealingDispatcher {
     // 📦 Атомарные очереди для worker'ов
-    worker_senders: Arc<Vec<Sender<WorkStealingTask>>>,
-    worker_receivers: Arc<Vec<Receiver<WorkStealingTask>>>,
-    worker_queues: Arc<DashMap<usize, usize>>,
+    pub worker_senders: Arc<Vec<Sender<WorkStealingTask>>>,
+    pub worker_receivers: Arc<Vec<Receiver<WorkStealingTask>>>,
+    pub worker_queues: Arc<DashMap<usize, usize>>,
 
     // 📦 Канал для инжектора (work stealing)
     injector_sender: Sender<WorkStealingTask>,
@@ -195,7 +195,7 @@ impl WorkStealingDispatcher {
     }
 
     /// 👷 Запуск worker'ов
-    fn start_workers(&self) {
+    pub fn start_workers(&self) {
         let num_workers = self.worker_senders.len();
 
         // Сохраняем в stats информацию о запуске

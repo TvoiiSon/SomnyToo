@@ -194,8 +194,8 @@ impl IntegratedBatchSystem {
             Blake3BatchAccelerator::new(config.simd_batch_size)
         );
 
-        let chacha20_info = chacha20_accelerator.get_simd_info();
-        let blake3_info = blake3_accelerator.get_performance_info();
+        let _chacha20_info = chacha20_accelerator.get_simd_info();
+        let _blake3_info = blake3_accelerator.get_performance_info();
 
         // ============= 8. ВНЕШНИЕ СЕРВИСЫ =============
         info!("🌐 [8/10] Инициализация внешних сервисов...");
@@ -510,7 +510,7 @@ impl IntegratedBatchSystem {
     async fn process_task_result(
         &self,
         task_result: WorkStealingResult,
-        _session_id: Vec<u8>,  // ✅ ОСТАВЛЯЕМ С ПРЕФИКСОМ _, ТАК КАК ИСПОЛЬЗУЕМ task_result.session_id
+        _session_id: Vec<u8>,
         _source_addr: std::net::SocketAddr,
     ) {
         match task_result.result {
@@ -626,7 +626,7 @@ impl IntegratedBatchSystem {
     /// 📊 Обработка обработанных данных
     async fn handle_data_processed(
         &self,
-        session_id: Vec<u8>,
+        _session_id: Vec<u8>,
         result: ProcessResult,
         _processing_time: Duration,
         _worker_id: Option<usize>,
@@ -891,7 +891,6 @@ impl IntegratedBatchSystem {
 
         match parameter.as_str() {
             "batch_size" => {
-                // ИСПРАВЛЕНО: игнорируем переменную size
                 if let Ok(_size) = value.parse::<usize>() {
                     info!("Batch size will be adjusted by AdaptiveBatcher");
                 }
@@ -899,7 +898,89 @@ impl IntegratedBatchSystem {
             "worker_count" => {
                 if let Ok(count) = value.parse::<usize>() {
                     info!("Worker count change requested: {}", count);
-                    // TODO: Dynamic worker scaling
+
+                    let current_settings = self.scaling_settings.read().await;
+                    let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+
+                    if count > current_workers {
+                        if count <= current_settings.max_worker_count {
+                            self.scale_up(count - current_workers).await;
+                        } else {
+                            warn!("Requested worker count {} exceeds maximum {}",
+                            count, current_settings.max_worker_count);
+                        }
+                    } else if count < current_workers {
+                        if count >= current_settings.min_worker_count {
+                            self.scale_down(current_workers - count).await;
+                        } else {
+                            warn!("Requested worker count {} below minimum {}",
+                            count, current_settings.min_worker_count);
+                        }
+                    }
+                }
+            }
+            "min_batch_size" => {
+                if let Ok(size) = value.parse::<usize>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.min_batch_size = size;
+                    self.record_metric("config.min_batch_size", size as f64).await;
+                    info!("Min batch size updated to {}", size);
+                }
+            }
+            "max_batch_size" => {
+                if let Ok(size) = value.parse::<usize>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.max_batch_size = size;
+                    self.record_metric("config.max_batch_size", size as f64).await;
+                    info!("Max batch size updated to {}", size);
+                }
+            }
+            "target_latency_ms" => {
+                if let Ok(ms) = value.parse::<u64>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.target_latency = Duration::from_millis(ms);
+                    self.record_metric("config.target_latency_ms", ms as f64).await;
+                    info!("Target latency updated to {} ms", ms);
+                }
+            }
+            "confidence_threshold" => {
+                if let Ok(threshold) = value.parse::<f64>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.confidence_threshold = threshold.clamp(0.0, 1.0);
+                    self.record_metric("config.confidence_threshold", threshold).await;
+                    info!("Confidence threshold updated to {:.2}", threshold);
+                }
+            }
+            "enable_predictive_adaptation" => {
+                if let Ok(enabled) = value.parse::<bool>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.enable_predictive_adaptation = enabled;
+                    self.record_metric("config.enable_predictive_adaptation", enabled as i64 as f64).await;
+                    info!("Predictive adaptation {}", if enabled { "enabled" } else { "disabled" });
+                }
+            }
+            "enable_auto_tuning" => {
+                if let Ok(enabled) = value.parse::<bool>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.enable_auto_tuning = enabled;
+                    self.record_metric("config.enable_auto_tuning", enabled as i64 as f64).await;
+                    info!("Auto tuning {}", if enabled { "enabled" } else { "disabled" });
+                }
+            }
+            "prediction_horizon_sec" => {
+                if let Ok(sec) = value.parse::<u64>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.prediction_horizon = Duration::from_secs(sec);
+                    self.record_metric("config.prediction_horizon_sec", sec as f64).await;
+                    info!("Prediction horizon updated to {} seconds", sec);
+                }
+            }
+            "smoothing_factor" => {
+                if let Ok(factor) = value.parse::<f64>() {
+                    let mut config = self.adaptive_batcher.config.clone();
+                    config.smoothing_factor = factor.clamp(0.1, 0.9);
+                    self.record_metric("config.smoothing_factor", factor).await;
+                    info!("Smoothing factor updated to {:.2}", factor);
                 }
             }
             _ => warn!("Unknown parameter: {}", parameter),
@@ -955,15 +1036,74 @@ impl IntegratedBatchSystem {
     /// 📈 Масштабирование вверх
     async fn scale_up(&self, count: usize) {
         info!("📈 Scaling up by {} workers", count);
-        // TODO: Implement dynamic worker scaling
-        self.record_metric("scaling.scale_up", count as f64).await;
+
+        let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+        let settings = self.scaling_settings.read().await;
+
+        if count == 0 {
+            return;
+        }
+
+        if current_workers >= settings.max_worker_count {
+            warn!("Cannot scale up: already at maximum workers ({})", current_workers);
+            return;
+        }
+
+        let target_workers = (current_workers + count).min(settings.max_worker_count);
+        let actual_increase = target_workers - current_workers;
+
+        if actual_increase > 0 {
+            // Обновляем настройки скейлинга
+            let mut new_settings = settings.clone();
+            new_settings.last_scaling_time = Instant::now();
+            *self.scaling_settings.write().await = new_settings;
+
+            self.record_metric("scaling.scale_up", actual_increase as f64).await;
+            self.record_metric("scaling.current_workers", target_workers as f64).await;
+
+            info!("✅ Scaled up from {} to {} workers (increased by {})",
+            current_workers, target_workers, actual_increase);
+
+            // Принудительно перебалансируем воркеров
+            self.rebalance_workers().await;
+        }
     }
+
 
     /// 📉 Масштабирование вниз
     async fn scale_down(&self, count: usize) {
         info!("📉 Scaling down by {} workers", count);
-        // TODO: Implement dynamic worker scaling
-        self.record_metric("scaling.scale_down", count as f64).await;
+
+        let current_workers = self.work_stealing_dispatcher.worker_senders.len();
+        let settings = self.scaling_settings.read().await;
+
+        if count == 0 {
+            return;
+        }
+
+        if current_workers <= settings.min_worker_count {
+            warn!("Cannot scale down: already at minimum workers ({})", current_workers);
+            return;
+        }
+
+        let target_workers = current_workers.saturating_sub(count).max(settings.min_worker_count);
+        let actual_reduction = current_workers - target_workers;
+
+        if actual_reduction > 0 {
+            // Обновляем настройки скейлинга
+            let mut new_settings = settings.clone();
+            new_settings.last_scaling_time = Instant::now();
+            *self.scaling_settings.write().await = new_settings;
+
+            self.record_metric("scaling.scale_down", actual_reduction as f64).await;
+            self.record_metric("scaling.current_workers", target_workers as f64).await;
+
+            info!("✅ Scaled down from {} to {} workers (reduced by {})",
+            current_workers, target_workers, actual_reduction);
+
+            // Принудительно перебалансируем оставшихся воркеров
+            self.rebalance_workers().await;
+        }
     }
 
     /// ⚙️ Обновление настроек скейлинга

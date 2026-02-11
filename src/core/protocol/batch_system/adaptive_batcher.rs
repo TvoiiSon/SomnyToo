@@ -6,8 +6,8 @@ use dashmap::DashMap;
 
 /// Адаптивный батчер с предсказательной адаптацией на основе ML
 pub struct AdaptiveBatcher {
-    config: AdaptiveBatcherConfig,
-    current_batch_size: RwLock<usize>,
+    pub config: AdaptiveBatcherConfig,
+    pub current_batch_size: RwLock<usize>,
     metrics: RwLock<BatchMetrics>,
     window_metrics: Mutex<Vec<WindowMetric>>,
     metrics_store: Arc<DashMap<String, f64>>,

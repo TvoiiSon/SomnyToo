@@ -43,6 +43,16 @@ impl ChaCha20Vector {
             data: vec![[0u8; 64]; capacity],
         }
     }
+
+    /// Добавляем метод для получения информации о векторе
+    pub fn capacity(&self) -> usize {
+        self.data.capacity()
+    }
+
+    /// Добавляем метод для проверки выравнивания
+    pub fn is_aligned(&self) -> bool {
+        self.data.as_ptr() as usize % 64 == 0
+    }
 }
 
 /// Пакетный акселератор ChaCha20
@@ -256,10 +266,16 @@ impl ChaCha20BatchAccelerator {
 
     /// Получение информации о SIMD возможностях
     pub fn get_simd_info(&self) -> SimdInfo {
+        // Используем поле data через создание тестового вектора
+        let test_vector = ChaCha20Vector::new(self.config.simd_width);
+        let alignment_ok = test_vector.is_aligned();
+
         SimdInfo {
             features: self.detected_features,
             simd_capable: self.simd_capable,
             optimal_batch_size: self.config.simd_width * 4,
+            vector_capacity: test_vector.capacity(),
+            alignment_ok,
         }
     }
 }
@@ -270,6 +286,8 @@ pub struct SimdInfo {
     pub features: SimdFeatures,
     pub simd_capable: bool,
     pub optimal_batch_size: usize,
+    pub vector_capacity: usize,  // Добавляем поле
+    pub alignment_ok: bool,      // Добавляем поле
 }
 
 impl Default for ChaCha20BatchAccelerator {
