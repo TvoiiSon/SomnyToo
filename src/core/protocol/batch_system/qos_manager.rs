@@ -640,35 +640,10 @@ impl QosManager {
         self.statistics.read().await.clone()
     }
 
-    /// Сбросить статистику
-    pub async fn reset_statistics(&self) {
-        let mut stats = self.statistics.write().await;
-        *stats = QosStatistics {
-            high_priority_requests: 0,
-            normal_priority_requests: 0,
-            low_priority_requests: 0,
-            high_priority_rejected: 0,
-            normal_priority_rejected: 0,
-            low_priority_rejected: 0,
-            high_priority_wait_time: Duration::from_secs(0),
-            normal_priority_wait_time: Duration::from_secs(0),
-            low_priority_wait_time: Duration::from_secs(0),
-            high_priority_avg_wait_ms: 0.0,
-            normal_priority_avg_wait_ms: 0.0,
-            low_priority_avg_wait_ms: 0.0,
-        };
-    }
-
     /// Получить текущие квоты
     pub async fn get_quotas(&self) -> (f64, f64, f64) {
         let quotas = self.quotas.read().await;
         (quotas.current_high_priority, quotas.current_normal_priority, quotas.current_low_priority)
-    }
-
-    /// Получить базовые квоты
-    pub async fn get_base_quotas(&self) -> (f64, f64, f64) {
-        let quotas = self.quotas.read().await;
-        (quotas.base_high_priority, quotas.base_normal_priority, quotas.base_low_priority)
     }
 
     /// Получить использование по приоритетам
@@ -696,104 +671,6 @@ impl QosManager {
 
         (high_util, normal_util, low_util)
     }
-
-    /// Обновить политику адаптации
-    pub async fn update_adaptation_policy(&self, policy_update: PolicyUpdate) {
-        let mut policy = self.dynamic_policy.lock().await;
-
-        if let Some(enabled) = policy_update.enabled {
-            policy.enabled = enabled;
-        }
-        if let Some(interval) = policy_update.adaptation_interval {
-            policy.adaptation_interval = interval;
-        }
-        if let Some(target) = policy_update.target_high_priority_latency_ms {
-            policy.target_high_priority_latency_ms = target;
-        }
-        if let Some(target) = policy_update.target_normal_priority_latency_ms {
-            policy.target_normal_priority_latency_ms = target;
-        }
-        if let Some(max_change) = policy_update.max_quota_change_per_step {
-            policy.max_quota_change_per_step = max_change;
-        }
-        if let Some(min_quota) = policy_update.min_quota_per_class {
-            policy.min_quota_per_class = min_quota;
-        }
-        if let Some(starvation_enabled) = policy_update.starvation_prevention_enabled {
-            policy.starvation_prevention_enabled = starvation_enabled;
-        }
-
-        info!("⚙️ QoS политика адаптации обновлена");
-    }
-
-    /// Принудительно вернуться к базовым квотам
-    pub async fn reset_to_base_quotas(&self) -> Result<(), QosError> {
-        let quotas = self.quotas.read().await;
-
-        let decision = AdaptationDecision {
-            timestamp: Instant::now(),
-            from_high: quotas.current_high_priority,
-            from_normal: quotas.current_normal_priority,
-            from_low: quotas.current_low_priority,
-            to_high: quotas.base_high_priority,
-            to_normal: quotas.base_normal_priority,
-            to_low: quotas.base_low_priority,
-            reason: "Manual reset to base quotas".to_string(),
-            improvement_expected: 0.0,
-        };
-
-        self.apply_adaptation_decision(decision).await
-    }
-
-    /// Получить историю адаптаций
-    pub async fn get_adaptation_history(&self, limit: usize) -> Vec<AdaptationDecision> {
-        self.adaptation_engine.get_decisions(limit).await
-    }
-
-    /// Получить историю нагрузки системы
-    pub async fn get_load_history(&self, limit: usize) -> Vec<LoadAnalysis> {
-        self.adaptation_engine.get_load_samples(limit).await
-    }
-
-    /// Получить текущее состояние системы QoS
-    pub async fn get_system_status(&self) -> QosSystemStatus {
-        let quotas = self.quotas.read().await;
-        let stats = self.statistics.read().await;
-        let (high_util, normal_util, low_util) = self.get_utilization().await;
-
-        let high_rejection = if stats.high_priority_requests > 0 {
-            stats.high_priority_rejected as f64 / stats.high_priority_requests as f64
-        } else { 0.0 };
-
-        let normal_rejection = if stats.normal_priority_requests > 0 {
-            stats.normal_priority_rejected as f64 / stats.normal_priority_requests as f64
-        } else { 0.0 };
-
-        let low_rejection = if stats.low_priority_requests > 0 {
-            stats.low_priority_rejected as f64 / stats.low_priority_requests as f64
-        } else { 0.0 };
-
-        QosSystemStatus {
-            current_quotas: (
-                quotas.current_high_priority,
-                quotas.current_normal_priority,
-                quotas.current_low_priority,
-            ),
-            base_quotas: (
-                quotas.base_high_priority,
-                quotas.base_normal_priority,
-                quotas.base_low_priority,
-            ),
-            utilization: (high_util, normal_util, low_util),
-            latency_ms: (
-                stats.high_priority_avg_wait_ms,
-                stats.normal_priority_avg_wait_ms,
-                stats.low_priority_avg_wait_ms,
-            ),
-            rejection_rates: (high_rejection, normal_rejection, low_rejection),
-            last_adaptation: quotas.last_adaptation,
-        }
-    }
 }
 
 impl AdaptationEngine {
@@ -819,30 +696,6 @@ impl AdaptationEngine {
         }
     }
 
-    async fn get_load_samples(&self, limit: usize) -> Vec<LoadAnalysis> {
-        let history = self.load_history.read().await;
-
-        // Конвертируем LoadSample в LoadAnalysis
-        history.iter()
-            .rev()
-            .take(limit)
-            .map(|sample| LoadAnalysis {
-                timestamp: sample.timestamp,
-                high_rejection_rate: sample.high_rejection_rate,
-                normal_rejection_rate: sample.normal_rejection_rate,
-                low_rejection_rate: sample.low_rejection_rate,
-                high_utilization: sample.high_load,
-                normal_utilization: sample.normal_load,
-                low_utilization: sample.low_load,
-                high_latency_violation: sample.high_rejection_rate > 0.1,
-                normal_latency_violation: sample.normal_rejection_rate > 0.2,
-                low_starvation: sample.low_rejection_rate > 0.5,
-                total_requests: 0, // Нет данных в LoadSample
-                system_load: sample.system_load,
-            })
-            .collect()
-    }
-
     async fn record_decision(&self, decision: AdaptationDecision) {
         let mut history = self.decision_history.write().await;
         history.push(decision);
@@ -850,16 +703,6 @@ impl AdaptationEngine {
         if history.len() > self.max_history_size {
             history.remove(0);
         }
-    }
-
-    async fn get_decisions(&self, limit: usize) -> Vec<AdaptationDecision> {
-        let history = self.decision_history.read().await;
-        let start = if history.len() > limit {
-            history.len() - limit
-        } else {
-            0
-        };
-        history[start..].to_vec()
     }
 }
 

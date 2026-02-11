@@ -61,10 +61,6 @@ impl BufferHandle {
         &self.buffer
     }
 
-    pub fn as_mut_slice(&mut self) -> &mut [u8] {
-        &mut self.buffer
-    }
-
     pub fn len(&self) -> usize {
         self.buffer.len()
     }
@@ -80,21 +76,9 @@ impl BufferHandle {
     pub fn freeze(mut self) -> bytes::Bytes {
         std::mem::take(&mut self.buffer).freeze()
     }
-
-    pub fn extend_from_slice(&mut self, slice: &[u8]) {
-        self.buffer.extend_from_slice(slice);
-    }
-
-    pub fn clear(&mut self) {
-        self.buffer.clear();
-    }
-
+    
     pub fn buffer_type(&self) -> BufferType {
         self.buffer_type
-    }
-
-    pub fn buffer_type_name(&self) -> &'static str {
-        self.buffer_type.name()
     }
 }
 
@@ -329,67 +313,6 @@ impl UnifiedBufferPool {
     /// Получение статистики
     pub fn get_stats(&self) -> BufferStats {
         self.stats.lock().clone()
-    }
-
-    /// Логирование статистики
-    pub fn log_stats(&self) {
-        let stats = self.get_stats();
-        let pools = self.pools.read();
-
-        info!("📊 Buffer Pool Statistics:");
-        info!("  Total allocated: {:.2} MB", stats.total_allocated as f64 / 1024.0 / 1024.0);
-        info!("  Currently used: {} buffers", stats.currently_used);
-        info!("  Allocation count: {}", stats.allocation_count);
-        info!("  Reuse count: {}", stats.reuse_count);
-        info!("  Peak memory: {:.2} MB", stats.peak_memory_usage as f64 / 1024.0 / 1024.0);
-
-        let hit_rate = if stats.allocation_count + stats.reuse_count > 0 {
-            stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64 * 100.0
-        } else {
-            0.0
-        };
-
-        info!("  Hit rate: {:.1}%", hit_rate);
-
-        for (buffer_type, pool) in pools.iter() {
-            let pool_size = pool.len();
-            let used_count = pool.iter().filter(|b| b.is_used).count();
-            let total_size: usize = pool.iter().map(|b| b.size).sum();
-
-            info!("  {:?}: pool={}, used={}, total_size={:.2} KB",
-                  buffer_type, pool_size, used_count, total_size as f64 / 1024.0);
-        }
-    }
-
-    /// Получение информации о памяти
-    pub fn memory_info(&self) -> MemoryInfo {
-        let stats = self.get_stats();
-        let pools = self.pools.read();
-
-        let mut buffer_type_counts = HashMap::new();
-        let mut buffer_type_sizes = HashMap::new();
-
-        for (buffer_type, pool) in pools.iter() {
-            let used_count = pool.iter().filter(|b| b.is_used).count();
-            let total_size: usize = pool.iter().map(|b| b.size).sum();
-
-            buffer_type_counts.insert(*buffer_type, (used_count, pool.len() - used_count));
-            buffer_type_sizes.insert(*buffer_type, total_size);
-        }
-
-        MemoryInfo {
-            total_allocated: stats.total_allocated,
-            currently_used: stats.currently_used,
-            allocation_count: stats.allocation_count,
-            reuse_count: stats.reuse_count,
-            hit_rate: if stats.allocation_count + stats.reuse_count > 0 {
-                stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64
-            } else {
-                0.0
-            },
-            buffer_type_counts,
-            buffer_type_sizes,
-        }
     }
 }
 

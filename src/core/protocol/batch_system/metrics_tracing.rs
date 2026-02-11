@@ -105,26 +105,6 @@ impl MetricsTracingSystem {
         Ok(())
     }
 
-    /// Регистрация метрики
-    pub fn record_metric(&self, name: &str, value: f64, aggregation: AggregationType) {
-        if !self.config.enabled {
-            return;
-        }
-
-        self.metrics_store.entry(name.to_string())
-            .or_insert_with(|| MetricSeries {
-                name: name.to_string(),
-                values: Vec::with_capacity(1000),
-                aggregation,
-                max_samples: 1000,
-            })
-            .values
-            .push((Instant::now(), value));
-
-        // Обрезка старых значений
-        self.cleanup_old_metrics();
-    }
-
     /// Получение агрегированных метрик
     pub fn get_aggregated_metrics(&self, name: &str) -> Option<AggregatedMetric> {
         let series = self.metrics_store.get(name)?;
@@ -172,90 +152,6 @@ impl MetricsTracingSystem {
 
         let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
         sorted[index.min(sorted.len() - 1)]
-    }
-
-    fn cleanup_old_metrics(&self) {
-        let now = Instant::now();
-
-        for mut series in self.metrics_store.iter_mut() {
-            // Удаляем старые значения
-            series.values.retain(|(timestamp, _)| {
-                now.duration_since(*timestamp) <= self.config.retention_period
-            });
-
-            // Ограничиваем количество значений
-            if series.values.len() > series.max_samples {
-                let excess = series.values.len() - series.max_samples;
-                series.values.drain(0..excess);
-            }
-        }
-    }
-
-    /// Получение статистики трассировки
-    pub fn get_trace_stats(&self) -> TraceStats {
-        let sampler = self.trace_sampler.blocking_read();
-
-        TraceStats {
-            sampling_rate: sampler.sampling_rate,
-            total_traces: sampler.total_traces,
-            sampled_traces: sampler.sampled_traces,
-            sampling_efficiency: if sampler.total_traces > 0 {
-                sampler.sampled_traces as f64 / sampler.total_traces as f64
-            } else {
-                0.0
-            },
-        }
-    }
-
-    /// Экспорт всех метрик
-    pub fn export_metrics(&self) -> Vec<ExportedMetric> {
-        let mut exported = Vec::new();
-
-        for series in self.metrics_store.iter() {
-            if let Some(aggregated) = self.get_aggregated_metrics(&series.name) {
-                exported.push(ExportedMetric {
-                    name: series.name.clone(),
-                    aggregation_type: series.aggregation,
-                    aggregated,
-                });
-            }
-        }
-
-        exported
-    }
-
-    /// Запуск фоновых задач
-    pub fn start_background_tasks(&self) {
-        if !self.config.enabled {
-            return;
-        }
-
-        let metrics_store = self.metrics_store.clone();
-        let config = self.config.clone();
-
-        // Очистка старых метрик
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(60));
-
-            loop {
-                interval.tick().await;
-
-                let now = Instant::now();
-                let mut to_remove = Vec::new();
-
-                for entry in metrics_store.iter() {
-                    if let Some((last_time, _)) = entry.values.last() {
-                        if now.duration_since(*last_time) > config.retention_period * 2 {
-                            to_remove.push(entry.name.clone());
-                        }
-                    }
-                }
-
-                for name in to_remove {
-                    metrics_store.remove(&name);
-                }
-            }
-        });
     }
 }
 

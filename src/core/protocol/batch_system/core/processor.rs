@@ -36,19 +36,6 @@ pub struct CryptoBatch {
 }
 
 impl CryptoBatch {
-    pub fn new(id: u64, priority: Priority) -> Self {
-        Self {
-            id,
-            operations: Vec::with_capacity(64),
-            priority,
-            created_at: Instant::now(),
-        }
-    }
-
-    pub fn add_operation(&mut self, op: CryptoOperation) {
-        self.operations.push(op);
-    }
-
     pub fn len(&self) -> usize {
         self.operations.len()
     }
@@ -372,14 +359,6 @@ impl CryptoProcessor {
         let mut cache = self.session_cache.write().await;
         for (session_id, session) in sessions {
             cache.insert(session_id.clone(), session.clone());
-        }
-    }
-
-    /// Предварительное заполнение кэша сессий
-    pub async fn prefill_session_cache(&self, sessions: HashMap<Vec<u8>, Arc<PhantomSession>>) {
-        let mut cache = self.session_cache.write().await;
-        for (session_id, session) in sessions {
-            cache.insert(session_id, session);
         }
     }
 

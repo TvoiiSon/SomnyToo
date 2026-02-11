@@ -51,16 +51,6 @@ impl ChaCha20Vector {
         }
     }
 
-    // Добавляем метод для использования capacity
-    pub fn capacity(&self) -> usize {
-        self.capacity
-    }
-
-    // Добавляем метод для изменения capacity
-    pub fn set_capacity(&mut self, capacity: usize) {
-        self.capacity = capacity;
-    }
-
     pub fn len(&self) -> usize {
         self.data.len()
     }
@@ -68,23 +58,15 @@ impl ChaCha20Vector {
     pub fn is_empty(&self) -> bool {
         self.data.is_empty()
     }
-
-    pub fn as_mut_ptr(&mut self) -> *mut u8 {
-        self.data.as_mut_ptr() as *mut u8
-    }
-
-    pub fn as_ptr(&self) -> *const u8 {
-        self.data.as_ptr() as *const u8
-    }
 }
 
-impl Zeroize for ChaCha20Vector {
-    fn zeroize(&mut self) {
-        for block in &mut self.data {
-            block.zeroize();
-        }
-    }
-}
+// impl Zeroize for ChaCha20Vector {
+//     fn zeroize(&mut self) {
+//         for block in &mut self.data {
+//             block.zeroize();
+//         }
+//     }
+// }
 
 /// Пакетный акселератор ChaCha20
 pub struct ChaCha20BatchAccelerator {
@@ -555,15 +537,6 @@ impl ChaCha20BatchAccelerator {
         self.encrypt_in_place_scalar(keys, nonces, buffers).await;
     }
 
-    /// Получение информации о SIMD возможностях
-    pub fn get_simd_info(&self) -> SimdInfo {
-        SimdInfo {
-            features: self.detected_features,
-            simd_capable: self.simd_capable,
-            optimal_batch_size: self.get_optimal_batch_size(),
-        }
-    }
-
     /// Определение оптимального размера батча
     fn get_optimal_batch_size(&self) -> usize {
         if self.detected_features.avx512 {
@@ -575,22 +548,6 @@ impl ChaCha20BatchAccelerator {
         } else {
             1
         }
-    }
-
-    // Добавляем метод для использования state_cache
-    pub fn state_cache_size(&self) -> usize {
-        self.state_cache.len()
-    }
-
-    // Добавляем метод для использования output_cache
-    pub fn output_cache_size(&self) -> usize {
-        self.output_cache.len()
-    }
-
-    // Добавляем метод для очистки кэшей
-    pub fn clear_caches(&mut self) {
-        self.state_cache.clear();
-        self.output_cache.clear();
     }
 }
 

@@ -69,66 +69,6 @@ pub struct LoadAwareDispatcher {
 }
 
 impl LoadAwareDispatcher {
-    pub fn new(
-        num_workers: usize,
-        queue_capacity: usize,
-        session_manager: Arc<PhantomSessionManager>,
-        circuit_breaker: Arc<CircuitBreaker>,
-        qos_manager: Arc<QosManager>,
-        adaptive_batcher: Arc<AdaptiveBatcher>,
-    ) -> Self {
-        info!("🚀 Создание LoadAwareDispatcher с {} workers и атомарными очередями", num_workers);
-
-        let mut worker_senders = Vec::with_capacity(num_workers);
-        let mut worker_receivers = Vec::with_capacity(num_workers);
-
-        for _ in 0..num_workers {
-            let (tx, rx) = bounded(queue_capacity);
-            worker_senders.push(tx);
-            worker_receivers.push(rx);
-        }
-
-        let (injector_sender, injector_receiver) = bounded(queue_capacity * 2);
-
-        // Инициализируем информацию о загрузке worker'ов
-        let mut worker_loads = Vec::new();
-        for i in 0..num_workers {
-            worker_loads.push(WorkerLoadInfo {
-                worker_id: i,
-                queue_size: 0,
-                processing_rate: 0.0,
-                avg_processing_time: Duration::from_millis(0),
-                last_update: Instant::now(),
-                is_healthy: true,
-                current_complexity: 0,
-            });
-        }
-
-        let dispatcher = Self {
-            worker_senders: Arc::new(worker_senders),
-            worker_receivers: Arc::new(worker_receivers),
-            injector_sender,
-            injector_receiver,
-            results: Arc::new(DashMap::new()),
-            stats: Arc::new(DashMap::new()),
-            worker_loads: Arc::new(parking_lot::RwLock::new(worker_loads)),
-            circuit_breaker,
-            qos_manager,
-            adaptive_batcher,
-            is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
-            next_task_id: std::sync::atomic::AtomicU64::new(1),
-            metrics: Arc::new(DashMap::new()),
-        };
-
-        // Запускаем worker'ов
-        dispatcher.start_workers(session_manager);
-
-        dispatcher.start_load_monitor();
-        dispatcher.start_metrics_collector();
-
-        dispatcher
-    }
-
     /// Запуск worker'ов с атомарными очередями
     fn start_workers(&self, session_manager: Arc<PhantomSessionManager>) {
         let packet_processor = PhantomPacketProcessor::new();
@@ -356,114 +296,6 @@ impl LoadAwareDispatcher {
         }
     }
 
-    /// Обновление информации о загрузке worker'а
-    async fn update_worker_load(
-        &self,
-        worker_id: usize,
-        queue_delta: isize,
-        processing_time: Option<Duration>,
-        complexity_delta: i32,
-    ) {
-        let mut loads = self.worker_loads.write();
-
-        if let Some(worker) = loads.get_mut(worker_id) {
-            if queue_delta > 0 {
-                worker.queue_size += queue_delta as usize;
-            } else {
-                worker.queue_size = worker.queue_size.saturating_sub((-queue_delta) as usize);
-            }
-
-            if complexity_delta > 0 {
-                worker.current_complexity += complexity_delta as u32;
-            } else {
-                worker.current_complexity = worker.current_complexity.saturating_sub((-complexity_delta) as u32);
-            }
-
-            if let Some(time) = processing_time {
-                let alpha = 0.1;
-                let current_ns = worker.avg_processing_time.as_nanos() as f64;
-                let new_ns = current_ns * (1.0 - alpha) + time.as_nanos() as f64 * alpha;
-                worker.avg_processing_time = Duration::from_nanos(new_ns as u64);
-
-                if time.as_millis() > 0 {
-                    let current_rate = worker.processing_rate;
-                    let instant_rate = 1000.0 / time.as_millis() as f64;
-                    worker.processing_rate = current_rate * (1.0 - alpha) + instant_rate * alpha;
-                }
-            }
-
-            worker.last_update = Instant::now();
-            worker.is_healthy = worker.queue_size < 1000 &&
-                worker.current_complexity < 500 &&
-                worker.avg_processing_time < Duration::from_secs(5);
-        }
-    }
-
-    /// Отправка задачи с атомарными очередями
-    pub async fn submit_task(&self, mut task: LoadAwareTask) -> Result<u64, BatchError> {
-        if !self.circuit_breaker.allow_request().await {
-            warn!("🚨 Circuit breaker блокирует задачу");
-            return Err(BatchError::ProcessingError("Circuit breaker open".to_string()));
-        }
-
-        let _qos_permit = match self.qos_manager.acquire_permit(task.priority).await {
-            Ok(permit) => permit,
-            Err(e) => {
-                warn!("⚠️ QoS отклонил задачу: {}", e);
-                return Err(BatchError::Backpressure);
-            }
-        };
-
-        let task_id = self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        task.id = task_id;
-
-        if task.estimated_complexity == 0 {
-            task.estimated_complexity = self.estimate_task_complexity(&task);
-        }
-
-        let worker_id = match self.select_optimal_worker(&task).await {
-            Some(id) => id,
-            None => {
-                error!("❌ Нет доступных здоровых worker'ов");
-                return Err(BatchError::ProcessingError("No healthy workers available".to_string()));
-            }
-        };
-
-        self.update_worker_load(
-            worker_id,
-            1,
-            None,
-            task.estimated_complexity as i32,
-        ).await;
-
-        // Пытаемся отправить задачу в очередь worker'а
-        match self.worker_senders[worker_id].try_send(task.clone()) {
-            Ok(_) => {
-                debug!("✅ Задача {} отправлена worker {}", task_id, worker_id);
-                *self.stats.entry("tasks_submitted".to_string()).or_insert(0) += 1;
-                self.circuit_breaker.record_success().await;
-                Ok(task_id)
-            }
-            Err(_) => {
-                // Очередь worker'а переполнена, пытаемся отправить в инжектор
-                match self.injector_sender.try_send(task.clone()) {
-                    Ok(_) => {
-                        debug!("✅ Задача {} отправлена в инжектор", task_id);
-                        *self.stats.entry("tasks_submitted".to_string()).or_insert(0) += 1;
-                        self.circuit_breaker.record_success().await;
-                        Ok(task_id)
-                    }
-                    Err(_) => {
-                        self.update_worker_load(worker_id, -1, None, -(task.estimated_complexity as i32)).await;
-                        self.circuit_breaker.record_failure().await;
-                        error!("❌ Ошибка отправки задачи: все очереди переполнены");
-                        Err(BatchError::Backpressure)
-                    }
-                }
-            }
-        }
-    }
-
     fn estimate_task_complexity(&self, task: &LoadAwareTask) -> u32 {
         let base_complexity = match task.priority {
             Priority::Critical => 10,
@@ -479,30 +311,6 @@ impl LoadAwareDispatcher {
         base_complexity + size_factor + crypto_factor
     }
 
-    /// Получение расширенных метрик
-    pub async fn get_advanced_metrics(&self) -> AdvancedDispatcherMetrics {
-        let loads = self.worker_loads.read();
-        let circuit_state = self.circuit_breaker.get_state().await;
-        let (high_q, normal_q, low_q) = self.qos_manager.get_quotas().await;
-        let (high_u, normal_u, low_u) = self.qos_manager.get_utilization().await;
-        let batch_metrics = self.adaptive_batcher.get_metrics().await;
-
-        AdvancedDispatcherMetrics {
-            total_workers: loads.len(),
-            healthy_workers: loads.iter().filter(|w| w.is_healthy).count(),
-            total_queue: loads.iter().map(|w| w.queue_size).sum(),
-            avg_processing_time_ms: loads.iter()
-                .map(|w| w.avg_processing_time.as_millis())
-                .sum::<u128>() as f64 / loads.len().max(1) as f64,
-            circuit_breaker_state: circuit_state,
-            qos_quotas: (high_q, normal_q, low_q),
-            qos_utilization: (high_u, normal_u, low_u),
-            current_batch_size: self.adaptive_batcher.get_batch_size().await,
-            batch_metrics,
-            imbalance: self.calculate_imbalance(&loads),
-        }
-    }
-
     fn calculate_imbalance(&self, loads: &[WorkerLoadInfo]) -> f64 {
         if loads.is_empty() {
             return 0.0;
@@ -516,11 +324,6 @@ impl LoadAwareDispatcher {
             .sum::<f64>() / loads.len() as f64;
 
         variance.sqrt() / (avg_load + 1.0)
-    }
-
-    pub async fn shutdown(&self) {
-        self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
-        info!("LoadAwareDispatcher остановлен");
     }
 }
 

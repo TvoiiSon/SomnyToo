@@ -174,55 +174,6 @@ impl Blake3BatchAccelerator {
         result
     }
 
-    /// Одиночное скалярное хеширование без ключа
-    pub fn hash_single_scalar(&self, input: &[u8]) -> [u8; 32] {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new();
-        hasher.update(input);
-        let result_bytes = hasher.finalize();
-        let mut result = [0u8; 32];
-        result.copy_from_slice(result_bytes.as_bytes());
-        result
-    }
-
-    /// Пакетное хеширование с получением произвольной длины вывода
-    pub async fn hash_keyed_xof_batch(
-        &self,
-        keys: &[[u8; 32]],
-        inputs: &[Vec<u8>],
-        output_len: usize,
-    ) -> Vec<Vec<u8>> {
-        let start = Instant::now();
-        let batch_size = keys.len();
-
-        if batch_size == 0 {
-            return Vec::new();
-        }
-
-        let results = if self.config.enable_parallel_hashing && batch_size >= 4 {
-            // Параллельная обработка
-            (0..batch_size)
-                .into_par_iter()
-                .map(|i| {
-                    self.hash_keyed_xof_single_scalar(&keys[i], &inputs[i], output_len)
-                })
-                .collect()
-        } else {
-            // Последовательная обработка
-            let mut results = Vec::with_capacity(batch_size);
-            for i in 0..batch_size {
-                results.push(self.hash_keyed_xof_single_scalar(&keys[i], &inputs[i], output_len));
-            }
-            results
-        };
-
-        let elapsed = start.elapsed();
-        debug!("✅ Blake3 XOF batch: {} ops in {:?}", batch_size, elapsed);
-
-        results
-    }
-
     /// Одиночное XOF хеширование
     fn hash_keyed_xof_single_scalar(&self, key: &[u8; 32], input: &[u8], output_len: usize) -> Vec<u8> {
         use blake3::Hasher;
@@ -232,24 +183,6 @@ impl Blake3BatchAccelerator {
         let mut output = vec![0u8; output_len];
         hasher.finalize_xof().fill(&mut output);
         output
-    }
-
-    /// Получение информации о производительности
-    pub fn get_performance_info(&self) -> Blake3PerformanceInfo {
-        let hits = self.cache_hits.load(std::sync::atomic::Ordering::Relaxed);
-        let misses = self.cache_misses.load(std::sync::atomic::Ordering::Relaxed);
-        let total = hits + misses;
-        let hit_rate = if total > 0 { hits as f64 / total as f64 * 100.0 } else { 0.0 };
-
-        Blake3PerformanceInfo {
-            simd_capable: self.simd_capable,
-            optimal_batch_size: self.get_optimal_batch_size(),
-            estimated_throughput: self.estimate_throughput(),
-            cache_hits: hits,
-            cache_misses: misses,
-            cache_hit_rate: hit_rate,
-            state_cache_size: self.state_cache.len(),
-        }
     }
 
     /// Определение оптимального размера батча
@@ -277,28 +210,6 @@ impl Blake3BatchAccelerator {
         } else {
             300.0   // 300 MB/s
         }
-    }
-
-    /// Получение кэша состояний
-    pub fn get_state_cache(&self) -> &Vec<Vec<u32>> {
-        &self.state_cache
-    }
-
-    /// Очистка кэша состояний
-    pub fn clear_state_cache(&mut self) {
-        self.state_cache.clear();
-        self.cache_hits.store(0, std::sync::atomic::Ordering::Relaxed);
-        self.cache_misses.store(0, std::sync::atomic::Ordering::Relaxed);
-        info!("Cleared Blake3 state cache");
-    }
-
-    /// Предварительное заполнение кэша
-    pub fn prefill_state_cache(&mut self, num_states: usize) {
-        self.state_cache.clear();
-        for _ in 0..num_states {
-            self.state_cache.push(vec![0u32; 16]); // Blake3 internal state size
-        }
-        info!("Prefilled Blake3 state cache with {} states", num_states);
     }
 }
 

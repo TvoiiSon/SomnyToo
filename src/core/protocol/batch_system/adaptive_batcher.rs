@@ -880,56 +880,9 @@ impl AdaptiveBatcher {
         history[start..].to_vec()
     }
 
-    /// Получить предсказание нагрузки
-    pub async fn get_load_prediction(&self, horizon_seconds: u64) -> LoadPrediction {
-        let predictor = self.workload_predictor.lock().await;
-        let horizon = (horizon_seconds / 5).max(1) as usize; // 5-секундные интервалы
-        predictor.predict_load(horizon.min(60)) // Максимум 60 интервалов (5 минут)
-    }
-
     /// Принудительно выполнить адаптацию
     pub async fn force_adaptation(&self) {
         self.perform_predictive_adaptation().await;
-    }
-
-    /// Сбросить к начальным настройкам
-    pub async fn reset(&self) {
-        *self.current_batch_size.write().await = self.config.initial_batch_size;
-
-        let mut metrics = self.metrics.write().await;
-        *metrics = BatchMetrics {
-            total_batches: 0,
-            total_items: 0,
-            avg_batch_size: self.config.initial_batch_size as f64,
-            avg_processing_time: Duration::from_millis(0),
-            p95_processing_time: Duration::from_millis(0),
-            p99_processing_time: Duration::from_millis(0),
-            last_adaptation: Instant::now(),
-            adaptation_count: 0,
-            prediction_accuracy: 0.5,
-            proactive_adaptations: 0,
-            reactive_adaptations: 0,
-            avg_prediction_error: 0.0,
-        };
-
-        self.window_metrics.lock().await.clear();
-        self.metrics_store.clear();
-
-        // Сброс моделей предсказания
-        *self.prediction_model.lock().await = PredictionModel::new(
-            self.config.smoothing_factor,
-            self.config.smoothing_factor * 0.5,
-            self.config.smoothing_factor * 0.3,
-            60,
-        );
-
-        *self.workload_predictor.lock().await = WorkloadPredictor::new(
-            self.config.prediction_horizon.as_secs() as usize
-        );
-
-        self.adaptation_history.lock().await.clear();
-
-        info!("🔄 AdaptiveBatcher сброшен к начальным настройкам");
     }
 }
 

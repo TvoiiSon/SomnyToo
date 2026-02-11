@@ -189,22 +189,6 @@ impl WorkStealingDispatcher {
         }
     }
 
-    /// Получение расширенных метрик диспетчера
-    pub async fn get_dispatcher_metrics(&self) -> WorkStealingDispatcherMetrics {
-        let stats = self.get_stats();
-
-        WorkStealingDispatcherMetrics {
-            worker_count: self.worker_senders.len(),
-            total_tasks_submitted: stats.get("tasks_submitted").cloned().unwrap_or(0),
-            total_tasks_processed: stats.get("total_tasks_processed").cloned().unwrap_or(0),
-            successful_decryptions: stats.get("successful_decryptions").cloned().unwrap_or(0),
-            failed_decryptions: stats.get("failed_decryptions").cloned().unwrap_or(0),
-            session_not_found: stats.get("session_not_found").cloned().unwrap_or(0),
-            work_steals: stats.get("work_steals").cloned().unwrap_or(0),
-            timestamp: Instant::now(),
-        }
-    }
-
     /// Запуск worker'ов
     fn start_workers(&self) {
         let num_workers = self.worker_senders.len();

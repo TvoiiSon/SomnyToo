@@ -344,22 +344,6 @@ impl OptimizedCryptoProcessor {
         }
     }
 
-    /// Получение результата
-    pub fn get_crypto_result(&self, task_id: u64) -> Option<CryptoResult> {
-        self.results.get(&task_id).map(|r| r.clone())
-    }
-
-    /// Получение статистики
-    pub fn get_stats(&self) -> std::collections::HashMap<String, u64> {
-        let mut stats_map = std::collections::HashMap::new();
-
-        for entry in self.stats.iter() {
-            stats_map.insert(entry.key().clone(), *entry.value());
-        }
-
-        stats_map
-    }
-
     /// Остановка
     pub async fn shutdown(&self) {
         info!("🛑 Shutting down crypto processor...");

@@ -44,28 +44,6 @@ impl SizeClass {
         }
     }
 
-    /// Минимальный размер для класса
-    pub fn min_size(&self) -> usize {
-        match self {
-            SizeClass::Small => 64,
-            SizeClass::Medium => 1025,
-            SizeClass::Large => 8193,
-            SizeClass::XLarge => 65537,
-            SizeClass::Giant => 262145,
-        }
-    }
-
-    /// Максимальный размер для класса
-    pub fn max_size(&self) -> usize {
-        match self {
-            SizeClass::Small => 1024,
-            SizeClass::Medium => 8192,
-            SizeClass::Large => 65536,
-            SizeClass::XLarge => 262144,
-            SizeClass::Giant => 1048576,
-        }
-    }
-
     /// Имя класса для отладки
     pub fn name(&self) -> &'static str {
         match self {
@@ -692,47 +670,6 @@ impl OptimizedBufferPool {
         self.cleanup_old_buffers(max_age);
         info!("✅ Buffer pool force cleanup completed");
     }
-
-    /// Получение информации об использовании памяти
-    pub fn get_memory_usage(&self) -> MemoryUsage {
-        let pools = self.size_class_pools.read();
-        let bytes_mut_pool = self.bytes_mut_pool.lock();
-
-        let mut memory_by_class = std::collections::HashMap::new();
-        let mut total_memory = 0;
-
-        // Считаем память по классам
-        for (i, class) in SizeClass::all_classes().iter().enumerate() {
-            let memory: usize = pools[i]
-                .iter()
-                .map(|buf| buf.capacity())
-                .sum();
-
-            memory_by_class.insert(*class, memory);
-            total_memory += memory;
-        }
-
-        // Память для BytesMut
-        let bytes_mut_memory: usize = bytes_mut_pool
-            .iter()
-            .map(|buf| buf.capacity())
-            .sum();
-
-        total_memory += bytes_mut_memory;
-
-        MemoryUsage {
-            memory_by_class,
-            bytes_mut_memory_kb: bytes_mut_memory / 1024,
-            total_memory_kb: total_memory / 1024,
-            buffers_by_class: pools.iter().map(|p| p.len()).collect::<Vec<_>>(),
-            bytes_mut_buffers: bytes_mut_pool.len(),
-        }
-    }
-
-    /// Создание буфера определенного размера
-    pub fn create_sized_buffer(&self, size: usize) -> Vec<u8> {
-        self.acquire_buffer(size)
-    }
 }
 
 /// Детальная статистика класса
@@ -756,33 +693,6 @@ pub struct MemoryUsage {
     pub total_memory_kb: usize,
     pub buffers_by_class: Vec<usize>,
     pub bytes_mut_buffers: usize,
-}
-
-impl MemoryUsage {
-    pub fn to_string(&self) -> String {
-        let mut result = String::new();
-        result.push_str(&format!("Total: {:.1} MB\n", self.total_memory_kb as f64 / 1024.0));
-
-        for (class, &memory) in &self.memory_by_class {
-            if memory > 0 {
-                let class_index = class.as_usize();
-                if class_index < self.buffers_by_class.len() {
-                    result.push_str(&format!("  {}: {} buffers, {:.1} KB\n",
-                                             class.name(),
-                                             self.buffers_by_class[class_index],
-                                             memory as f64 / 1024.0));
-                }
-            }
-        }
-
-        if self.bytes_mut_memory_kb > 0 {
-            result.push_str(&format!("  BytesMut: {} buffers, {:.1} KB\n",
-                                     self.bytes_mut_buffers,
-                                     self.bytes_mut_memory_kb as f64));
-        }
-
-        result
-    }
 }
 
 impl Clone for OptimizedBufferPool {
