@@ -50,6 +50,7 @@ pub mod core {
             pub mod types {
                 pub mod priority;
                 pub mod error;
+                pub mod packet_types;
             }
             pub mod heartbeat {
                 pub mod batch_system_monitor;

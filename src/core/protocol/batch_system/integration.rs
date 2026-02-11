@@ -33,6 +33,7 @@ use crate::core::protocol::batch_system::adaptive_batcher::{
 use crate::core::protocol::batch_system::metrics_tracing::{
     MetricsTracingSystem, MetricsConfig
 };
+use crate::core::protocol::batch_system::types::packet_types::{is_packet_supported, get_packet_info, get_packet_priority};
 
 // ✅ READER & WRITER
 use crate::core::protocol::batch_system::core::reader::{BatchReader, ReaderEvent};
@@ -551,40 +552,26 @@ impl IntegratedBatchSystem {
         session_id: Vec<u8>,
         data: Bytes,
         source_addr: std::net::SocketAddr,
-        priority: Priority,
+        _priority: Priority,  // Не используем переданный приоритет, определяем после дешифровки
         timestamp: Instant,
     ) {
-        debug!("📥 Data received: {} bytes from {}", data.len(), source_addr);
+        debug!("📥 Raw data received: {} bytes from {}", data.len(), source_addr);
 
         // Обновляем статистику
         {
             let mut stats = self.stats.write().await;
             stats.total_data_received += data.len() as u64;
-            stats.total_packets_processed += 1;
-            stats.crypto_operations += 1;
         }
 
-        // Обновляем кэш сессии
-        {
-            let mut cache = self.session_cache.write().await;
-            cache.insert(session_id.clone(), SessionCacheEntry {
-                session_id: session_id.clone(),
-                last_used: Instant::now(),
-                access_count: 1,
-                data: data.clone(),
-                metadata: HashMap::new(),
-            });
-        }
-
-        // Обновляем информацию о соединении
-        self.update_connection_info(&session_id, source_addr, priority, data.len()).await;
+        // ✅ НЕ ПРОВЕРЯЕМ ТИП ПАКЕТА ЗДЕСЬ!
+        // Тип пакета будет определен ПОСЛЕ дешифрования в worker'е
 
         let task = WorkStealingTask {
             id: 0,
             session_id: session_id.clone(),
             data: data.clone(),
             source_addr,
-            priority,
+            priority: Priority::Normal, // Временный приоритет, реальный определится после дешифровки
             created_at: timestamp,
             worker_id: None,
             retry_count: 0,
@@ -694,6 +681,7 @@ impl IntegratedBatchSystem {
                     let packet_data = &data[1..];
 
                     if let Some(session) = self.session_manager.get_session(&task_result.session_id).await {
+                        // ✅ ИСПРАВЛЕНО: Отправляем пакет в packet_service для обработки
                         match self.packet_service.process_packet(
                             session.clone(),
                             packet_type,
@@ -701,21 +689,23 @@ impl IntegratedBatchSystem {
                             task_result.destination_addr,
                         ).await {
                             Ok(processing_result) => {
-                                // ✅ ИСПРАВЛЕНО: используем правильный метод получения ключа
+                                // ✅ packet_service уже вернул правильный ответ
                                 match self.packet_processor.create_outgoing_vec(
                                     &session,
-                                    processing_result.packet_type,
-                                    &processing_result.response,
+                                    processing_result.packet_type,  // Используем тип из processing_result
+                                    &processing_result.response,    // Используем ответ из packet_service
                                 ) {
                                     Ok(encrypted_response) => {
                                         if let Err(e) = self.writer.write(
                                             task_result.destination_addr,
                                             task_result.session_id.clone(),
                                             Bytes::from(encrypted_response),
-                                            processing_result.priority,
-                                            true,
+                                            processing_result.priority,  // Используем приоритет из packet_service
+                                            true,  // requires_flush для критических пакетов
                                         ).await {
                                             error!("❌ Failed to send response: {}", e);
+                                        } else {
+                                            debug!("✅ Response sent for packet type 0x{:02x}", packet_type);
                                         }
                                     }
                                     Err(e) => error!("❌ Encryption failed: {}", e),
@@ -831,35 +821,6 @@ impl IntegratedBatchSystem {
         if let Some(entry) = cache.get_mut(&session_id) {
             entry.last_used = Instant::now();
             entry.access_count += 1;
-        }
-    }
-
-    /// 🔄 Обновление информации о соединении
-    async fn update_connection_info(
-        &self,
-        session_id: &[u8],
-        source_addr: std::net::SocketAddr,
-        priority: Priority,
-        data_len: usize,
-    ) {
-        let mut connections = self.active_connections.write().await;
-
-        if let Some(conn) = connections.get_mut(&source_addr) {
-            conn.last_activity = Instant::now();
-            conn.bytes_received += data_len as u64;
-            conn.priority = priority;
-        } else {
-            connections.insert(source_addr, ConnectionInfo {
-                addr: source_addr,
-                session_id: session_id.to_vec(),
-                opened_at: Instant::now(),
-                last_activity: Instant::now(),
-                bytes_received: data_len as u64,
-                bytes_sent: 0,
-                priority,
-                is_active: true,
-                worker_assigned: None,
-            });
         }
     }
 
@@ -1012,7 +973,7 @@ impl IntegratedBatchSystem {
 
         if buffer_hit_rate < settings.buffer_pool_target_hit_rate * 0.8 {
             warn!("📉 Buffer pool hit rate low: {:.1}%", buffer_hit_rate * 100.0);
-            self.buffer_pool.force_cleanup();
+            let _ = self.buffer_pool.force_cleanup();
         }
 
         if crypto_success_rate < settings.crypto_processor_target_success_rate * 0.9 {
@@ -1107,7 +1068,7 @@ impl IntegratedBatchSystem {
     /// 🌀 Сброс буферов
     async fn flush_buffers(&self) {
         info!("🌀 Flushing all buffers...");
-        self.buffer_pool.force_cleanup();
+        let _ = self.buffer_pool.force_cleanup();
 
         let mut cache = self.session_cache.write().await;
         cache.clear();
@@ -1546,37 +1507,84 @@ impl IntegratedBatchSystem {
         debug!("🔄 Processing batch #{} with {} operations", batch_id, batch_size);
 
         let mut successful = 0;
+        let mut processed_packets = Vec::new();
 
         for operation in batch.operations {
             match operation {
                 BatchOperation::Encryption { session_id, data, key: _, nonce: _ } => {
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
-                        // ✅ ИСПРАВЛЕНО: используем create_outgoing_vec вместо get_encryption_key
-                        match self.packet_processor.create_outgoing_vec(&session, 0x01, &data) {
-                            Ok(encrypted) => {
-                                successful += 1;
-                                let _ = self.writer.write(
+                        // ✅ ИСПРАВЛЕНО: Сначала дешифруем пакет
+                        match self.packet_processor.process_incoming_vec(&data, &session) {
+                            Ok((packet_type, decrypted_payload)) => {
+                                // ✅ Затем отправляем в packet_service для обработки
+                                match self.packet_service.process_packet(
+                                    session.clone(),
+                                    packet_type,
+                                    decrypted_payload,
                                     batch.source_addr,
-                                    session_id,
-                                    Bytes::from(encrypted),
-                                    Priority::Normal,
-                                    false,
-                                ).await;
+                                ).await {
+                                    Ok(processing_result) => {
+                                        // ✅ Шифруем ответ от packet_service
+                                        match self.packet_processor.create_outgoing_vec(
+                                            &session,
+                                            processing_result.packet_type,
+                                            &processing_result.response,
+                                        ) {
+                                            Ok(encrypted_response) => {
+                                                successful += 1;
+
+                                                let _ = self.writer.write(
+                                                    batch.source_addr,
+                                                    session_id,
+                                                    Bytes::from(encrypted_response),
+                                                    processing_result.priority,
+                                                    processing_result.packet_type == 0x01, // flush для Ping
+                                                ).await;
+
+                                                debug!("✅ Processed packet type 0x{:02x} through packet_service", packet_type);
+                                            }
+                                            Err(e) => {
+                                                debug!("❌ Encryption failed: {}", e);
+                                            }
+                                        }
+                                    }
+                                    Err(e) => {
+                                        debug!("❌ Packet service processing failed: {}", e);
+                                    }
+                                }
                             }
-                            Err(_) => {}
+                            Err(e) => {
+                                debug!("❌ Decryption failed: {}", e);
+                            }
                         }
                     }
                 }
+
                 BatchOperation::Decryption { session_id, data, key: _, nonce: _ } => {
+                    let packet_type_byte = if !data.is_empty() { data[0] } else { 0 };
+
+                    if !is_packet_supported(packet_type_byte) {
+                        debug!("⚠️ Unsupported packet type for decryption: 0x{:02x}", packet_type_byte);
+                        continue;
+                    }
+
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
                         match self.packet_processor.process_incoming_vec(&data, &session) {
-                            Ok((_packet_type, _decrypted)) => {
-                                successful += 1;
+                            Ok((decoded_type, _)) => {
+                                if decoded_type == packet_type_byte {
+                                    successful += 1;
+                                    processed_packets.push((packet_type_byte, true));
+                                    debug!("✅ Decrypted packet type 0x{:02x}", packet_type_byte);
+                                }
                             }
-                            Err(_) => {}
+                            Err(e) => {
+                                debug!("❌ Decryption failed for packet type 0x{:02x}: {}", packet_type_byte, e);
+                                processed_packets.push((packet_type_byte, false));
+                            }
                         }
                     }
                 }
+
                 BatchOperation::Hashing { data, key } => {
                     if let Some(key) = key {
                         let keys = vec![key; 1];
@@ -1587,21 +1595,35 @@ impl IntegratedBatchSystem {
                         }
                     }
                 }
+
                 BatchOperation::Processing { session_id, data, processor_type } => {
+                    let packet_type_byte = if !data.is_empty() { data[0] } else { 0 };
+
+                    if !is_packet_supported(packet_type_byte) {
+                        debug!("⚠️ Unsupported packet type for processing: 0x{:02x}", packet_type_byte);
+                        continue;
+                    }
+
                     match processor_type {
                         ProcessorType::Accelerated => {
+                            let _priority = get_packet_priority(packet_type_byte).unwrap_or(Priority::Normal);
+
                             if let Some(session) = self.session_manager.get_session(&session_id).await {
-                                // ✅ ИСПРАВЛЕНО: используем create_outgoing_vec для шифрования
-                                match self.packet_processor.create_outgoing_vec(&session, 0x01, &data) {
+                                match self.packet_processor.create_outgoing_vec(&session, packet_type_byte, &data) {
                                     Ok(_encrypted) => {
                                         successful += 1;
+                                        processed_packets.push((packet_type_byte, true));
                                     }
-                                    Err(_) => {}
+                                    Err(e) => {
+                                        debug!("❌ Processing failed for packet type 0x{:02x}: {}", packet_type_byte, e);
+                                        processed_packets.push((packet_type_byte, false));
+                                    }
                                 }
                             }
                         }
                         _ => {
                             successful += 1;
+                            processed_packets.push((packet_type_byte, true));
                         }
                     }
                 }
@@ -1615,6 +1637,27 @@ impl IntegratedBatchSystem {
         };
 
         let processing_time = start_time.elapsed();
+
+        // ✅ ЛОГИРУЕМ СТАТИСТИКУ ПО ТИПАМ ПАКЕТОВ
+        let mut packet_stats = HashMap::new();
+        for (packet_type, success) in processed_packets {
+            *packet_stats.entry(packet_type).or_insert((0, 0)) = (
+                packet_stats.get(&packet_type).map(|(s, _)| s + 1).unwrap_or(1),
+                if success { 1 } else { 0 }
+            );
+        }
+
+        if !packet_stats.is_empty() {
+            debug!("📊 Batch #{} packet types:", batch_id);
+            for (packet_type, (total, successful_count)) in packet_stats {
+                if let Some(info) = get_packet_info(packet_type) {
+                    debug!("  - 0x{:02x}: {}/{} ({:.1}%) - {}",
+                       packet_type, successful_count, total,
+                       (successful_count as f64 / total as f64) * 100.0,
+                       info.description);
+                }
+            }
+        }
 
         self.adaptive_batcher.record_batch_execution(
             batch_size,
@@ -1639,7 +1682,7 @@ impl IntegratedBatchSystem {
         let _ = self.event_tx.send(event).await;
 
         debug!("✅ Batch #{} completed: {}/{} successful, {:.1}% in {:?}",
-            batch_id, successful, batch_size, success_rate * 100.0, processing_time);
+        batch_id, successful, batch_size, success_rate * 100.0, processing_time);
     }
 
     /// 🛑 Завершение компонентов

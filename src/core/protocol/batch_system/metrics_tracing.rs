@@ -64,27 +64,6 @@ impl MetricsTracingSystem {
         }
     }
 
-    /// Инициализация tracing (должна быть вызвана только один раз в приложении)
-    pub fn init_tracing() -> Result<(), MetricsError> {
-        if tracing::dispatcher::has_been_set() {
-            info!("📊 Tracing уже инициализирован, пропускаем повторную инициализацию");
-            return Ok(());
-        }
-
-        let subscriber = tracing_subscriber::FmtSubscriber::builder()
-            .with_target(true)
-            .with_thread_ids(true)
-            .with_thread_names(true)
-            .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-            .finish();
-
-        tracing::subscriber::set_global_default(subscriber)
-            .map_err(|e| MetricsError::InitializationError(e.to_string()))?;
-
-        info!("📊 Tracing успешно инициализирован");
-        Ok(())
-    }
-
     /// Запись метрики
     pub fn record_metric(&self, name: &str, value: f64) {
         let key = name.to_string();

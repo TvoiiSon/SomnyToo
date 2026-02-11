@@ -130,21 +130,6 @@ impl PooledBuffer {
         self.data.capacity()
     }
 
-    /// Получение информации о буфере для мониторинга
-    pub fn get_info(&self) -> PooledBufferInfo {
-        PooledBufferInfo {
-            size_class: self.size_class,
-            data_size: self.data.len(),
-            capacity: self.data.capacity(),
-            created_at: self.created_at,
-            last_used: self.last_used,
-            usage_count: self.usage_count,
-            is_used: self.is_used,
-            age_seconds: self.created_at.elapsed().as_secs(),
-            idle_seconds: self.last_used.elapsed().as_secs(),
-        }
-    }
-
     /// Проверка, является ли буфер устаревшим
     pub fn is_stale(&self, max_age: Duration) -> bool {
         !self.is_used && Instant::now().duration_since(self.last_used) > max_age
@@ -564,22 +549,21 @@ impl OptimizedBufferPool {
     fn start_background_tasks(&self) {
         let pool = self.clone();
 
-        // Задача очистки старых буферов
         tokio::spawn(async move {
             let cleanup_interval = Duration::from_secs(pool.config.cleanup_interval_secs);
             let max_age = Duration::from_secs(pool.config.max_buffer_age_secs);
 
             loop {
                 tokio::time::sleep(cleanup_interval).await;
-                pool.cleanup_old_buffers(max_age);
+                pool.cleanup_old_buffers(max_age).await;
                 pool.update_hit_rate();
-                pool.adaptive_pool_adjustment();
+                pool.adaptive_pool_adjustment().await;
             }
         });
     }
 
     /// Очистка старых буферов
-    fn cleanup_old_buffers(&self, max_age: Duration) {
+    async fn cleanup_old_buffers(&self, max_age: Duration) {
         let now = Instant::now();
         let mut cleaned = 0;
         let mut total_freed = 0;
@@ -590,12 +574,19 @@ impl OptimizedBufferPool {
             let before = pool.len();
             let class = SizeClass::all_classes()[class_idx];
 
+            let min_pool_size = match class {
+                SizeClass::Small => 20,
+                SizeClass::Medium => 15,
+                SizeClass::Large => 10,
+                SizeClass::XLarge => 5,
+                SizeClass::Giant => 2,
+            };
+
             pool.retain(|buf| {
-                if buf.is_stale(max_age) {
+                let is_stale = buf.is_stale(max_age);
+
+                if is_stale && before > min_pool_size {
                     total_freed += buf.capacity();
-                    let info = buf.get_info();
-                    debug!("🧹 Cleaning up stale buffer: class={}, age={}s, idle={}s, usage={}",
-                       class.name(), info.age_seconds, info.idle_seconds, info.usage_count);
                     false
                 } else {
                     true
@@ -605,14 +596,21 @@ impl OptimizedBufferPool {
             cleaned += before - pool.len();
         }
 
+        // ✅ Освобождаем pools перед обновлением глобальной статистики
+        drop(pools); // Явно освобождаем блокировку
+
         if cleaned > 0 {
             debug!("🧹 Cleaned up {} old buffers, freed {} bytes", cleaned, total_freed);
 
-            // Обновляем метрики
-            let mut global_stats = self.global_stats.lock();
-            global_stats.total_memory_allocated = global_stats.total_memory_allocated.saturating_sub(total_freed);
+            // ✅ Получаем блокировку, обновляем, сразу освобождаем
+            {
+                let mut global_stats = self.global_stats.lock();
+                global_stats.total_memory_allocated = global_stats.total_memory_allocated.saturating_sub(total_freed);
+            } // Блокировка освобождена
 
-            // Обновляем метрики по классам
+            // ✅ Снова получаем блокировку для обновления статистики по классам
+            let pools = self.size_class_pools.read(); // read lock
+
             for (class_idx, pool) in pools.iter().enumerate() {
                 let class = SizeClass::all_classes()[class_idx];
                 let class_memory: usize = pool.iter().map(|buf| buf.data.capacity()).sum();
@@ -621,6 +619,7 @@ impl OptimizedBufferPool {
                     stats.memory_usage = class_memory;
                 }
             }
+            // pools освобождается здесь
         }
 
         *self.last_cleanup.lock() = now;
@@ -644,31 +643,58 @@ impl OptimizedBufferPool {
     }
 
     /// Адаптивная регулировка пула
-    fn adaptive_pool_adjustment(&self) {
+    async fn adaptive_pool_adjustment(&self) {
         if !self.config.enable_adaptive_pooling {
             return;
         }
 
-        let global_stats = self.global_stats.lock();
-        let current_hit_rate = global_stats.current_hit_rate;
-        let target_hit_rate = self.config.target_hit_rate;
+        // ✅ 1. Получаем данные из блокировки и СРАЗУ освобождаем
+        let (current_hit_rate, target_hit_rate) = {
+            let global_stats = self.global_stats.lock();
+            (global_stats.current_hit_rate, self.config.target_hit_rate)
+        }; // ✅ Блокировка освобождается здесь, перед .await
 
         if current_hit_rate < target_hit_rate * 0.8 {
-            // Hit rate слишком низкий, возможно нужно увеличить размер пула
-            warn!("📉 Hit rate too low ({:.2}%), consider adjusting buffer sizes",
+            warn!("📉 Hit rate too low ({:.1}%), increasing pool size",
                   current_hit_rate * 100.0);
+
+            self.increase_pool_sizes().await; // ✅ await безопасен, блокировка освобождена
+
         } else if current_hit_rate > target_hit_rate * 1.2 {
-            // Hit rate слишком высокий, возможно пул слишком большой
-            debug!("📈 Hit rate excellent ({:.2}%), pool well sized",
+            debug!("📈 Hit rate excellent ({:.1}%), can shrink pool",
                    current_hit_rate * 100.0);
         }
     }
 
+    async fn increase_pool_sizes(&self) {
+        let mut pools = self.size_class_pools.write();
+
+        for (i, class) in SizeClass::all_classes().iter().enumerate() {
+            let current_size = pools[i].len();
+            let target_size = self.config.max_buffers_per_class;
+
+            if current_size < target_size {
+                let to_add = (target_size - current_size).min(10);
+                for _ in 0..to_add {
+                    pools[i].push_back(PooledBuffer::new(*class));
+                }
+                debug!("📈 Increased {} pool from {} to {}",
+                       class.name(), current_size, current_size + to_add);
+            }
+        }
+        // pools освобождается здесь
+    }
+
     /// Принудительная очистка
-    pub fn force_cleanup(&self) {
-        let max_age = Duration::from_secs(0); // Очищаем все неиспользуемые буферы
-        self.cleanup_old_buffers(max_age);
-        info!("✅ Buffer pool force cleanup completed");
+    pub async fn force_cleanup(&self) {
+        let max_age = if self.config.enable_adaptive_pooling {
+            Duration::from_secs(60)
+        } else {
+            Duration::from_secs(0)
+        };
+
+        self.cleanup_old_buffers(max_age).await;
+        info!("✅ Buffer pool force cleanup completed (age threshold: {}s)", max_age.as_secs());
     }
 }
 
