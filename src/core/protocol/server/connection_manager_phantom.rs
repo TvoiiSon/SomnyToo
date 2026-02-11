@@ -5,7 +5,7 @@ use tracing::{info, error};
 
 use crate::core::protocol::phantom_crypto::core::keys::PhantomSession;
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
-use crate::core::protocol::batch_system::integration::BatchSystem;
+use crate::core::protocol::batch_system::integration::IntegratedBatchSystem;
 
 pub async fn handle_phantom_client_connection(
     stream: TcpStream,
@@ -13,7 +13,7 @@ pub async fn handle_phantom_client_connection(
     session: Arc<PhantomSession>,
     phantom_session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<BatchSystem>,
+    batch_system: Arc<IntegratedBatchSystem>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id();
     info!(target: "server", "💓 Starting batch-integrated phantom connection for session: {} from {}",
@@ -35,7 +35,7 @@ pub async fn handle_connection_with_batch(
     session: Arc<PhantomSession>,
     phantom_session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<BatchSystem>,
+    batch_system: Arc<IntegratedBatchSystem>,
 ) -> anyhow::Result<()> {
     let session_id = session.session_id().to_vec();
 

@@ -6,6 +6,10 @@ use flume::{Sender, Receiver, bounded};
 
 use crate::core::protocol::batch_system::types::error::BatchError;
 
+// ИМПОРТЫ SIMD АКСЕЛЕРАТОРОВ
+use crate::core::protocol::batch_system::acceleration_batch::chacha20_batch_accel::ChaCha20BatchAccelerator;
+use crate::core::protocol::batch_system::acceleration_batch::blake3_batch_accel::Blake3BatchAccelerator;
+
 /// Криптозадача
 #[derive(Debug, Clone)]
 pub struct CryptoTask {
@@ -56,30 +60,25 @@ pub struct CryptoResult {
     pub worker_id: usize,
 }
 
-/// Оптимизированный криптопроцессор с атомарными очередями
+/// Оптимизированный криптопроцессор с SIMD акселерацией
 pub struct OptimizedCryptoProcessor {
-    // Атомарные каналы для worker'ов
     worker_senders: Arc<Vec<Sender<CryptoTask>>>,
     worker_receivers: Arc<Vec<Receiver<CryptoTask>>>,
-
-    // Канал для инжектора
     injector_sender: Sender<CryptoTask>,
     injector_receiver: Receiver<CryptoTask>,
-
-    // Результаты
     results: Arc<DashMap<u64, CryptoResult>>,
-
-    // Статистика
     stats: Arc<DashMap<String, u64>>,
-
-    // Управление
     is_running: Arc<std::sync::atomic::AtomicBool>,
     next_task_id: std::sync::atomic::AtomicU64,
+
+    // SIMD АКСЕЛЕРАТОРЫ
+    chacha20_accelerator: Arc<ChaCha20BatchAccelerator>,
+    blake3_accelerator: Arc<Blake3BatchAccelerator>,
 }
 
 impl OptimizedCryptoProcessor {
     pub fn new(num_workers: usize) -> Self {
-        info!("🚀 Creating optimized crypto processor with {} workers and atomарными очередями", num_workers);
+        info!("🚀 Creating optimized crypto processor with {} workers and SIMD acceleration", num_workers);
 
         let mut worker_senders = Vec::with_capacity(num_workers);
         let mut worker_receivers = Vec::with_capacity(num_workers);
@@ -92,6 +91,10 @@ impl OptimizedCryptoProcessor {
 
         let (injector_sender, injector_receiver) = bounded(2000);
 
+        // ИНИЦИАЛИЗАЦИЯ SIMD АКСЕЛЕРАТОРОВ
+        let chacha20_accelerator = Arc::new(ChaCha20BatchAccelerator::new(8));
+        let blake3_accelerator = Arc::new(Blake3BatchAccelerator::new(8));
+
         let processor = Self {
             worker_senders: Arc::new(worker_senders),
             worker_receivers: Arc::new(worker_receivers),
@@ -101,10 +104,11 @@ impl OptimizedCryptoProcessor {
             stats: Arc::new(DashMap::new()),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             next_task_id: std::sync::atomic::AtomicU64::new(1),
+            chacha20_accelerator,
+            blake3_accelerator,
         };
 
         processor.start_workers();
-
         processor
     }
 
@@ -118,6 +122,10 @@ impl OptimizedCryptoProcessor {
             let stats = self.stats.clone();
             let is_running = self.is_running.clone();
 
+            // КЛОНЫ АКСЕЛЕРАТОРОВ ДЛЯ WORKER'ОВ
+            let chacha20 = self.chacha20_accelerator.clone();
+            let blake3 = self.blake3_accelerator.clone();
+
             tokio::spawn(async move {
                 Self::crypto_worker_loop(
                     worker_id,
@@ -126,13 +134,16 @@ impl OptimizedCryptoProcessor {
                     results,
                     stats,
                     is_running,
+                    chacha20,
+                    blake3,
                 ).await;
             });
         }
 
-        info!("✅ Started {} crypto workers with atomарными очередями", num_workers);
+        info!("✅ Started {} crypto workers with SIMD acceleration", num_workers);
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn crypto_worker_loop(
         worker_id: usize,
         worker_receiver: Receiver<CryptoTask>,
@@ -140,178 +151,253 @@ impl OptimizedCryptoProcessor {
         results: Arc<DashMap<u64, CryptoResult>>,
         stats: Arc<DashMap<String, u64>>,
         is_running: Arc<std::sync::atomic::AtomicBool>,
+        chacha20_accelerator: Arc<ChaCha20BatchAccelerator>,
+        blake3_accelerator: Arc<Blake3BatchAccelerator>,
     ) {
-        info!("🔐 Crypto worker #{} started with atomарными очередями", worker_id);
+        info!("🔐 Crypto worker #{} started with SIMD", worker_id);
 
-        let mut processed = 0;
+        let mut batch_buffer: Vec<CryptoTask> = Vec::with_capacity(32);
+        let mut batch_start = Instant::now();
 
         while is_running.load(std::sync::atomic::Ordering::Relaxed) {
             tokio::select! {
-                // Берем из своей очереди
                 Ok(task) = worker_receiver.recv_async() => {
-                    Self::process_crypto_task(
-                        worker_id,
-                        task,
-                        &results,
-                        &stats,
-                    );
-                    processed += 1;
+                    batch_buffer.push(task);
                 }
-
-                // Work-stealing из инжектора
                 Ok(task) = injector_receiver.recv_async() => {
                     *stats.entry("crypto_steals".to_string()).or_insert(0) += 1;
-                    Self::process_crypto_task(
-                        worker_id,
-                        task,
-                        &results,
-                        &stats,
-                    );
-                    processed += 1;
+                    batch_buffer.push(task);
                 }
-
-                _ = tokio::time::sleep(Duration::from_micros(5)) => {
-                    // Короткая пауза
+                _ = tokio::time::sleep(Duration::from_micros(100)) => {
+                    if !batch_buffer.is_empty() && batch_start.elapsed() > Duration::from_micros(500) {
+                        Self::process_batch(
+                            worker_id,
+                            &mut batch_buffer,
+                            &results,
+                            &stats,
+                            &chacha20_accelerator,
+                            &blake3_accelerator,
+                        ).await;
+                        batch_buffer.clear();
+                        batch_start = Instant::now();
+                    }
                 }
             }
 
-            // Статистика
-            if processed >= 50 {
-                stats.insert(format!("crypto_worker_{}_processed", worker_id), processed as u64);
-                processed = 0;
+            // Обработка батча при накоплении
+            if batch_buffer.len() >= 16 {
+                Self::process_batch(
+                    worker_id,
+                    &mut batch_buffer,
+                    &results,
+                    &stats,
+                    &chacha20_accelerator,
+                    &blake3_accelerator,
+                ).await;
+                batch_buffer.clear();
+                batch_start = Instant::now();
             }
         }
 
         info!("👋 Crypto worker #{} stopped", worker_id);
     }
 
-    fn process_crypto_task(
+    async fn process_batch(
         worker_id: usize,
-        task: CryptoTask,
+        tasks: &mut Vec<CryptoTask>,
+        results: &Arc<DashMap<u64, CryptoResult>>,
+        stats: &Arc<DashMap<String, u64>>,
+        chacha20: &Arc<ChaCha20BatchAccelerator>,
+        blake3: &Arc<Blake3BatchAccelerator>,
+    ) {
+        if tasks.is_empty() {
+            return;
+        }
+
+        let start_time = Instant::now();
+
+        // Группируем операции по типу
+        let mut chacha_ops = Vec::new();
+        let mut blake_ops = Vec::new();
+        let mut derive_ops = Vec::new();
+
+        for task in tasks.iter() {
+            match &task.operation {
+                CryptoOperation::EncryptChaCha20 { .. } |
+                CryptoOperation::DecryptChaCha20 { .. } => chacha_ops.push(task),
+                CryptoOperation::HashBlake3 { .. } => blake_ops.push(task),
+                CryptoOperation::DeriveKey { .. } => derive_ops.push(task),
+            }
+        }
+
+        // ПАКЕТНАЯ ОБРАБОТКА CHACHA20 С SIMD
+        if !chacha_ops.is_empty() {
+            Self::process_chacha_batch(worker_id, &chacha_ops, results, stats, chacha20).await;
+        }
+
+        // ПАКЕТНАЯ ОБРАБОТКА BLAKE3 С SIMD
+        if !blake_ops.is_empty() {
+            Self::process_blake_batch(worker_id, &blake_ops, results, stats, blake3).await;
+        }
+
+        // Обработка key derivation (последовательно)
+        for task in derive_ops {
+            Self::process_derive_task(worker_id, task, results, stats).await;
+        }
+
+        let elapsed = start_time.elapsed();
+        *stats.entry("crypto_batch_processing_time".to_string()).or_insert(0) += elapsed.as_micros() as u64;
+        *stats.entry("crypto_batches_processed".to_string()).or_insert(0) += 1;
+    }
+
+    async fn process_chacha_batch(
+        worker_id: usize,
+        tasks: &[&CryptoTask],
+        results: &Arc<DashMap<u64, CryptoResult>>,
+        stats: &Arc<DashMap<String, u64>>,
+        accelerator: &Arc<ChaCha20BatchAccelerator>,
+    ) {
+        let batch_size = tasks.len();
+        let mut keys = Vec::with_capacity(batch_size);
+        let mut nonces = Vec::with_capacity(batch_size);
+        let mut data_buffers = Vec::with_capacity(batch_size);
+        let mut is_encryption = Vec::with_capacity(batch_size);
+
+        for task in tasks {
+            match &task.operation {
+                CryptoOperation::EncryptChaCha20 { key, nonce, plaintext } => {
+                    keys.push(*key);
+                    nonces.push(*nonce);
+                    data_buffers.push(plaintext.clone());
+                    is_encryption.push(true);
+                }
+                CryptoOperation::DecryptChaCha20 { key, nonce, ciphertext } => {
+                    keys.push(*key);
+                    nonces.push(*nonce);
+                    data_buffers.push(ciphertext.clone());
+                    is_encryption.push(false);
+                }
+                _ => {}
+            }
+        }
+
+        // ПАКЕТНОЕ ШИФРОВАНИЕ/ДЕШИФРОВАНИЕ ЧЕРЕЗ SIMD
+        let processed = if is_encryption.iter().all(|&x| x) {
+            accelerator.encrypt_batch(&keys, &nonces, &data_buffers).await
+        } else {
+            accelerator.decrypt_batch(&keys, &nonces, &data_buffers).await
+        };
+
+        // Сохраняем результаты
+        for (i, task) in tasks.iter().enumerate() {
+            let result = CryptoResult {
+                id: task.id,
+                result: Ok(processed[i].clone()),
+                processing_time: Duration::from_micros(0), // Будет обновлено
+                worker_id,
+            };
+            results.insert(task.id, result);
+        }
+
+        *stats.entry("chacha_batch_operations".to_string()).or_insert(0) += batch_size as u64;
+    }
+
+    async fn process_blake_batch(
+        worker_id: usize,
+        tasks: &[&CryptoTask],
+        results: &Arc<DashMap<u64, CryptoResult>>,
+        stats: &Arc<DashMap<String, u64>>,
+        accelerator: &Arc<Blake3BatchAccelerator>,
+    ) {
+        let batch_size = tasks.len();
+        let mut keys = Vec::with_capacity(batch_size);
+        let mut inputs = Vec::with_capacity(batch_size);
+
+        for task in tasks {
+            if let CryptoOperation::HashBlake3 { key, data } = &task.operation {
+                keys.push(*key);
+                inputs.push(data.clone());
+            }
+        }
+
+        // ПАКЕТНОЕ ХЕШИРОВАНИЕ ЧЕРЕЗ SIMD
+        let hashes = accelerator.hash_keyed_batch(&keys, &inputs).await;
+
+        for (i, task) in tasks.iter().enumerate() {
+            let result = CryptoResult {
+                id: task.id,
+                result: Ok(hashes[i].to_vec()),
+                processing_time: Duration::from_micros(0),
+                worker_id,
+            };
+            results.insert(task.id, result);
+        }
+
+        *stats.entry("blake_batch_operations".to_string()).or_insert(0) += batch_size as u64;
+    }
+
+    async fn process_derive_task(
+        worker_id: usize,
+        task: &CryptoTask,
         results: &Arc<DashMap<u64, CryptoResult>>,
         stats: &Arc<DashMap<String, u64>>,
     ) {
-        let start_time = Instant::now();
+        if let CryptoOperation::DeriveKey { algorithm, input, context, output_len } = &task.operation {
+            let result = match algorithm {
+                KeyDerivationAlgorithm::Blake3 => {
+                    use blake3::Hasher;
+                    let mut hasher = Hasher::new();
+                    hasher.update(input);
+                    hasher.update(context);
+                    let mut output = vec![0u8; *output_len];
+                    hasher.finalize_xof().fill(&mut output);
+                    Ok(output)
+                }
+                KeyDerivationAlgorithm::HkdfSha256 => {
+                    use ring::hkdf;
+                    let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]);
+                    let prk = salt.extract(input);
+                    let context_slice = &[context.as_slice()];
+                    match prk.expand(context_slice, hkdf::HKDF_SHA256) {
+                        Ok(okm) => {
+                            let mut output = vec![0u8; *output_len];
+                            match okm.fill(&mut output) {
+                                Ok(_) => Ok(output),
+                                Err(e) => Err(format!("HKDF fill failed: {:?}", e)),
+                            }
+                        }
+                        Err(e) => Err(format!("HKDF expand failed: {:?}", e)),
+                    }
+                }
+                KeyDerivationAlgorithm::HkdfSha512 => {
+                    use ring::hkdf;
+                    let salt = hkdf::Salt::new(hkdf::HKDF_SHA512, &[]);
+                    let prk = salt.extract(input);
+                    let context_slice = &[context.as_slice()];
+                    match prk.expand(context_slice, hkdf::HKDF_SHA512) {
+                        Ok(okm) => {
+                            let mut output = vec![0u8; *output_len];
+                            match okm.fill(&mut output) {
+                                Ok(_) => Ok(output),
+                                Err(e) => Err(format!("HKDF fill failed: {:?}", e)),
+                            }
+                        }
+                        Err(e) => Err(format!("HKDF expand failed: {:?}", e)),
+                    }
+                }
+            };
 
-        let result = match &task.operation {
-            CryptoOperation::EncryptChaCha20 { key, nonce, plaintext } => {
-                Self::encrypt_chacha20(key, nonce, plaintext)
-            }
-            CryptoOperation::DecryptChaCha20 { key, nonce, ciphertext } => {
-                Self::decrypt_chacha20(key, nonce, ciphertext)
-            }
-            CryptoOperation::HashBlake3 { key, data } => {
-                Self::hash_blake3(key, data)
-            }
-            CryptoOperation::DeriveKey { algorithm, input, context, output_len } => {
-                Self::derive_key(algorithm, input, context, *output_len)
-            }
-        };
-
-        let processing_time = start_time.elapsed();
-
-        let crypto_result = CryptoResult {
-            id: task.id,
-            result,
-            processing_time,
-            worker_id,
-        };
-
-        results.insert(task.id, crypto_result);
-
-        // Статистика
-        *stats.entry("crypto_tasks_processed".to_string()).or_insert(0) += 1;
-    }
-
-    fn encrypt_chacha20(
-        key: &[u8; 32],
-        nonce: &[u8; 12],
-        plaintext: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        use chacha20::cipher::{KeyIvInit, StreamCipher};
-        use chacha20::ChaCha20;
-
-        let mut buffer = plaintext.to_vec();
-        let mut cipher = ChaCha20::new(key.into(), nonce.into());
-        cipher.apply_keystream(&mut buffer);
-
-        Ok(buffer)
-    }
-
-    fn decrypt_chacha20(
-        key: &[u8; 32],
-        nonce: &[u8; 12],
-        ciphertext: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        Self::encrypt_chacha20(key, nonce, ciphertext)
-    }
-
-    fn hash_blake3(
-        key: &[u8; 32],
-        data: &[u8],
-    ) -> Result<Vec<u8>, String> {
-        use blake3::Hasher;
-
-        let mut hasher = Hasher::new_keyed(key);
-        hasher.update(data);
-        let hash = hasher.finalize();
-
-        Ok(hash.as_bytes().to_vec())
-    }
-
-    fn derive_key(
-        algorithm: &KeyDerivationAlgorithm,
-        input: &[u8],
-        context: &[u8],
-        output_len: usize,
-    ) -> Result<Vec<u8>, String> {
-        match algorithm {
-            KeyDerivationAlgorithm::Blake3 => {
-                use blake3::Hasher;
-
-                let mut hasher = Hasher::new();
-                hasher.update(input);
-                hasher.update(context);
-
-                let mut output = vec![0u8; output_len];
-                hasher.finalize_xof().fill(&mut output);
-
-                Ok(output)
-            }
-            KeyDerivationAlgorithm::HkdfSha256 => {
-                use ring::hkdf;
-
-                let salt = hkdf::Salt::new(hkdf::HKDF_SHA256, &[]);
-                let prk = salt.extract(input);
-                let context_slice = &[context];
-                let okm = prk.expand(context_slice, hkdf::HKDF_SHA256)
-                    .map_err(|e| format!("HKDF expand failed: {:?}", e))?;
-
-                let mut output = vec![0u8; output_len];
-                okm.fill(&mut output)
-                    .map_err(|e| format!("HKDF fill failed: {:?}", e))?;
-
-                Ok(output)
-            }
-            KeyDerivationAlgorithm::HkdfSha512 => {
-                use ring::hkdf;
-
-                let salt = hkdf::Salt::new(hkdf::HKDF_SHA512, &[]);
-                let prk = salt.extract(input);
-                let context_slice = &[context];
-                let okm = prk.expand(context_slice, hkdf::HKDF_SHA512)
-                    .map_err(|e| format!("HKDF expand failed: {:?}", e))?;
-
-                let mut output = vec![0u8; output_len];
-                okm.fill(&mut output)
-                    .map_err(|e| format!("HKDF fill failed: {:?}", e))?;
-
-                Ok(output)
-            }
+            let crypto_result = CryptoResult {
+                id: task.id,
+                result: result.map_err(|e| e.to_string()),
+                processing_time: Duration::from_micros(0),
+                worker_id,
+            };
+            results.insert(task.id, crypto_result);
+            *stats.entry("derive_key_operations".to_string()).or_insert(0) += 1;
         }
     }
 
-    /// Отправка криптозадачи с атомарными очередями
     pub async fn submit_crypto_task(&self, operation: CryptoOperation, session_id: Vec<u8>, priority: u8) -> Result<u64, BatchError> {
         let task_id = self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
@@ -322,17 +408,14 @@ impl OptimizedCryptoProcessor {
             priority,
         };
 
-        // Round-robin распределение
         let worker_idx = task_id as usize % self.worker_senders.len();
 
-        // Пытаемся отправить в очередь worker'а
         match self.worker_senders[worker_idx].try_send(task.clone()) {
             Ok(_) => {
                 *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
                 Ok(task_id)
             }
             Err(_) => {
-                // Очередь worker'а переполнена, отправляем в инжектор
                 match self.injector_sender.try_send(task) {
                     Ok(_) => {
                         *self.stats.entry("crypto_tasks_submitted".to_string()).or_insert(0) += 1;
@@ -344,11 +427,18 @@ impl OptimizedCryptoProcessor {
         }
     }
 
-    /// Остановка
     pub async fn shutdown(&self) {
         info!("🛑 Shutting down crypto processor...");
         self.is_running.store(false, std::sync::atomic::Ordering::Relaxed);
         info!("✅ Crypto processor stopped");
+    }
+
+    pub fn get_stats(&self) -> std::collections::HashMap<String, u64> {
+        let mut stats_map = std::collections::HashMap::new();
+        for entry in self.stats.iter() {
+            stats_map.insert(entry.key().clone(), *entry.value());
+        }
+        stats_map
     }
 }
 

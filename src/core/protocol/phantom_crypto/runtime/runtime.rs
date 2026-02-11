@@ -9,7 +9,9 @@ use crate::core::protocol::phantom_crypto::{
         blake3_accel::Blake3Accelerator,
     },
 };
-use crate::core::protocol::batch_system::core::processor::CryptoProcessor;
+
+// ИСПРАВЛЕНО: правильный импорт
+use crate::core::protocol::batch_system::optimized::crypto_processor::OptimizedCryptoProcessor;
 
 /// Время выполнения в тактах процессора
 #[derive(Debug, Clone, Copy)]
@@ -36,7 +38,7 @@ pub struct RuntimeStats {
 pub struct PhantomRuntime {
     chacha20_accel: ChaCha20Accelerator,
     blake3_accel: Blake3Accelerator,
-    batch_processor: Arc<CryptoProcessor>,  // Измененный тип
+    batch_processor: Arc<OptimizedCryptoProcessor>,
     stats: std::sync::Mutex<RuntimeStats>,
     cpu_caps: CpuCapabilities,
 }
@@ -45,9 +47,9 @@ impl PhantomRuntime {
     pub fn new(num_workers: usize) -> Self {
         let chacha20_accel = ChaCha20Accelerator::new();
         let blake3_accel = Blake3Accelerator::new();
-        let batch_processor = Arc::new(CryptoProcessor::new(
-            crate::core::protocol::batch_system::config::BatchConfig::default()
-        ));
+
+        // ИСПРАВЛЕНО: передаем количество workers, а не конфиг
+        let batch_processor = Arc::new(OptimizedCryptoProcessor::new(num_workers));
 
         let cpu_caps = CpuCapabilities::detect();
 
@@ -88,7 +90,7 @@ impl PhantomRuntime {
         &self.blake3_accel
     }
 
-    pub fn batch_processor(&self) -> Arc<CryptoProcessor> {
+    pub fn batch_processor(&self) -> Arc<OptimizedCryptoProcessor> {
         self.batch_processor.clone()
     }
 
@@ -110,7 +112,6 @@ impl PhantomRuntime {
         #[cfg(not(target_arch = "x86_64"))]
         let start_cycles = 0;
 
-        // Выполняем операцию с передачей ускорителей
         let result = operation(&self.chacha20_accel, &self.blake3_accel);
 
         #[cfg(target_arch = "x86_64")]
@@ -122,10 +123,8 @@ impl PhantomRuntime {
         let elapsed_time = start_instant.elapsed();
         let cycles = end_cycles.wrapping_sub(start_cycles);
 
-        // Обновляем статистику
         self.update_stats(cycles, elapsed_time, true);
 
-        // Проверяем timing аномалии
         if self.check_timing_anomaly(cycles, elapsed_time).is_err() {
             warn!("Timing anomaly detected, but continuing due to acceleration");
         }
@@ -150,7 +149,6 @@ impl PhantomRuntime {
 
         let elapsed = start.elapsed();
 
-        // Обновляем batch статистику
         let mut stats = self.stats.lock().unwrap();
         stats.batch_operations += results.len() as u64;
         stats.total_operations += results.len() as u64;
@@ -186,7 +184,6 @@ impl PhantomRuntime {
     }
 
     fn check_timing_anomaly(&self, cycles: u64, elapsed_time: std::time::Duration) -> Result<(), String> {
-        // Более мягкие лимиты для SIMD операций
         let max_cycles = if self.cpu_caps.avx2 { 2000 } else { 1000 };
         let min_cycles = if self.cpu_caps.avx2 { 5 } else { 10 };
 

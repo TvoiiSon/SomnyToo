@@ -7,7 +7,7 @@ use tracing::{info, error};
 use crate::core::protocol::phantom_crypto::core::handshake::{perform_phantom_handshake, HandshakeRole};
 use crate::core::protocol::server::session_manager_phantom::PhantomSessionManager;
 use crate::core::protocol::server::connection_manager_phantom::PhantomConnectionManager;
-use crate::core::protocol::batch_system::integration::BatchSystem;
+use crate::core::protocol::batch_system::integration::IntegratedBatchSystem;
 use crate::core::protocol::server::connection_manager_phantom::handle_phantom_client_connection;
 
 pub async fn handle_phantom_connection(
@@ -15,7 +15,7 @@ pub async fn handle_phantom_connection(
     peer: std::net::SocketAddr,
     session_manager: Arc<PhantomSessionManager>,
     connection_manager: Arc<PhantomConnectionManager>,
-    batch_system: Arc<BatchSystem>,
+    batch_system: Arc<IntegratedBatchSystem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Выполняем handshake
     let handshake_result = match timeout(

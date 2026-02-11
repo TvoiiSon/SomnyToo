@@ -31,7 +31,6 @@ pub mod core {
             pub mod circuit_breaker;
             pub mod qos_manager;
             pub mod adaptive_batcher;
-            pub mod load_aware_dispatcher;
             pub mod metrics_tracing;
 
             pub mod acceleration_batch {
@@ -41,9 +40,6 @@ pub mod core {
             pub mod core {
                 pub mod reader;
                 pub mod writer;
-                pub mod dispatcher;
-                pub mod processor;
-                pub mod buffer;
             }
             pub mod optimized {
                 pub mod work_stealing_dispatcher;

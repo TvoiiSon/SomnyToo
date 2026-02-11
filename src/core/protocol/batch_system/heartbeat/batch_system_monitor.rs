@@ -3,12 +3,18 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::RwLock;
 
-use crate::core::protocol::batch_system::core::buffer::UnifiedBufferPool;
-use crate::core::protocol::batch_system::core::processor::CryptoProcessor;
-use crate::core::protocol::batch_system::optimized::work_stealing_dispatcher::WorkStealingDispatcher;
-use crate::core::protocol::batch_system::optimized::crypto_processor::OptimizedCryptoProcessor;
 use crate::core::protocol::batch_system::optimized::buffer_pool::OptimizedBufferPool;
+use crate::core::protocol::batch_system::optimized::crypto_processor::OptimizedCryptoProcessor;
+use crate::core::protocol::batch_system::optimized::work_stealing_dispatcher::WorkStealingDispatcher;
 use crate::core::monitoring::unified_monitor::{UnifiedMonitor, AlertLevel, Monitor, MonitorMetrics, MetricValue};
+
+/// Статистика криптопроцессора
+#[derive(Debug, Clone)]
+pub struct CryptoProcessorStats {
+    pub total_operations: u64,
+    pub total_failed: u64,
+    pub total_batches: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct BatchSystemMetrics {
@@ -41,9 +47,7 @@ pub struct ComponentStatus {
 
 #[derive(Clone)]
 pub struct BatchSystemMonitor {
-    buffer_pool: Option<Arc<UnifiedBufferPool>>,
     optimized_buffer_pool: Option<Arc<OptimizedBufferPool>>,
-    crypto_processor: Option<Arc<CryptoProcessor>>,
     optimized_crypto_processor: Option<Arc<OptimizedCryptoProcessor>>,
     work_stealing_dispatcher: Option<Arc<WorkStealingDispatcher>>,
     unified_monitor: Option<Arc<UnifiedMonitor>>,
@@ -55,9 +59,7 @@ pub struct BatchSystemMonitor {
 impl BatchSystemMonitor {
     pub fn new() -> Self {
         Self {
-            buffer_pool: None,
             optimized_buffer_pool: None,
-            crypto_processor: None,
             optimized_crypto_processor: None,
             work_stealing_dispatcher: None,
             unified_monitor: None,
@@ -67,16 +69,8 @@ impl BatchSystemMonitor {
         }
     }
 
-    pub fn attach_buffer_pool(&mut self, buffer_pool: Arc<UnifiedBufferPool>) {
-        self.buffer_pool = Some(buffer_pool);
-    }
-
     pub fn attach_optimized_buffer_pool(&mut self, buffer_pool: Arc<OptimizedBufferPool>) {
         self.optimized_buffer_pool = Some(buffer_pool);
-    }
-
-    pub fn attach_crypto_processor(&mut self, processor: Arc<CryptoProcessor>) {
-        self.crypto_processor = Some(processor);
     }
 
     pub fn attach_optimized_crypto_processor(&mut self, processor: Arc<OptimizedCryptoProcessor>) {
@@ -104,39 +98,41 @@ impl BatchSystemMonitor {
             batch_processing_rate: 0.0,
         };
 
-        // Собираем метрики из буферных пулов
-        if let Some(ref buffer_pool) = self.buffer_pool {
-            let stats = buffer_pool.get_stats();
-            if stats.allocation_count + stats.reuse_count > 0 {
-                metrics.buffer_pool_hit_rate = stats.reuse_count as f64 /
-                    (stats.allocation_count + stats.reuse_count) as f64;
-            }
-        }
-
         if let Some(ref optimized_pool) = self.optimized_buffer_pool {
             metrics.buffer_pool_reuse_rate = optimized_pool.get_reuse_rate();
-        }
 
-        // Собираем метрики из криптопроцессоров
-        if let Some(ref crypto_processor) = self.crypto_processor {
-            let stats = crypto_processor.get_stats();
-            if stats.total_operations > 0 {
-                metrics.crypto_operations_success_rate = 1.0 -
-                    (stats.total_failed as f64 / stats.total_operations as f64);
+            // Получаем детальную статистику для hit rate
+            let detailed_stats = optimized_pool.get_detailed_stats();
+            if let Some(global_stats) = detailed_stats.get("Global") {
+                metrics.buffer_pool_hit_rate = global_stats.hit_rate;
             }
         }
 
-        // Собираем метрики из диспетчеров
-        if let Some(ref dispatcher) = self.work_stealing_dispatcher {
-            let stats = dispatcher.get_stats();
-            metrics.work_stealing_tasks = stats.values().sum();
+        if let Some(ref crypto_processor) = self.optimized_crypto_processor {
+            let stats = crypto_processor.get_stats();
+            let total_ops = stats.get("crypto_tasks_submitted").copied().unwrap_or(0);
+            let total_failed = stats.get("failed_decryptions").copied().unwrap_or(0);
+
+            if total_ops > 0 {
+                metrics.crypto_operations_success_rate = 1.0 - (total_failed as f64 / total_ops as f64);
+            }
         }
 
-        // Сохраняем историю метрик
+        if let Some(ref dispatcher) = self.work_stealing_dispatcher {
+            let stats = dispatcher.get_stats();
+            metrics.work_stealing_tasks = stats.get("total_tasks_processed").copied().unwrap_or(0);
+            metrics.pending_tasks = stats.get("current_queue_size").copied().unwrap_or(0) as usize;
+
+            let processing_time = stats.get("processing_time_ms_total").copied().unwrap_or(0);
+            let processed = stats.get("total_tasks_processed").copied().unwrap_or(0);
+            if processed > 0 {
+                metrics.avg_processing_time_ms = processing_time as f64 / processed as f64;
+            }
+        }
+
         let mut history = self.metrics_history.write().await;
         history.push((SystemTime::now(), metrics.clone()));
 
-        // Ограничиваем размер истории
         if history.len() > 1000 {
             history.remove(0);
         }
@@ -150,23 +146,15 @@ impl BatchSystemMonitor {
         let mut health_statuses = HashMap::new();
         let mut component_metrics = HashMap::new();
 
-        // Проверяем буферный пул
-        if let (Some(buffer_pool), Some(optimized_pool)) =
-            (&self.buffer_pool, &self.optimized_buffer_pool)
-        {
-            let stats = buffer_pool.get_stats();
+        // ИСПРАВЛЕНО: используем только optimized_buffer_pool
+        if let Some(ref optimized_pool) = self.optimized_buffer_pool {
             let reuse_rate = optimized_pool.get_reuse_rate();
+            let detailed_stats = optimized_pool.get_detailed_stats();
+            let hit_rate = detailed_stats.get("Global")
+                .map(|s| s.hit_rate)
+                .unwrap_or(0.0);
 
-            let hit_rate = if stats.allocation_count + stats.reuse_count > 0 {
-                stats.reuse_count as f64 / (stats.allocation_count + stats.reuse_count) as f64
-            } else {
-                0.0
-            };
-
-            let health = if stats.total_allocated == 0 {
-                // Система только запустилась
-                ComponentHealth::Healthy
-            } else if hit_rate > 0.7 && reuse_rate > 0.6 {
+            let health = if hit_rate > 0.7 && reuse_rate > 0.6 {
                 ComponentHealth::Healthy
             } else if hit_rate > 0.5 && reuse_rate > 0.4 {
                 ComponentHealth::Degraded
@@ -179,17 +167,18 @@ impl BatchSystemMonitor {
             let mut metrics = HashMap::new();
             metrics.insert("hit_rate".to_string(), MetricValue::Gauge(hit_rate));
             metrics.insert("reuse_rate".to_string(), MetricValue::Gauge(reuse_rate));
-            metrics.insert("allocations".to_string(), MetricValue::Counter(stats.allocation_count));
-            metrics.insert("reuses".to_string(), MetricValue::Counter(stats.reuse_count));
 
             component_metrics.insert("buffer_pool".to_string(), metrics);
         }
 
-        // Проверяем криптопроцессор
-        if let Some(ref crypto_processor) = self.crypto_processor {
+        // ИСПРАВЛЕНО: используем optimized_crypto_processor
+        if let Some(ref crypto_processor) = self.optimized_crypto_processor {
             let stats = crypto_processor.get_stats();
-            let success_rate = if stats.total_operations > 0 {
-                1.0 - (stats.total_failed as f64 / stats.total_operations as f64)
+            let total_ops = stats.get("crypto_tasks_submitted").copied().unwrap_or(0);
+            let total_failed = stats.get("failed_decryptions").copied().unwrap_or(0);
+
+            let success_rate = if total_ops > 0 {
+                1.0 - (total_failed as f64 / total_ops as f64)
             } else {
                 1.0
             };
@@ -206,16 +195,15 @@ impl BatchSystemMonitor {
 
             let mut metrics = HashMap::new();
             metrics.insert("success_rate".to_string(), MetricValue::Gauge(success_rate));
-            metrics.insert("total_operations".to_string(), MetricValue::Counter(stats.total_operations));
-            metrics.insert("failed_operations".to_string(), MetricValue::Counter(stats.total_failed));
+            metrics.insert("total_operations".to_string(), MetricValue::Counter(total_ops));
+            metrics.insert("failed_operations".to_string(), MetricValue::Counter(total_failed));
 
             component_metrics.insert("crypto_processor".to_string(), metrics);
         }
 
-        // Проверяем диспетчеры
         if let Some(ref dispatcher) = self.work_stealing_dispatcher {
             let stats = dispatcher.get_stats();
-            let total_tasks: u64 = stats.values().sum();
+            let total_tasks: u64 = stats.get("total_tasks_processed").copied().unwrap_or(0);
 
             let health = if total_tasks > 0 {
                 ComponentHealth::Healthy
@@ -231,7 +219,6 @@ impl BatchSystemMonitor {
             component_metrics.insert("dispatchers".to_string(), metrics);
         }
 
-        // Обновляем статусы компонентов
         let mut statuses = self.component_statuses.write().await;
         for (name, health) in &health_statuses {
             statuses.insert(name.clone(), ComponentStatus {
@@ -266,9 +253,7 @@ impl BatchSystemMonitor {
                             &format!("Component {} is degraded", component)
                         ).await;
                     }
-                    ComponentHealth::Healthy => {
-                        // Не отправляем алерты для здоровых компонентов
-                    }
+                    ComponentHealth::Healthy => {}
                 }
             }
         }
@@ -304,8 +289,6 @@ impl BatchSystemMonitor {
 
     pub async fn health_check(&self) -> bool {
         let health_statuses = self.check_components_health().await;
-
-        // Система считается здоровой, если нет критических или нездоровых компонентов
         !health_statuses.values().any(|h|
             *h == ComponentHealth::Unhealthy || *h == ComponentHealth::Critical
         )
@@ -359,5 +342,11 @@ impl Monitor for BatchSystemMonitor {
 
     async fn reset_metrics(&self) {
         self.reset_metrics().await;
+    }
+}
+
+impl Default for BatchSystemMonitor {
+    fn default() -> Self {
+        Self::new()
     }
 }

@@ -21,7 +21,7 @@ use somnytoo::core::protocol::server::heartbeat::types::ConnectionHeartbeatManag
 use somnytoo::core::protocol::packets::packet_service::PhantomPacketService;
 
 // Импортируем batch систему
-use somnytoo::core::protocol::batch_system::integration::BatchSystem;
+use somnytoo::core::protocol::batch_system::integration::IntegratedBatchSystem;
 use somnytoo::core::protocol::batch_system::config::BatchConfig;
 use somnytoo::core::protocol::batch_system::metrics_tracing::MetricsTracingSystem;
 
@@ -108,7 +108,7 @@ async fn run_server_mode(app_config: AppConfig) -> Result<()> {
     let batch_config = BatchConfig::default();  // Используем конфиг по умолчанию
 
     // Создаем batch систему с обработкой ошибки
-    let batch_system_result = BatchSystem::new(
+    let batch_system_result = IntegratedBatchSystem::new(
         batch_config,  // Первый аргумент: BatchConfig
         phantom_session_manager.clone(),
         phantom_crypto_instance.clone(),
@@ -191,7 +191,7 @@ async fn start_phantom_server(
     _crypto_pool: Arc<PhantomCryptoPool>,
     _heartbeat_manager: Arc<ConnectionHeartbeatManager>,
     _packet_service: Arc<PhantomPacketService>,
-    batch_system: Arc<BatchSystem>,
+    batch_system: Arc<IntegratedBatchSystem>,
 ) -> Result<()> {
     let addr = server_config.get_addr();
     let listener = TcpListener::bind(&addr).await?;
