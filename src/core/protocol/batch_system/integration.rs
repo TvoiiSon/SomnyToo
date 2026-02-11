@@ -918,7 +918,7 @@ impl IntegratedBatchSystem {
         &self,
         task_id: u64,
         session_id: Vec<u8>,
-        source_addr: std::net::SocketAddr,
+        _source_addr: std::net::SocketAddr, // Добавлено подчеркивание
     ) {
         info!("🔄 Отслеживание результата задачи {}", task_id);
 
@@ -975,7 +975,6 @@ impl IntegratedBatchSystem {
                     system.process_task_result(
                         task_result,
                         session_id,
-                        source_addr,
                     ).await;
                 }
                 Ok(None) => {
@@ -1013,7 +1012,6 @@ impl IntegratedBatchSystem {
         &self,
         task_result: WorkStealingResult,
         session_id: Vec<u8>,
-        source_addr: std::net::SocketAddr,
     ) {
         info!("🔄 Processing task result for session: {}", hex::encode(&session_id));
 
@@ -1027,7 +1025,7 @@ impl IntegratedBatchSystem {
                     let packet_data = &data[1..];
 
                     info!("📦 Обработка дешифрованного пакета: тип=0x{:02x}, размер={}",
-                           packet_type, packet_data.len());
+                       packet_type, packet_data.len());
 
                     // Получаем сессию
                     if let Some(session) = self.session_manager.get_session(&session_id).await {
@@ -1038,11 +1036,11 @@ impl IntegratedBatchSystem {
                             session.clone(),
                             packet_type,
                             packet_data.to_vec(),
-                            source_addr,
+                            task_result.destination_addr, // Используем адрес из результата
                         ).await {
                             Ok(processing_result) => {
                                 info!("✅ Packet service processed: packet_type=0x{:02x}, response_len={}",
-                                       processing_result.packet_type, processing_result.response.len());
+                                   processing_result.packet_type, processing_result.response.len());
 
                                 // Шифруем ответ
                                 match self.packet_processor.create_outgoing_vec(
@@ -1055,17 +1053,17 @@ impl IntegratedBatchSystem {
 
                                         // Отправляем зашифрованный ответ
                                         info!("📤 Sending response to {} with priority: {:?}",
-                                               source_addr, processing_result.priority);
+                                           task_result.destination_addr, processing_result.priority);
 
                                         match self.writer.write(
-                                            source_addr,
+                                            task_result.destination_addr,
                                             session_id.clone(),
                                             Bytes::from(encrypted_response.clone()),
                                             processing_result.priority,
                                             true,
                                         ).await {
                                             Ok(_) => {
-                                                info!("✅ Response sent successfully to {}", source_addr);
+                                                info!("✅ Response sent successfully to {}", task_result.destination_addr);
                                             }
                                             Err(e) => {
                                                 error!("❌ Ошибка отправки ответа: {}", e);

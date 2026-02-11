@@ -147,21 +147,44 @@ impl PooledBuffer {
         self.is_used = true;
     }
 
-    /// Возврат буфера в пул
-    fn return_to_pool(&mut self) {
-        self.data.clear();
-        self.is_used = false;
-    }
-
     /// Получение доступной емкости
     fn capacity(&self) -> usize {
         self.data.capacity()
     }
 
-    /// Получение фактического размера данных
-    fn len(&self) -> usize {
-        self.data.len()
+    /// Получение информации о буфере для мониторинга
+    pub fn get_info(&self) -> PooledBufferInfo {
+        PooledBufferInfo {
+            size_class: self.size_class,
+            data_size: self.data.len(),
+            capacity: self.data.capacity(),
+            created_at: self.created_at,
+            last_used: self.last_used,
+            usage_count: self.usage_count,
+            is_used: self.is_used,
+            age_seconds: self.created_at.elapsed().as_secs(),
+            idle_seconds: self.last_used.elapsed().as_secs(),
+        }
     }
+
+    /// Проверка, является ли буфер устаревшим
+    pub fn is_stale(&self, max_age: Duration) -> bool {
+        !self.is_used && Instant::now().duration_since(self.last_used) > max_age
+    }
+}
+
+/// Информация о буфере для мониторинга
+#[derive(Debug, Clone)]
+pub struct PooledBufferInfo {
+    pub size_class: SizeClass,
+    pub data_size: usize,
+    pub capacity: usize,
+    pub created_at: Instant,
+    pub last_used: Instant,
+    pub usage_count: u32,
+    pub is_used: bool,
+    pub age_seconds: u64,
+    pub idle_seconds: u64,
 }
 
 /// Оптимизированный пул буферов с размерными классами
@@ -585,12 +608,16 @@ impl OptimizedBufferPool {
 
         let mut pools = self.size_class_pools.write();
 
-        for (_i, pool) in pools.iter_mut().enumerate() {
+        for (class_idx, pool) in pools.iter_mut().enumerate() {
             let before = pool.len();
+            let class = SizeClass::all_classes()[class_idx];
 
             pool.retain(|buf| {
-                if !buf.is_used && now.duration_since(buf.last_used) > max_age {
+                if buf.is_stale(max_age) {
                     total_freed += buf.capacity();
+                    let info = buf.get_info();
+                    debug!("🧹 Cleaning up stale buffer: class={}, age={}s, idle={}s, usage={}",
+                       class.name(), info.age_seconds, info.idle_seconds, info.usage_count);
                     false
                 } else {
                     true
@@ -602,6 +629,20 @@ impl OptimizedBufferPool {
 
         if cleaned > 0 {
             debug!("🧹 Cleaned up {} old buffers, freed {} bytes", cleaned, total_freed);
+
+            // Обновляем метрики
+            let mut global_stats = self.global_stats.lock();
+            global_stats.total_memory_allocated = global_stats.total_memory_allocated.saturating_sub(total_freed);
+
+            // Обновляем метрики по классам
+            for (class_idx, pool) in pools.iter().enumerate() {
+                let class = SizeClass::all_classes()[class_idx];
+                let class_memory: usize = pool.iter().map(|buf| buf.data.capacity()).sum();
+
+                if let Some(mut stats) = self.stats.get_mut(&class) {
+                    stats.memory_usage = class_memory;
+                }
+            }
         }
 
         *self.last_cleanup.lock() = now;

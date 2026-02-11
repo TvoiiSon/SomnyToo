@@ -30,6 +30,7 @@ pub struct WorkStealingResult {
     pub result: Result<Vec<u8>, String>,
     pub processing_time: Duration,
     pub worker_id: usize,
+    pub destination_addr: std::net::SocketAddr, // Добавлено
 }
 
 #[derive(Debug, Clone)]
@@ -313,6 +314,7 @@ impl WorkStealingDispatcher {
                             result: Ok(result_data),
                             processing_time: start_time.elapsed(),
                             worker_id,
+                            destination_addr: task.source_addr, // Добавлено
                         };
 
                         results.insert(task.id, result);
@@ -331,6 +333,7 @@ impl WorkStealingDispatcher {
                             result: Err(format!("Decryption failed: {}", e)),
                             processing_time: start_time.elapsed(),
                             worker_id,
+                            destination_addr: task.source_addr, // Добавлено
                         };
 
                         results.insert(task.id, result);
@@ -348,6 +351,7 @@ impl WorkStealingDispatcher {
                     result: Err(error.clone()),
                     processing_time: start_time.elapsed(),
                     worker_id,
+                    destination_addr: task.source_addr, // Добавлено
                 };
 
                 results.insert(task.id, result);

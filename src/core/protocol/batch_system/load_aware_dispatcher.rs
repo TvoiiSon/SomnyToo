@@ -245,6 +245,7 @@ impl LoadAwareDispatcher {
             result: Ok(vec![]), // Упрощенный результат
             processing_time,
             worker_id,
+            destination_addr: task.source_addr, // Добавлено
         };
 
         results.insert(task.id, result);
