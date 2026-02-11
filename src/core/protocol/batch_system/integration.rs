@@ -445,6 +445,10 @@ impl IntegratedBatchSystem {
             min_decrease_rate: 0.3,
             adaptation_interval: Duration::from_secs(1),
             enable_auto_tuning: config.enable_adaptive_batching,
+            enable_predictive_adaptation: true,  // Добавлено
+            prediction_horizon: Duration::from_secs(30),  // Добавлено
+            smoothing_factor: 0.3,  // Добавлено
+            confidence_threshold: 0.7,  // Добавлено
         };
 
         let adaptive_batcher = Arc::new(

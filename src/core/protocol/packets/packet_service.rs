@@ -82,8 +82,8 @@ impl PhantomPacketService {
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         let start = Instant::now();
 
-        info!("👻 Ping packet received from {}: {} ({} bytes)",
-        client_ip, String::from_utf8_lossy(&payload), payload.len());
+        info!("👻 Ping packet received from {}: ({} bytes)",
+        client_ip, payload.len());
 
         self.heartbeat_manager.send_custom_alert(
             crate::core::monitoring::unified_monitor::AlertLevel::Info,

@@ -180,6 +180,10 @@ impl WorkStealingDispatcher {
                 p99_processing_time: Duration::from_secs(0),
                 last_adaptation: Instant::now(),
                 adaptation_count: 0,
+                prediction_accuracy: 0.5,  // Добавлено
+                proactive_adaptations: 0,  // Добавлено
+                reactive_adaptations: 0,   // Добавлено
+                avg_prediction_error: 0.0, // Добавлено
             },
             imbalance,
         }
