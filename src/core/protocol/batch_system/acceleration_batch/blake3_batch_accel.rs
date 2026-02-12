@@ -1,8 +1,112 @@
-use std::time::Instant;
-use tracing::{info, debug};
+use std::time::{Instant};
 use rayon::prelude::*;
+use tracing::{info, debug};
 
-/// Конфигурация SIMD ускорителя Blake3
+/// Степенной закон зависимости времени от размера: T(n) = a * n^b
+#[derive(Debug, Clone)]
+pub struct PowerLawModel {
+    /// Коэффициент масштаба (a)
+    pub scale: f64,
+
+    /// Показатель степени (b)
+    pub exponent: f64,
+
+    /// Базовое время для малых данных
+    pub base_time_ns: f64,
+
+    /// Коэффициент качества (R²)
+    pub quality: f64,
+}
+
+impl PowerLawModel {
+    pub fn new() -> Self {
+        Self {
+            scale: 10.0,      // 10 нс
+            exponent: 1.05,   // почти линейный
+            base_time_ns: 50.0, // 50 нс базовых
+            quality: 0.95,
+        }
+    }
+
+    /// Время выполнения для размера n
+    pub fn execution_time(&self, n: usize) -> f64 {
+        self.base_time_ns + self.scale * (n as f64).powf(self.exponent)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheEffectModel {
+    /// Размер L1 кэша
+    pub l1_cache_size: usize,
+
+    /// Размер L2 кэша
+    pub l2_cache_size: usize,
+
+    /// Размер L3 кэша
+    pub l3_cache_size: usize,
+
+    /// Штраф за промах L1 (нс)
+    pub l1_miss_penalty: f64,
+
+    /// Штраф за промах L2 (нс)
+    pub l2_miss_penalty: f64,
+
+    /// Штраф за промах L3 (нс)
+    pub l3_miss_penalty: f64,
+
+    /// Размер строки кэша
+    pub cache_line_size: usize,
+}
+
+impl CacheEffectModel {
+    pub fn new() -> Self {
+        Self {
+            l1_cache_size: 32 * 1024,      // 32 KB
+            l2_cache_size: 256 * 1024,     // 256 KB
+            l3_cache_size: 8 * 1024 * 1024, // 8 MB
+            l1_miss_penalty: 10.0,          // 10 нс
+            l2_miss_penalty: 30.0,          // 30 нс
+            l3_miss_penalty: 100.0,         // 100 нс
+            cache_line_size: 64,            // 64 байта
+        }
+    }
+
+    /// Количество промахов кэша для размера данных
+    pub fn cache_misses(&self, size: usize) -> usize {
+        let lines = (size + self.cache_line_size - 1) / self.cache_line_size;
+
+        if size <= self.l1_cache_size {
+            0
+        } else if size <= self.l2_cache_size {
+            lines - self.l1_cache_size / self.cache_line_size
+        } else if size <= self.l3_cache_size {
+            lines - self.l2_cache_size / self.cache_line_size
+        } else {
+            lines - self.l3_cache_size / self.cache_line_size
+        }
+    }
+
+    /// Штраф за кэш-промахи
+    pub fn cache_penalty(&self, size: usize) -> f64 {
+        let misses = self.cache_misses(size);
+
+        if size <= self.l1_cache_size {
+            0.0
+        } else if size <= self.l2_cache_size {
+            misses as f64 * self.l1_miss_penalty
+        } else if size <= self.l3_cache_size {
+            misses as f64 * self.l2_miss_penalty
+        } else {
+            misses as f64 * self.l3_miss_penalty
+        }
+    }
+
+    /// Оптимальный размер для кэша
+    pub fn optimal_size(&self) -> usize {
+        self.l1_cache_size / 2
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct Blake3BatchConfig {
     pub simd_width: usize,
@@ -12,6 +116,8 @@ pub struct Blake3BatchConfig {
     pub enable_parallel_hashing: bool,
     pub batch_alignment: usize,
     pub max_concurrent_batches: usize,
+    pub power_law_model: PowerLawModel,
+    pub cache_model: CacheEffectModel,
 }
 
 impl Default for Blake3BatchConfig {
@@ -24,18 +130,12 @@ impl Default for Blake3BatchConfig {
             enable_parallel_hashing: true,
             batch_alignment: 64,
             max_concurrent_batches: 8,
+            power_law_model: PowerLawModel::new(),
+            cache_model: CacheEffectModel::new(),
         }
     }
 }
 
-/// Пакетный акселератор Blake3
-pub struct Blake3BatchAccelerator {
-    config: Blake3BatchConfig,
-    simd_capable: bool,
-    detected_features: SimdFeatures,
-}
-
-/// SIMD фичи
 #[derive(Debug, Clone, Copy)]
 pub struct SimdFeatures {
     pub avx2: bool,
@@ -43,12 +143,6 @@ pub struct SimdFeatures {
     pub neon: bool,
     pub aes_ni: bool,
     pub sse4_2: bool,
-}
-
-impl Default for SimdFeatures {
-    fn default() -> Self {
-        Self::detect()
-    }
 }
 
 impl SimdFeatures {
@@ -88,6 +182,25 @@ impl SimdFeatures {
             }
         }
     }
+
+    /// Функция эффективности для хеширования
+    pub fn hashing_efficiency(&self) -> f64 {
+        if self.avx512 {
+            0.90
+        } else if self.avx2 {
+            0.75
+        } else if self.neon {
+            0.70
+        } else {
+            0.50
+        }
+    }
+}
+
+pub struct Blake3BatchAccelerator {
+    config: Blake3BatchConfig,
+    simd_capable: bool,
+    detected_features: SimdFeatures,
 }
 
 impl Blake3BatchAccelerator {
@@ -98,27 +211,29 @@ impl Blake3BatchAccelerator {
         };
 
         let detected_features = SimdFeatures::detect();
-        let simd_capable = detected_features.avx2 || detected_features.neon;
+        let simd_capable = detected_features.avx2 || detected_features.neon || detected_features.avx512;
+
+        let cache_optimal = config.cache_model.optimal_size();
+        let _power_law_time = config.power_law_model.execution_time(cache_optimal);
 
         info!("🚀 Blake3BatchAccelerator initialized:");
         info!("  - SIMD width: {}", simd_width);
         info!("  - AVX2: {}", detected_features.avx2);
         info!("  - AVX512: {}", detected_features.avx512);
         info!("  - NEON: {}", detected_features.neon);
-        info!("  - AES-NI: {}", detected_features.aes_ni);
-        info!("  - SSE4.2: {}", detected_features.sse4_2);
         info!("  - SIMD capable: {}", simd_capable);
+        info!("  - Hashing efficiency: {:.1}%", detected_features.hashing_efficiency() * 100.0);
+        info!("  - Cache optimal size: {} KB", cache_optimal / 1024);
+        info!("  - Power law: T(n) = {:.1} * n^{:.2} ns",
+              config.power_law_model.scale, config.power_law_model.exponent);
 
-        let accelerator = Self {
+        Self {
             config,
             simd_capable,
             detected_features,
-        };
-
-        accelerator
+        }
     }
 
-    /// Пакетное хеширование с ключом
     pub async fn hash_keyed_batch(
         &self,
         keys: &[[u8; 32]],
@@ -133,32 +248,58 @@ impl Blake3BatchAccelerator {
             return Vec::new();
         }
 
-        debug!("🔑 Blake3 keyed batch hashing: {} blocks", batch_size);
+        // Определение оптимальной стратегии
+        let use_parallel = self.config.enable_parallel_hashing && batch_size >= 4;
+        let avg_size = inputs.iter().map(|i| i.len()).sum::<usize>() / batch_size;
+        let use_simd = self.simd_capable && avg_size >= 64;
 
-        let results = if self.config.enable_parallel_hashing && batch_size >= 4 {
+        debug!("🔑 Blake3 keyed batch: {} blocks, SIMD={}, parallel={}",
+               batch_size, use_simd, use_parallel);
+
+        let results = if use_parallel && batch_size >= 16 {
+            self.hash_keyed_batch_parallel_optimized(keys, inputs)
+        } else if use_parallel {
             self.hash_keyed_batch_parallel(keys, inputs)
         } else {
             self.hash_keyed_batch_scalar(keys, inputs)
         };
 
         let elapsed = start.elapsed();
-        debug!("✅ Blake3 batch hashing completed in {:?} ({:.1} ops/ms)",
-               elapsed, batch_size as f64 / elapsed.as_millis() as f64);
+        let throughput = batch_size as f64 / elapsed.as_secs_f64();
+        let bytes_per_sec = inputs.iter().map(|i| i.len()).sum::<usize>() as f64 / elapsed.as_secs_f64();
+
+        debug!("✅ Blake3 batch hashing: {} ops in {:?} ({:.0} ops/s, {:.1} MB/s)",
+               batch_size, elapsed, throughput, bytes_per_sec / 1024.0 / 1024.0);
 
         results
     }
 
-    /// Пакетное хеширование без ключа
-    pub async fn hash_batch(
+    fn hash_keyed_batch_parallel_optimized(
         &self,
+        keys: &[[u8; 32]],
         inputs: &[Vec<u8>],
     ) -> Vec<[u8; 32]> {
-        let batch_size = inputs.len();
-        let zero_keys = vec![[0u8; 32]; batch_size];
-        self.hash_keyed_batch(&zero_keys, inputs).await
+        let batch_size = keys.len();
+
+        // Сортируем индексы
+        let mut indices: Vec<usize> = (0..batch_size).collect();
+        indices.par_sort_by(|&a, &b| inputs[a].len().cmp(&inputs[b].len()));
+
+        // ИСПРАВЛЕНИЕ: используем par_iter() вместо into_par_iter()
+        let sorted_results: Vec<[u8; 32]> = indices
+            .par_iter()
+            .map(|&i| self.hash_keyed_single(&keys[i], &inputs[i]))
+            .collect();
+
+        // Восстанавливаем исходный порядок
+        let mut results = vec![[0u8; 32]; batch_size];
+        for (pos, &idx) in indices.iter().enumerate() {
+            results[idx] = sorted_results[pos];
+        }
+
+        results
     }
 
-    /// Параллельное хеширование
     fn hash_keyed_batch_parallel(
         &self,
         keys: &[[u8; 32]],
@@ -170,7 +311,6 @@ impl Blake3BatchAccelerator {
             .collect()
     }
 
-    /// Скалярное хеширование
     fn hash_keyed_batch_scalar(
         &self,
         keys: &[[u8; 32]],
@@ -186,7 +326,6 @@ impl Blake3BatchAccelerator {
         results
     }
 
-    /// Одиночное хеширование с ключом
     fn hash_keyed_single(&self, key: &[u8; 32], input: &[u8]) -> [u8; 32] {
         use blake3::Hasher;
 
@@ -198,46 +337,52 @@ impl Blake3BatchAccelerator {
         result
     }
 
-    /// Получение информации о производительности
     pub fn get_performance_info(&self) -> Blake3PerformanceInfo {
-        // Используем detected_features для более точной оценки производительности
         let base_throughput = if self.detected_features.avx512 {
-            2048.0  // AVX512 дает максимальную производительность
+            2048.0
         } else if self.detected_features.avx2 {
-            1024.0  // AVX2 - хорошая производительность
+            1024.0
         } else if self.detected_features.neon {
-            896.0   // NEON - хорошая производительность на ARM
-        } else if self.detected_features.sse4_2 {
-            512.0   // SSE4.2 - базовая SIMD
+            896.0
         } else {
-            256.0   // Без SIMD
+            512.0
         };
 
-        // Учитываем AES-NI для ключевого хеширования
         let aes_bonus = if self.detected_features.aes_ni { 1.2 } else { 1.0 };
 
         Blake3PerformanceInfo {
             simd_capable: self.simd_capable,
             optimal_batch_size: self.config.simd_width * 4,
             estimated_throughput: base_throughput * aes_bonus,
-            avx512_enabled: self.detected_features.avx512,  // Новое поле
-            avx2_enabled: self.detected_features.avx2,      // Новое поле
-            neon_enabled: self.detected_features.neon,      // Новое поле
-            aes_ni_enabled: self.detected_features.aes_ni,  // Новое поле
+            avx512_enabled: self.detected_features.avx512,
+            avx2_enabled: self.detected_features.avx2,
+            neon_enabled: self.detected_features.neon,
+            aes_ni_enabled: self.detected_features.aes_ni,
+            power_law_exponent: self.config.power_law_model.exponent,
+            cache_optimal_size: self.config.cache_model.optimal_size(),
         }
     }
 }
 
-/// Информация о производительности Blake3
+#[derive(Debug, Clone)]
+pub struct ComparisonMetrics {
+    pub blake3_time_ns: f64,
+    pub chacha20_time_ns: f64,
+    pub ratio: f64,
+    pub faster: bool,
+}
+
 #[derive(Debug, Clone)]
 pub struct Blake3PerformanceInfo {
     pub simd_capable: bool,
     pub optimal_batch_size: usize,
-    pub estimated_throughput: f64, // MB/s
-    pub avx512_enabled: bool,      // Добавляем поле
-    pub avx2_enabled: bool,        // Добавляем поле
-    pub neon_enabled: bool,        // Добавляем поле
-    pub aes_ni_enabled: bool,      // Добавляем поле
+    pub estimated_throughput: f64,
+    pub avx512_enabled: bool,
+    pub avx2_enabled: bool,
+    pub neon_enabled: bool,
+    pub aes_ni_enabled: bool,
+    pub power_law_exponent: f64,
+    pub cache_optimal_size: usize,
 }
 
 impl Default for Blake3BatchAccelerator {
