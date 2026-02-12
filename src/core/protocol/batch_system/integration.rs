@@ -995,7 +995,7 @@ impl IntegratedBatchSystem {
                 config.high_priority_quota,
                 config.normal_priority_quota,
                 config.low_priority_quota,
-                config.max_queue_size,
+                config.max_queue_size * 10,
             )
         );
 
@@ -1032,7 +1032,7 @@ impl IntegratedBatchSystem {
             config.read_buffer_size,
             config.write_buffer_size,
             64 * 1024,
-            5000,
+            500,
         );
 
         let crypto_processor = factory.create_crypto_processor(
@@ -1066,7 +1066,7 @@ impl IntegratedBatchSystem {
 
         let work_stealing_dispatcher = factory.create_dispatcher(
             config.worker_count,
-            config.max_queue_size,
+            config.max_queue_size * 10,
             session_manager.clone(),
             adaptive_batcher.clone(),
             qos_manager.clone(),

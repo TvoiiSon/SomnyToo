@@ -282,9 +282,9 @@ impl QosQuotas {
             (high_quota, normal_quota, low_quota)
         };
 
-        let high_capacity = (total_capacity as f64 * norm_high).ceil() as usize;
-        let normal_capacity = (total_capacity as f64 * norm_normal).ceil() as usize;
-        let low_capacity = (total_capacity as f64 * norm_low).ceil() as usize;
+        let high_capacity = (total_capacity as f64 * norm_high).ceil() as usize * 10;
+        let normal_capacity = (total_capacity as f64 * norm_normal).ceil() as usize * 10;
+        let low_capacity = (total_capacity as f64 * norm_low).ceil() as usize * 10;
 
         let mut gps_model = GPSModel::new(total_capacity as f64);
         gps_model.weights = [4.0, 2.0, 1.0, 0.5, 0.25];
@@ -303,9 +303,18 @@ impl QosQuotas {
             high_token_bucket: TokenBucket::new(high_capacity as f64 / 1000.0, high_capacity as f64),
             normal_token_bucket: TokenBucket::new(normal_capacity as f64 / 1000.0, normal_capacity as f64),
             low_token_bucket: TokenBucket::new(low_capacity as f64 / 1000.0, low_capacity as f64),
-            high_leaky_bucket: LeakyBucket::new(high_capacity as f64 / 1000.0, high_capacity as f64),
-            normal_leaky_bucket: LeakyBucket::new(normal_capacity as f64 / 1000.0, normal_capacity as f64),
-            low_leaky_bucket: LeakyBucket::new(low_capacity as f64 / 1000.0, low_capacity as f64),
+            high_leaky_bucket: LeakyBucket::new(
+                high_capacity as f64 / 100.0,  // rate = 4 ops/ms = 4000 ops/sec
+                high_capacity as f64           // capacity = 4000
+            ),
+            normal_leaky_bucket: LeakyBucket::new(
+                normal_capacity as f64 / 100.0,
+                normal_capacity as f64
+            ),
+            low_leaky_bucket: LeakyBucket::new(
+                low_capacity as f64 / 100.0,
+                low_capacity as f64
+            ),
         }
     }
 
@@ -513,16 +522,20 @@ impl QosManager {
     pub async fn acquire_permit(&self, priority: Priority) -> Result<QosPermit<'_>, QosError> {
         let start_wait = Instant::now();
 
-        // Обновление статистики
         self.update_statistics(priority, false).await;
 
-        // Проверка token bucket
-        let mut quotas = self.quotas.write().await;  // Изменяем на write для мутабельного доступа
+        let mut quotas = self.quotas.write().await;
         let token_cost = match priority {
             Priority::Critical | Priority::High => 1.0,
             Priority::Normal => 0.5,
             Priority::Low | Priority::Background => 0.25,
         };
+
+        // ИСПРАВЛЕНО: Critical priority bypasses rate limiting!
+        if priority == Priority::Critical {
+            // Skip token bucket and leaky bucket for critical packets
+            return self.acquire_permit_no_limit(priority, token_cost, start_wait).await;
+        }
 
         let token_bucket = match priority {
             Priority::Critical | Priority::High => &mut quotas.high_token_bucket,
@@ -530,14 +543,18 @@ impl QosManager {
             Priority::Low | Priority::Background => &mut quotas.low_token_bucket,
         };
 
-        // Неблокирующая проверка token bucket
         if !token_bucket.try_consume(token_cost) {
             self.update_statistics(priority, true).await;
             self.record_metric(&format!("qos.rate_limit.{}", priority_to_str(priority)), 1.0);
             return Err(QosError::RateLimitExceeded);
         }
 
-        // Проверка leaky bucket для сглаживания
+        // ИСПРАВЛЕНО: Skip leaky bucket for High priority too
+        if priority == Priority::High {
+            // High priority bypasses leaky bucket
+            return self.acquire_permit_with_semaphore(priority, token_cost, start_wait).await;
+        }
+
         let leaky_bucket = match priority {
             Priority::Critical | Priority::High => &mut quotas.high_leaky_bucket,
             Priority::Normal => &mut quotas.normal_leaky_bucket,
@@ -551,8 +568,15 @@ impl QosManager {
         }
 
         drop(quotas);
+        self.acquire_permit_with_semaphore(priority, token_cost, start_wait).await
+    }
 
-        // Получение семафора
+    async fn acquire_permit_with_semaphore(
+        &self,
+        priority: Priority,
+        token_cost: f64,
+        start_wait: Instant
+    ) -> Result<QosPermit<'_>, QosError> {
         let permit_result = match priority {
             Priority::Critical | Priority::High => {
                 tokio::time::timeout(
@@ -579,12 +603,6 @@ impl QosManager {
                 let wait_time = start_wait.elapsed();
                 self.record_wait_time(priority, wait_time).await;
 
-                // Обновление WFQ модели
-                if let Ok(mut wfq) = self.wfq_model.try_write() {
-                    let class = priority_to_class(priority);
-                    wfq.enqueue(1.0, class);
-                }
-
                 self.record_metric(
                     &format!("qos.acquire_success.{}", priority_to_str(priority)),
                     1.0
@@ -608,10 +626,6 @@ impl QosManager {
                     &format!("qos.acquire_failed.{}", priority_to_str(priority)),
                     1.0
                 );
-                self.record_metric(
-                    &format!("qos.{}_rejected", priority_to_str(priority)),
-                    1.0
-                );
                 Err(QosError::SemaphoreClosed)
             }
             Err(_) => {
@@ -620,13 +634,14 @@ impl QosManager {
                     &format!("qos.acquire_timeout.{}", priority_to_str(priority)),
                     1.0
                 );
-                self.record_metric(
-                    &format!("qos.{}_timeout", priority_to_str(priority)),
-                    1.0
-                );
                 Err(QosError::Timeout)
             }
         }
+    }
+
+    async fn acquire_permit_no_limit(&self, priority: Priority, token_cost: f64, start_wait: Instant) -> Result<QosPermit<'_>, QosError> {
+        // Use the same semaphore logic but without rate limiting
+        self.acquire_permit_with_semaphore(priority, token_cost, start_wait).await
     }
 
     fn release_permit(&self, priority: Priority, _token_cost: f64) {

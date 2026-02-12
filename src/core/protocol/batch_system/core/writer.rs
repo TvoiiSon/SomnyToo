@@ -3,7 +3,7 @@ use std::time::{Instant, Duration};
 use std::collections::{VecDeque, BinaryHeap};
 use std::cmp::Ordering;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, RwLock, Semaphore, Mutex};
+use tokio::sync::{RwLock, Semaphore, Mutex, mpsc};
 use bytes::Bytes;
 use tracing::{info, debug, error, warn};
 
@@ -264,7 +264,8 @@ pub struct BatchWriter {
     backpressure_model: Arc<RwLock<BackpressureModel>>,
     connections: Arc<RwLock<Vec<ConnectionWriter>>>,
     task_queue: Arc<Mutex<BinaryHeap<PrioritizedWriteTask>>>,
-    task_tx: broadcast::Sender<WriteTask>,
+    task_tx: mpsc::Sender<WriteTask>,
+    task_rx: Arc<Mutex<mpsc::Receiver<WriteTask>>>,
     backpressure_semaphore: Arc<Semaphore>,
     is_running: Arc<std::sync::atomic::AtomicBool>,
     stats: Arc<RwLock<WriterStats>>,
@@ -289,7 +290,7 @@ impl BatchWriter {
         info!("  Batch size: {}", config.batch_size);
         info!("  Flush interval: {:?}", config.flush_interval);
 
-        let (task_tx, _) = broadcast::channel(config.max_pending_writes);
+        let (task_tx, task_rx) = mpsc::channel(config.max_pending_writes);
 
         let batch_model = WriteBatchModel::new(
             config.min_batch_size,
@@ -306,6 +307,7 @@ impl BatchWriter {
             connections: Arc::new(RwLock::new(Vec::new())),
             task_queue: Arc::new(Mutex::new(BinaryHeap::with_capacity(config.max_pending_writes))),
             task_tx,
+            task_rx: Arc::new(Mutex::new(task_rx)),
             backpressure_semaphore: Arc::new(Semaphore::new(config.max_pending_writes)),
             is_running: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             stats: Arc::new(RwLock::new(WriterStats::default())),
@@ -356,21 +358,12 @@ impl BatchWriter {
         priority: Priority,
         requires_flush: bool,
     ) -> Result<(), BatchError> {
+
         // Проверка backpressure
         let permit = self.backpressure_semaphore.clone()
             .try_acquire_owned()
             .map_err(|_| {
                 warn!("⚠️ Backpressure for {}", destination_addr);
-
-                match self.stats.try_write() {
-                    Ok(mut stats) => {
-                        stats.backpressure_events += 1;
-                    }
-                    Err(_) => {
-                        debug!("Could not update backpressure stats - lock busy");
-                    }
-                }
-
                 BatchError::Backpressure
             })?;
 
@@ -391,24 +384,12 @@ impl BatchWriter {
             return result;
         }
 
-        // Обычные задачи в очередь с приоритетом
-        let prioritized = PrioritizedWriteTask {
-            task: task.clone(),
-            enqueue_time: Instant::now(),
-            priority_score: task.priority_score(),
-        };
-
-        {
-            let mut queue = self.task_queue.lock().await;
-            queue.push(prioritized);
-
-            let mut stats = self.stats.write().await;
-            stats.queue_size = queue.len();
-            stats.max_queue_size = stats.max_queue_size.max(queue.len());
+        // ИСПРАВЛЕНО: mpsc::Sender::send() возвращает Result, но мы .await его
+        if let Err(e) = self.task_tx.send(task).await {
+            error!("❌ Failed to queue write task: {}", e);
+            drop(permit);
+            return Err(BatchError::Backpressure);
         }
-
-        // Сигнал о новой задаче
-        let _ = self.task_tx.send(task);
 
         drop(permit);
         Ok(())
@@ -488,75 +469,41 @@ impl BatchWriter {
         }
     }
 
-    async fn start_writer_for_connection(&self, destination_addr: std::net::SocketAddr) -> Result<(), BatchError> {
+    pub async fn start_writer_for_connection(&self, destination_addr: std::net::SocketAddr) -> Result<(), BatchError> {
+        // ИСПРАВЛЕНО: клонируем все Arc ДО tokio::spawn!
         let connections = self.connections.clone();
         let config = self.config.clone();
         let is_running = self.is_running.clone();
         let backpressure = self.backpressure_semaphore.clone();
         let batch_model = self.batch_model.clone();
-        let _backpressure_model = self.backpressure_model.clone();
         let stats = self.stats.clone();
 
-        let mut task_rx = self.task_tx.subscribe();
-        let _task_queue = self.task_queue.clone();
+        // ИСПРАВЛЕНО: для mpsc Receiver нужно clone через мутекс
+        let task_rx = self.task_rx.clone();
 
         tokio::spawn(async move {
+            // ИСПРАВЛЕНО: получаем receiver внутри задачи
+            let mut task_rx = task_rx.lock().await;
             let mut pending_tasks: Vec<WriteTask> = Vec::with_capacity(config.batch_size);
             let mut last_flush = Instant::now();
 
             while is_running.load(std::sync::atomic::Ordering::Relaxed) {
-                // Получение оптимального размера батча
                 let optimal_size = {
                     let model = batch_model.read().await;
                     model.optimal_batch_size
                 };
 
                 tokio::select! {
-                    Ok(task) = task_rx.recv() => {
-                        if task.destination_addr == destination_addr {
-                            pending_tasks.push(task);
+                Some(task) = task_rx.recv() => {
+                    if task.destination_addr == destination_addr {
+                        pending_tasks.push(task);
 
-                            // Проверка условий отправки батча
-                            let send_batch =
-                                pending_tasks.len() >= optimal_size ||
-                                last_flush.elapsed() >= config.flush_interval ||
-                                pending_tasks.iter().any(|t| t.requires_flush);
+                        let send_batch =
+                            pending_tasks.len() >= optimal_size ||
+                            last_flush.elapsed() >= config.flush_interval ||
+                            pending_tasks.iter().any(|t| t.requires_flush);
 
-                            if send_batch {
-                                let batch_size = pending_tasks.len();
-                                let write_start = Instant::now();
-
-                                match Self::process_batch(
-                                    &connections,
-                                    destination_addr,
-                                    &mut pending_tasks,
-                                    &config
-                                ).await {
-                                    Ok(_) => {
-                                        let write_time = write_start.elapsed();
-
-                                        // Обновление модели
-                                        let mut model = batch_model.write().await;
-                                        model.update(batch_size, write_time);
-
-                                        let mut s = stats.write().await;
-                                        s.total_batches_written += 1;
-                                        s.avg_batch_size = s.avg_batch_size * 0.9 + batch_size as f64 * 0.1;
-                                        s.optimal_batch_size = model.optimal_batch_size;
-                                    }
-                                    Err(e) => {
-                                        error!("Batch write error: {}", e);
-                                    }
-                                }
-
-                                backpressure.add_permits(pending_tasks.len());
-                                pending_tasks.clear();
-                                last_flush = Instant::now();
-                            }
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_millis(10)) => {
-                        if !pending_tasks.is_empty() && last_flush.elapsed() >= config.flush_interval {
+                        if send_batch {
                             let batch_size = pending_tasks.len();
                             let write_start = Instant::now();
 
@@ -582,12 +529,45 @@ impl BatchWriter {
                                 }
                             }
 
-                            backpressure.add_permits(pending_tasks.len());
+                            backpressure.add_permits(batch_size);
                             pending_tasks.clear();
                             last_flush = Instant::now();
                         }
                     }
                 }
+                _ = tokio::time::sleep(Duration::from_millis(10)) => {
+                    if !pending_tasks.is_empty() && last_flush.elapsed() >= config.flush_interval {
+                        let batch_size = pending_tasks.len();
+                        let write_start = Instant::now();
+
+                        match Self::process_batch(
+                            &connections,
+                            destination_addr,
+                            &mut pending_tasks,
+                            &config
+                        ).await {
+                            Ok(_) => {
+                                let write_time = write_start.elapsed();
+
+                                let mut model = batch_model.write().await;
+                                model.update(batch_size, write_time);
+
+                                let mut s = stats.write().await;
+                                s.total_batches_written += 1;
+                                s.avg_batch_size = s.avg_batch_size * 0.9 + batch_size as f64 * 0.1;
+                                s.optimal_batch_size = model.optimal_batch_size;
+                            }
+                            Err(e) => {
+                                error!("Batch write error: {}", e);
+                            }
+                        }
+
+                        backpressure.add_permits(batch_size);
+                        pending_tasks.clear();
+                        last_flush = Instant::now();
+                    }
+                }
+            }
             }
         });
 
