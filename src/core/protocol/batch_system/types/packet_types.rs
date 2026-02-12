@@ -36,97 +36,10 @@ impl PacketClassificationModel {
             max_history,
         }
     }
-
-    /// Обновление модели на основе нового пакета
-    pub fn update(&mut self, packet_type: u8, size: usize, processing_time: Duration) {
-        // Обновление временного ряда
-        let series = self.time_series
-            .entry(packet_type)
-            .or_insert_with(|| VecDeque::with_capacity(self.max_history));
-
-        series.push_back(Instant::now());
-        if series.len() > self.max_history {
-            series.pop_front();
-        }
-
-        // Обновление частоты
-        let window = 60.0; // 60 секунд
-        let count = series.len();
-        let freq = count as f64 / window;
-        self.frequency.insert(packet_type, freq);
-
-        // Обновление среднего размера (EMA)
-        let alpha = 0.1;
-        let current_avg = self.avg_size.get(&packet_type).copied().unwrap_or(0);
-        let new_avg = current_avg as f64 * (1.0 - alpha) + size as f64 * alpha;
-        self.avg_size.insert(packet_type, new_avg as usize);
-
-        // Обновление среднего времени обработки (EMA)
-        let current_time = self.avg_processing_time
-            .get(&packet_type)
-            .copied()
-            .unwrap_or(Duration::from_micros(0));
-        let new_time_ns = current_time.as_nanos() as f64 * (1.0 - alpha) +
-            processing_time.as_nanos() as f64 * alpha;
-        self.avg_processing_time.insert(
-            packet_type,
-            Duration::from_nanos(new_time_ns as u64)
-        );
-
-        // Обновление критичности (на основе частоты и времени обработки)
-        let criticality = self.calculate_criticality(packet_type);
-        self.criticality.insert(packet_type, criticality);
-    }
-
-    /// Расчёт критичности пакета
-    pub fn calculate_criticality(&self, packet_type: u8) -> f64 {
-        let freq = self.frequency.get(&packet_type).copied().unwrap_or(0.0);
-        let proc_time = self.avg_processing_time
-            .get(&packet_type)
-            .copied()
-            .unwrap_or(Duration::from_micros(0))
-            .as_micros() as f64;
-
-        // Критичность = (частота * вес) + (время_обработки * вес)
-        let freq_weight = 0.3;
-        let time_weight = 0.7;
-
-        let norm_freq = (freq / 1000.0).min(1.0);
-        let norm_time = (proc_time / 1000.0).min(1.0);
-
-        (norm_freq * freq_weight + norm_time * time_weight).clamp(0.1, 1.0)
-    }
-
-    /// Прогноз следующего появления пакета
-    pub fn predict_next(&self, packet_type: u8) -> Option<Duration> {
-        let series = self.time_series.get(&packet_type)?;
-        if series.len() < 2 {
-            return None;
-        }
-
-        // Расчёт среднего интервала
-        let mut intervals = Vec::new();
-        let mut prev = series.front()?;
-
-        for curr in series.iter().skip(1) {
-            intervals.push(curr.duration_since(*prev));
-            prev = curr;
-        }
-
-        let avg_interval = intervals.iter().sum::<Duration>() / intervals.len() as u32;
-        Some(avg_interval)
-    }
-
-    /// Вероятность появления пакета в следующий момент
-    pub fn occurrence_probability(&self, packet_type: u8, dt: Duration) -> f64 {
-        let freq = self.frequency.get(&packet_type).copied().unwrap_or(0.0);
-        1.0 - (-freq * dt.as_secs_f64()).exp()
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PacketType {
-    // 🔧 Управляющие пакеты (Critical)
     Ping = 0x01,
     Heartbeat = 0x10,
 }
@@ -158,11 +71,6 @@ impl PacketType {
     /// Требует ли пакет немедленной отправки (flush)
     pub fn requires_immediate_flush(&self) -> bool {
         matches!(self, PacketType::Ping | PacketType::Heartbeat)
-    }
-
-    /// Является ли пакет критическим
-    pub fn is_critical(&self) -> bool {
-        self.priority() == Priority::Critical
     }
 
     /// Базовая критичность (0-1)
@@ -197,12 +105,7 @@ impl PacketType {
             _ => None,
         }
     }
-
-    /// Получить байт
-    pub fn as_byte(&self) -> u8 {
-        *self as u8
-    }
-
+    
     /// Получить описание пакета
     pub fn description(&self) -> &'static str {
         match self {

@@ -5,7 +5,6 @@ use dashmap::DashMap;
 use tracing::{info, debug};
 use flume::{Sender, Receiver, bounded};
 use tokio::sync::{Mutex, RwLock};
-use crate::core::protocol::batch_system::types::error::BatchError;
 use crate::core::protocol::batch_system::acceleration_batch::chacha20_batch_accel::ChaCha20BatchAccelerator;
 use crate::core::protocol::batch_system::acceleration_batch::blake3_batch_accel::Blake3BatchAccelerator;
 
@@ -110,15 +109,6 @@ impl CryptoWorkStealingModel {
             steal_efficiency: 0.8,
         }
     }
-
-    /// Вероятность успешной кражи
-    pub fn steal_success_probability(&self, victim_queue: usize) -> f64 {
-        if victim_queue < self.steal_threshold {
-            0.0
-        } else {
-            1.0 - (self.steal_threshold as f64 / victim_queue as f64)
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -160,45 +150,6 @@ impl BatchProcessingModel {
             target_latency,
             history: VecDeque::with_capacity(100),
         }
-    }
-
-    /// Обновление модели на основе измерения
-    pub fn update(&mut self, batch_size: usize, processing_time: Duration) {
-        self.history.push_back(BatchRecord {
-            batch_size,
-            processing_time,
-            throughput: batch_size as f64 / processing_time.as_secs_f64(),
-            timestamp: Instant::now(),
-        });
-
-        if self.history.len() > 100 {
-            self.history.pop_front();
-        }
-
-        self.current_batch_size = batch_size;
-        self.processing_time = processing_time;
-
-        self.estimate_optimal_batch_size();
-    }
-
-    /// Оценка оптимального размера батча
-    fn estimate_optimal_batch_size(&mut self) {
-        if self.history.len() < 10 {
-            return;
-        }
-
-        let mut best_throughput = 0.0;
-        let mut best_size = self.current_batch_size;
-
-        for record in self.history.iter() {
-            if record.throughput > best_throughput &&
-                record.processing_time <= self.target_latency {
-                best_throughput = record.throughput;
-                best_size = record.batch_size;
-            }
-        }
-
-        self.optimal_batch_size = best_size;
     }
 }
 
@@ -271,15 +222,6 @@ impl CryptoOperation {
             CryptoOperation::DeriveKey { input, .. } => input.len(),
         }
     }
-
-    pub fn operation_type(&self) -> &'static str {
-        match self {
-            CryptoOperation::EncryptChaCha20 { .. } => "encrypt",
-            CryptoOperation::DecryptChaCha20 { .. } => "decrypt",
-            CryptoOperation::HashBlake3 { .. } => "hash",
-            CryptoOperation::DeriveKey { .. } => "derive",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -322,7 +264,7 @@ pub struct CryptoProcessorStats {
 pub struct OptimizedCryptoProcessor {
     worker_senders: Arc<Vec<Sender<CryptoTask>>>,
     worker_receivers: Arc<Vec<Receiver<CryptoTask>>>,
-    injector_sender: Sender<CryptoTask>,
+    _injector_sender: Sender<CryptoTask>,
     injector_receiver: Receiver<CryptoTask>,
     results: Arc<DashMap<u64, CryptoResult>>,
     pub performance_model: Arc<RwLock<CryptoPerformanceModel>>,
@@ -388,7 +330,7 @@ impl OptimizedCryptoProcessor {
         let processor = Self {
             worker_senders: Arc::new(worker_senders),
             worker_receivers: Arc::new(worker_receivers),
-            injector_sender,
+            _injector_sender: injector_sender,
             injector_receiver,
             results: Arc::new(DashMap::with_capacity(10000)),
             performance_model,
@@ -958,89 +900,7 @@ impl OptimizedCryptoProcessor {
             }
         });
     }
-
-    pub async fn submit_crypto_task(
-        &self,
-        operation: CryptoOperation,
-        session_id: Vec<u8>,
-        priority: u8
-    ) -> Result<u64, BatchError> {
-        let task_id = self.next_task_id.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-
-        let mut task = CryptoTask::new(task_id, operation, session_id, priority);
-
-        // Оценка времени выполнения
-        if let Ok(model) = self.performance_model.try_read() {
-            task.estimate_time(&model);
-        }
-
-        // Определение типа операции для батчинга
-        match &task.operation {
-            CryptoOperation::EncryptChaCha20 { .. } |
-            CryptoOperation::DecryptChaCha20 { .. } => {
-                let mut buffer = self.chacha_batch_buffer.lock().await;
-                buffer.push(task.clone());
-
-                if buffer.len() >= self.max_batch_size {
-                    // Немедленная обработка батча
-                    drop(buffer);
-                    self.trigger_batch_processing().await;
-                }
-            }
-            CryptoOperation::HashBlake3 { .. } => {
-                let mut buffer = self.blake_batch_buffer.lock().await;
-                buffer.push(task.clone());
-
-                if buffer.len() >= self.max_batch_size {
-                    drop(buffer);
-                    self.trigger_batch_processing().await;
-                }
-            }
-            CryptoOperation::DeriveKey { .. } => {
-                let mut buffer = self.derive_batch_buffer.lock().await;
-                buffer.push(task.clone());
-            }
-        }
-
-        // Отправка в воркер
-        let worker_idx = task_id as usize % self.worker_senders.len();
-
-        match self.worker_senders[worker_idx].try_send(task.clone()) {
-            Ok(_) => {
-                self.stats.entry("crypto_tasks_submitted".to_string())
-                    .and_modify(|e| *e += 1)
-                    .or_insert(1);
-                Ok(task_id)
-            }
-            Err(_) => {
-                // Fallback в injector
-                match self.injector_sender.try_send(task.clone()) {
-                    Ok(_) => {
-                        self.stats.entry("crypto_tasks_submitted".to_string())
-                            .and_modify(|e| *e += 1)
-                            .or_insert(1);
-                        self.stats.entry("crypto_injector_usage".to_string())
-                            .and_modify(|e| *e += 1)
-                            .or_insert(1);
-                        Ok(task_id)
-                    }
-                    Err(_) => {
-                        Err(BatchError::ProcessingError("All crypto queues are full".to_string()))
-                    }
-                }
-            }
-        }
-    }
-
-    async fn trigger_batch_processing(&self) {
-        // Сигнал батч-процессору
-        // TODO В реальной системе здесь был бы канал уведомлений
-    }
-
-    pub fn get_result(&self, task_id: u64) -> Option<CryptoResult> {
-        self.results.get(&task_id).map(|r| r.clone())
-    }
-
+    
     pub fn get_stats(&self) -> HashMap<String, u64> {
         let mut stats_map = HashMap::new();
 
@@ -1095,7 +955,7 @@ impl Clone for OptimizedCryptoProcessor {
         Self {
             worker_senders: Arc::new(worker_senders),
             worker_receivers: Arc::new(worker_receivers),
-            injector_sender,
+            _injector_sender: injector_sender,
             injector_receiver,
             results: self.results.clone(),
             performance_model: self.performance_model.clone(),

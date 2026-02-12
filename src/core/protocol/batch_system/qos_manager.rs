@@ -70,23 +70,6 @@ impl GPSModel {
         }
     }
 
-    /// Время ожидания в очереди для класса i (формула BCMP)
-    pub fn waiting_time(&self, class: usize, _batch_size: f64) -> f64 {
-        if class >= 5 || self.total_utilization >= 1.0 {
-            return f64::INFINITY;
-        }
-
-        let rho_i = self.utilizations[class];
-        let service_rate = self.service_rates[class];
-
-        // Обобщённая формула времени ожидания для GPS
-        let wait = (1.0 + self.total_utilization) /
-            (service_rate * (1.0 - self.total_utilization)) *
-            (1.0 + rho_i / (1.0 - self.total_utilization));
-
-        wait * 1000.0 // в миллисекундах
-    }
-
     /// Пропускная способность для класса i
     pub fn throughput(&self, class: usize) -> f64 {
         if class >= 5 {
@@ -136,17 +119,6 @@ impl WFQModel {
     pub fn finish_time(&self, packet_length: f64, class: usize) -> f64 {
         let start = self.start_time(packet_length, class);
         start + packet_length / self.weights[class]
-    }
-
-    /// Добавление пакета в очередь
-    pub fn enqueue(&mut self, packet_length: f64, class: usize) {
-        if class >= 5 {
-            return;
-        }
-
-        self.queues[class].push(packet_length);
-        let finish = self.finish_time(packet_length, class);
-        self.finish_times[class].push(finish);
     }
 }
 
@@ -323,18 +295,6 @@ impl QosQuotas {
         self.gps_model.arrival_rates = arrival_rates;
         self.gps_model.compute_utilization(batch_size);
     }
-
-    /// Получение ёмкости для приоритета
-    pub fn capacity_for_priority(&self, priority: Priority) -> usize {
-        match priority {
-            Priority::Critical | Priority::High =>
-                (self.total_capacity as f64 * self.current_high_priority).ceil() as usize,
-            Priority::Normal =>
-                (self.total_capacity as f64 * self.current_normal_priority).ceil() as usize,
-            Priority::Low | Priority::Background =>
-                (self.total_capacity as f64 * self.current_low_priority).ceil() as usize,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,33 +386,17 @@ pub enum QosError {
 }
 
 pub struct QosPermit<'a> {
-    priority: Priority,
-    manager: &'a QosManager,
+    _priority: Priority,
+    _manager: &'a QosManager,
     _permit: Option<SemaphorePermit<'a>>,
-    acquired_at: Instant,
-    token_cost: f64,
-}
-
-impl<'a> QosPermit<'a> {
-    pub fn priority(&self) -> Priority {
-        self.priority
-    }
-
-    pub fn wait_time(&self) -> Duration {
-        self.acquired_at.elapsed()
-    }
-}
-
-impl<'a> Drop for QosPermit<'a> {
-    fn drop(&mut self) {
-        self.manager.release_permit(self.priority, self.token_cost);
-    }
+    _acquired_at: Instant,
+    _token_cost: f64,
 }
 
 pub struct QosManager {
     quotas: RwLock<QosQuotas>,
     pub gps_model: RwLock<GPSModel>,
-    wfq_model: RwLock<WFQModel>,
+    _wfq_model: RwLock<WFQModel>,
     high_priority_semaphore: Semaphore,
     normal_priority_semaphore: Semaphore,
     low_priority_semaphore: Semaphore,
@@ -501,10 +445,12 @@ impl QosManager {
         gps_model.weights = [4.0, 2.0, 1.0, 0.5, 0.25];
         gps_model.compute_shares();
 
+        let _wfq_model = RwLock::new(WFQModel::new());
+
         Self {
             quotas: RwLock::new(quotas),
             gps_model: RwLock::new(gps_model),
-            wfq_model: RwLock::new(WFQModel::new()),
+            _wfq_model,
             high_priority_semaphore: Semaphore::new(high_capacity),
             normal_priority_semaphore: Semaphore::new(normal_capacity),
             low_priority_semaphore: Semaphore::new(low_capacity),
@@ -574,7 +520,7 @@ impl QosManager {
     async fn acquire_permit_with_semaphore(
         &self,
         priority: Priority,
-        token_cost: f64,
+        _token_cost: f64,
         start_wait: Instant
     ) -> Result<QosPermit<'_>, QosError> {
         let permit_result = match priority {
@@ -613,11 +559,11 @@ impl QosManager {
                 );
 
                 Ok(QosPermit {
-                    priority,
-                    manager: self,
+                    _priority: priority,
+                    _manager: self,
                     _permit: Some(permit_owned),
-                    acquired_at: Instant::now(),
-                    token_cost,
+                    _acquired_at: Instant::now(),
+                    _token_cost,
                 })
             }
             Ok(Err(_)) => {
@@ -642,35 +588,6 @@ impl QosManager {
     async fn acquire_permit_no_limit(&self, priority: Priority, token_cost: f64, start_wait: Instant) -> Result<QosPermit<'_>, QosError> {
         // Use the same semaphore logic but without rate limiting
         self.acquire_permit_with_semaphore(priority, token_cost, start_wait).await
-    }
-
-    fn release_permit(&self, priority: Priority, _token_cost: f64) {
-        // Освобождение семафора
-        match priority {
-            Priority::Critical | Priority::High => self.high_priority_semaphore.add_permits(1),
-            Priority::Normal => self.normal_priority_semaphore.add_permits(1),
-            Priority::Low | Priority::Background => self.low_priority_semaphore.add_permits(1),
-        }
-
-        // Обновление leaky bucket (утечка)
-        if let Ok(mut quotas) = self.quotas.try_write() {
-            match priority {
-                Priority::Critical | Priority::High => {
-                    quotas.high_leaky_bucket.update();
-                }
-                Priority::Normal => {
-                    quotas.normal_leaky_bucket.update();
-                }
-                Priority::Low | Priority::Background => {
-                    quotas.low_leaky_bucket.update();
-                }
-            }
-        }
-
-        self.record_metric(
-            &format!("qos.{}_released", priority_to_str(priority)),
-            1.0
-        );
     }
 
     pub async fn adapt_quotas(&self) -> Result<AdaptationDecision, QosError> {
@@ -1124,7 +1041,7 @@ impl Clone for QosManager {
         Self {
             quotas: RwLock::new(quotas),
             gps_model: RwLock::new(gps_model),
-            wfq_model: RwLock::new(WFQModel::new()),
+            _wfq_model: RwLock::new(WFQModel::new()),
             high_priority_semaphore: Semaphore::new(high_capacity),
             normal_priority_semaphore: Semaphore::new(normal_capacity),
             low_priority_semaphore: Semaphore::new(low_capacity),

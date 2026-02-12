@@ -31,28 +31,6 @@ impl SizeClass {
         }
     }
 
-    /// Минимальный размер для класса
-    pub fn min_size(&self) -> usize {
-        match self {
-            SizeClass::Small => 1,
-            SizeClass::Medium => 1025,
-            SizeClass::Large => 8193,
-            SizeClass::XLarge => 65537,
-            SizeClass::Giant => 262145,
-        }
-    }
-
-    /// Максимальный размер для класса
-    pub fn max_size(&self) -> usize {
-        match self {
-            SizeClass::Small => 1024,
-            SizeClass::Medium => 8192,
-            SizeClass::Large => 65536,
-            SizeClass::XLarge => 262144,
-            SizeClass::Giant => 1048576,
-        }
-    }
-
     /// Определение класса по размеру
     pub fn from_size(size: usize) -> Self {
         match size {
@@ -245,13 +223,13 @@ impl CacheModel {
 #[derive(Debug)]
 pub struct PooledBuffer {
     data: Vec<u8>,
-    size_class: SizeClass,
+    _size_class: SizeClass,
     created_at: Instant,
     last_used: Instant,
     usage_count: u32,
-    is_used: bool,
+    _is_used: bool,
     requested_size: usize,
-    allocation_time: Duration,
+    _allocation_time: Duration,
 }
 
 impl PooledBuffer {
@@ -261,44 +239,14 @@ impl PooledBuffer {
 
         Self {
             data: vec![0u8; default_size],
-            size_class,
+            _size_class: size_class,
             created_at: Instant::now(),
             last_used: Instant::now(),
             usage_count: 0,
-            is_used: false,
+            _is_used: false,
             requested_size: default_size,
-            allocation_time: start.elapsed(),
+            _allocation_time: start.elapsed(),
         }
-    }
-
-    fn with_exact_size(size: usize) -> Self {
-        let start = Instant::now();
-        let size_class = SizeClass::from_size(size);
-
-        Self {
-            data: vec![0u8; size],
-            size_class,
-            created_at: Instant::now(),
-            last_used: Instant::now(),
-            usage_count: 0,
-            is_used: false,
-            requested_size: size,
-            allocation_time: start.elapsed(),
-        }
-    }
-
-    fn can_reuse_for(&self, requested_size: usize) -> bool {
-        !self.is_used &&
-            self.data.capacity() >= requested_size &&
-            self.data.capacity() <= requested_size * 2 &&  // Не более 2x избыточности
-            self.usage_count < 1000  // Предотвращение бесконечного переиспользования
-    }
-
-    fn prepare_for_reuse(&mut self) {
-        self.data.clear();
-        self.last_used = Instant::now();
-        self.usage_count += 1;
-        self.is_used = true;
     }
 
     fn capacity(&self) -> usize {
@@ -397,16 +345,16 @@ impl Default for PoolConfig {
 
 pub struct OptimizedBufferPool {
     pub size_class_pools: RwLock<[VecDeque<PooledBuffer>; 5]>,
-    bytes_mut_pool: Mutex<VecDeque<BytesMut>>,
+    _bytes_mut_pool: Mutex<VecDeque<BytesMut>>,  // Добавлен _
     pub size_distribution: RwLock<SizeDistributionModel>,
-    pub cache_model: TokioRwLock<CacheModel>,  // Изменено на TokioRwLock для async
+    pub cache_model: TokioRwLock<CacheModel>,
     stats: Arc<DashMap<SizeClass, SizeClassStats>>,
     global_stats: Mutex<GlobalStats>,
     allocation_times: Mutex<VecDeque<Duration>>,
     wait_times: Mutex<VecDeque<Duration>>,
     last_cleanup: Mutex<Instant>,
     last_adaptation: Mutex<Instant>,
-    config: Arc<PoolConfig>,  // Изменено на Arc для Send
+    config: Arc<PoolConfig>,
 }
 
 impl OptimizedBufferPool {
@@ -449,7 +397,7 @@ impl OptimizedBufferPool {
 
         let pool = Self {
             size_class_pools: RwLock::new(size_class_pools),
-            bytes_mut_pool: Mutex::new(VecDeque::with_capacity(config.max_bytes_mut_buffers)),
+            _bytes_mut_pool: Mutex::new(VecDeque::with_capacity(config.max_bytes_mut_buffers)),
             size_distribution: RwLock::new(size_distribution),
             cache_model: TokioRwLock::new(cache_model),
             stats: Arc::new(DashMap::new()),
@@ -498,236 +446,6 @@ impl OptimizedBufferPool {
                 wait_time_avg: Duration::from_micros(0),
             });
         }
-    }
-
-    pub fn acquire_buffer(&self, requested_size: usize) -> Vec<u8> {
-        let start_time = Instant::now();
-        let size_class = SizeClass::from_size(requested_size);
-
-        // Обновление модели распределения
-        if self.config.enable_size_prediction {
-            if let Some(mut dist) = self.size_distribution.try_write() {
-                dist.update(requested_size);
-            }
-        }
-
-        let mut wait_time = Duration::from_nanos(0);
-
-        // Попытка получить буфер из пула
-        let buffer = self.try_acquire_from_pool(requested_size, size_class, &mut wait_time);
-
-        let allocation_time = start_time.elapsed();
-
-        // Запись времени ожидания и аллокации
-        {
-            let mut wait_times = self.wait_times.lock();
-            wait_times.push_back(wait_time);
-            if wait_times.len() > 1000 {
-                wait_times.pop_front();
-            }
-        }
-
-        {
-            let mut alloc_times = self.allocation_times.lock();
-            alloc_times.push_back(allocation_time);
-            if alloc_times.len() > 1000 {
-                alloc_times.pop_front();
-            }
-        }
-
-        buffer
-    }
-
-    fn try_acquire_from_pool(&self, requested_size: usize, size_class: SizeClass, wait_time: &mut Duration) -> Vec<u8> {
-        let mut global_stats = self.global_stats.lock();
-        let mut stats = self.stats.get_mut(&size_class).unwrap();
-
-        let mut pools = self.size_class_pools.write();
-        let pool_index = size_class.index();
-
-        let wait_start = Instant::now();
-
-        // 1. Попытка получить буфер точно подходящего класса
-        if let Some(index) = pools[pool_index]
-            .iter()
-            .position(|buf| buf.can_reuse_for(requested_size))
-        {
-            let mut buffer = pools[pool_index].swap_remove_back(index).unwrap();
-            *wait_time = wait_start.elapsed();
-
-            buffer.prepare_for_reuse();
-
-            stats.reuses += 1;
-            stats.current_active += 1;
-            stats.peak_active = stats.peak_active.max(stats.current_active);
-            stats.memory_usage += buffer.capacity();
-            stats.peak_memory = stats.peak_memory.max(stats.memory_usage);
-
-            // EMA для среднего количества переиспользований
-            stats.avg_reuse_count = stats.avg_reuse_count * 0.9 + buffer.usage_count as f64 * 0.1;
-            stats.avg_utilization = stats.avg_utilization * 0.9 + buffer.utilization_ratio() * 0.1;
-
-            global_stats.total_reuses += 1;
-            global_stats.current_memory_usage += buffer.capacity();
-            global_stats.peak_memory_usage = global_stats.peak_memory_usage.max(global_stats.current_memory_usage);
-
-            debug!("✅ Buffer reuse: class={}, size={}/{}, utilization={:.1}%, age={:?}",
-                   size_class.name(), requested_size, buffer.capacity(),
-                   buffer.utilization_ratio() * 100.0, buffer.age());
-
-            return buffer.data;
-        }
-
-        // 2. Попытка получить буфер из большего класса
-        for larger_class in self.get_larger_classes(size_class) {
-            let larger_idx = larger_class.index();
-
-            if let Some(index) = pools[larger_idx]
-                .iter()
-                .position(|buf| buf.can_reuse_for(requested_size))
-            {
-                let mut buffer = pools[larger_idx].swap_remove_back(index).unwrap();
-                *wait_time = wait_start.elapsed();
-
-                buffer.prepare_for_reuse();
-
-                if let Some(mut larger_stats) = self.stats.get_mut(&larger_class) {
-                    larger_stats.reuses += 1;
-                    larger_stats.current_active += 1;
-                    larger_stats.peak_active = larger_stats.peak_active.max(larger_stats.current_active);
-                    larger_stats.memory_usage += buffer.capacity();
-                    larger_stats.avg_reuse_count = larger_stats.avg_reuse_count * 0.9 + buffer.usage_count as f64 * 0.1;
-                }
-
-                global_stats.total_reuses += 1;
-
-                debug!("✅ Buffer reuse from larger class: from={}, to={}, size={}/{}, utilization={:.1}%",
-                       larger_class.name(), size_class.name(), requested_size, buffer.capacity(),
-                       buffer.utilization_ratio() * 100.0);
-
-                return buffer.data;
-            }
-        }
-
-        // 3. Создание нового буфера
-        *wait_time = wait_start.elapsed();
-
-        let mut buffer = if requested_size <= size_class.optimal_size() {
-            PooledBuffer::new(size_class)
-        } else {
-            PooledBuffer::with_exact_size(requested_size)
-        };
-
-        buffer.prepare_for_reuse();
-
-        stats.allocations += 1;
-        stats.current_active += 1;
-        stats.peak_active = stats.peak_active.max(stats.current_active);
-        stats.memory_usage += buffer.capacity();
-        stats.peak_memory = stats.peak_memory.max(stats.memory_usage);
-
-        // Обновление среднего возраста
-        let total_age_secs = stats.avg_buffer_age_secs * (stats.allocations - 1) as f64;
-        stats.avg_buffer_age_secs = (total_age_secs + 0.0) / stats.allocations as f64;
-
-        global_stats.total_allocations += 1;
-        global_stats.total_memory_allocated += buffer.capacity();
-        global_stats.current_memory_usage += buffer.capacity();
-        global_stats.peak_memory_usage = global_stats.peak_memory_usage.max(global_stats.current_memory_usage);
-
-        debug!("🆕 Buffer allocation: class={}, size={}, capacity={}, time={:?}",
-               size_class.name(), requested_size, buffer.capacity(), buffer.allocation_time);
-
-        buffer.data
-    }
-
-    pub fn return_buffer(&self, mut buffer: Vec<u8>, buffer_type: &str) {
-        let capacity = buffer.capacity();
-        let size_class = SizeClass::from_size(capacity);
-
-        buffer.clear();
-
-        if self.should_keep_buffer(capacity, size_class) {
-            let mut pools = self.size_class_pools.write();
-            let pool_index = size_class.index();
-
-            if pools[pool_index].len() < self.config.max_buffers_per_class {
-                let pooled_buffer = PooledBuffer {
-                    data: buffer,
-                    size_class,
-                    created_at: Instant::now(),
-                    last_used: Instant::now(),
-                    usage_count: 1,
-                    is_used: false,
-                    requested_size: capacity,
-                    allocation_time: Duration::from_nanos(0),
-                };
-
-                pools[pool_index].push_back(pooled_buffer);
-
-                if let Some(mut stats) = self.stats.get_mut(&size_class) {
-                    stats.current_active = stats.current_active.saturating_sub(1);
-                    stats.memory_usage = stats.memory_usage.saturating_sub(capacity);
-                }
-
-                let mut global_stats = self.global_stats.lock();
-                global_stats.current_memory_usage = global_stats.current_memory_usage.saturating_sub(capacity);
-
-                debug!("🔄 Buffer returned: class={}, capacity={}, type={}",
-                       size_class.name(), capacity, buffer_type);
-            }
-        }
-    }
-
-    fn get_larger_classes(&self, size_class: SizeClass) -> Vec<SizeClass> {
-        match size_class {
-            SizeClass::Small => vec![SizeClass::Medium, SizeClass::Large],
-            SizeClass::Medium => vec![SizeClass::Large, SizeClass::XLarge],
-            SizeClass::Large => vec![SizeClass::XLarge, SizeClass::Giant],
-            SizeClass::XLarge => vec![SizeClass::Giant],
-            SizeClass::Giant => vec![],
-        }
-    }
-
-    fn should_keep_buffer(&self, capacity: usize, size_class: SizeClass) -> bool {
-        if capacity < 256 {
-            return false;
-        }
-
-        if let Some(stats) = self.stats.get(&size_class) {
-            // Рассчитываем hit rate
-            let total_ops = stats.allocations + stats.reuses;
-            let hit_rate = if total_ops > 0 {
-                stats.reuses as f64 / total_ops as f64
-            } else {
-                0.0
-            };
-
-            // Не сохраняем буферы с низким hit rate
-            if hit_rate < 0.3 {
-                return false;
-            }
-
-            // Для больших буферов более строгие условия
-            match size_class {
-                SizeClass::Giant | SizeClass::XLarge => {
-                    if stats.avg_reuse_count < 2.0 {
-                        return false;
-                    }
-                }
-                _ => {}
-            }
-
-            // Проверка на переполнение пула
-            let pools = self.size_class_pools.read();
-            let pool_index = size_class.index();
-
-            if pools[pool_index].len() >= self.config.max_buffers_per_class {
-                return false;
-            }
-        }
-
-        true
     }
 
     fn start_background_tasks(&self) {
@@ -1007,9 +725,6 @@ impl OptimizedBufferPool {
                 history_len
             );
 
-            // Если у вас есть атомарный счётчик для max_buffers_per_class
-            // self.set_max_buffers_per_class(optimal_cache_size.max(100));
-
             debug!("🎯 Optimal cache size would be: {}", optimal_cache_size);
         }
     }
@@ -1092,7 +807,7 @@ impl Clone for OptimizedBufferPool {
                 VecDeque::new(),
                 VecDeque::new(),
             ]),
-            bytes_mut_pool: Mutex::new(VecDeque::new()),
+            _bytes_mut_pool: Mutex::new(VecDeque::new()),
             size_distribution: RwLock::new(SizeDistributionModel::new(1000)),
             cache_model: TokioRwLock::new(CacheModel::new()),
             stats: Arc::new(DashMap::new()),

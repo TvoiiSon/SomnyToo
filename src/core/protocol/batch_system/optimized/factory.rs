@@ -270,129 +270,6 @@ impl OptimizedFactory {
 
         crypto_processor
     }
-
-    pub fn create_adaptive_batcher(
-        &self,
-        config: AdaptiveBatcherConfig,
-    ) -> Arc<AdaptiveBatcher> {
-        let start_time = Instant::now();
-
-        info!("🔄 Creating Mathematical AdaptiveBatcher");
-        info!("  Min batch: {}", config.min_batch_size);
-        info!("  Max batch: {}", config.max_batch_size);
-        info!("  Initial batch: {}", config.initial_batch_size);
-        info!("  Target latency: {} ms", config.target_latency.as_millis());
-
-        let adaptive_batcher = Arc::new(AdaptiveBatcher::new(config));
-
-        // Кэширование
-        if self.enable_caching {
-            self.component_cache.insert(
-                "adaptive_batcher".to_string(),
-                adaptive_batcher.clone() as Arc<dyn std::any::Any + Send + Sync>
-            );
-        }
-
-        // Обновление метрик
-        if self.enable_metrics {
-            if let Ok(mut metrics) = self.metrics.try_write() {
-                metrics.adaptive_batcher_created += 1;
-                metrics.total_allocation_time_ms += start_time.elapsed().as_millis() as f64;
-            }
-        }
-
-        info!("✅ AdaptiveBatcher created in {:?}", start_time.elapsed());
-
-        adaptive_batcher
-    }
-
-    pub fn create_qos_manager(
-        &self,
-        high_priority_quota: f64,
-        normal_priority_quota: f64,
-        low_priority_quota: f64,
-        total_capacity: usize,
-    ) -> Arc<QosManager> {
-        let start_time = Instant::now();
-
-        info!("⚖️ Creating Mathematical QoS Manager");
-        info!("  High quota: {:.1}%", high_priority_quota * 100.0);
-        info!("  Normal quota: {:.1}%", normal_priority_quota * 100.0);
-        info!("  Low quota: {:.1}%", low_priority_quota * 100.0);
-        info!("  Total capacity: {}", total_capacity);
-
-        let qos_manager = Arc::new(QosManager::new(
-            high_priority_quota,
-            normal_priority_quota,
-            low_priority_quota,
-            total_capacity,
-        ));
-
-        // Кэширование
-        if self.enable_caching {
-            self.component_cache.insert(
-                "qos_manager".to_string(),
-                qos_manager.clone() as Arc<dyn std::any::Any + Send + Sync>
-            );
-        }
-
-        // Обновление метрик
-        if self.enable_metrics {
-            if let Ok(mut metrics) = self.metrics.try_write() {
-                metrics.qos_manager_created += 1;
-                metrics.total_allocation_time_ms += start_time.elapsed().as_millis() as f64;
-            }
-        }
-
-        info!("✅ QosManager created in {:?}", start_time.elapsed());
-
-        qos_manager
-    }
-
-    pub fn create_circuit_breaker(
-        &self,
-        name: String,
-        failure_threshold: usize,
-        recovery_timeout: Duration,
-        half_open_max_requests: usize,
-        metrics: Arc<DashMap<String, MetricValue>>,
-    ) -> Arc<CircuitBreaker> {
-        let start_time = Instant::now();
-
-        info!("🛡️ Creating Mathematical CircuitBreaker: {}", name);
-        info!("  Failure threshold: {}", failure_threshold);
-        info!("  Recovery timeout: {:?}", recovery_timeout);
-        info!("  Half-open max requests: {}", half_open_max_requests);
-
-        let circuit_breaker = Arc::new(CircuitBreaker::new(
-            name.clone(),
-            failure_threshold,
-            recovery_timeout,
-            half_open_max_requests,
-            metrics,
-        ));
-
-        // Кэширование
-        if self.enable_caching {
-            let cache_key = format!("circuit_breaker_{}", name);
-            self.component_cache.insert(
-                cache_key,
-                circuit_breaker.clone() as Arc<dyn std::any::Any + Send + Sync>
-            );
-        }
-
-        // Обновление метрик
-        if self.enable_metrics {
-            if let Ok(mut metrics) = self.metrics.try_write() {
-                metrics.circuit_breaker_created += 1;
-                metrics.total_allocation_time_ms += start_time.elapsed().as_millis() as f64;
-            }
-        }
-
-        info!("✅ CircuitBreaker created in {:?}", start_time.elapsed());
-
-        circuit_breaker
-    }
 }
 
 impl Default for OptimizedFactory {
@@ -401,8 +278,6 @@ impl Default for OptimizedFactory {
     }
 }
 
-use crate::core::protocol::batch_system::adaptive_batcher::AdaptiveBatcherConfig;
-use crate::core::protocol::batch_system::circuit_breaker::MetricValue;
 use dashmap::DashMap;
 use std::ops::Deref;
 use std::time::Instant;

@@ -225,12 +225,6 @@ impl ReadTimeoutModel {
             self.current_timeout
         }
     }
-
-    /// Сброс к базовому значению
-    pub fn reset(&mut self) {
-        self.current_timeout = self.base_timeout;
-        self.read_times.clear();
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -291,7 +285,7 @@ pub enum ReaderEvent {
 }
 
 pub struct BatchReader {
-    config: BatchConfig,
+    _config: BatchConfig,
     packet_size_model: Arc<RwLock<PacketSizeModel>>,
     intensity_model: Arc<RwLock<ReadIntensityModel>>,
     timeout_model: Arc<RwLock<ReadTimeoutModel>>,
@@ -309,9 +303,10 @@ impl BatchReader {
         info!("  Adaptive timeout: {}", config.adaptive_read_timeout);
 
         let timeout_model = ReadTimeoutModel::new(config.read_timeout);
+        let _config = config;
 
         Self {
-            config,
+            _config,
             packet_size_model: Arc::new(RwLock::new(PacketSizeModel::new(1000))),
             intensity_model: Arc::new(RwLock::new(ReadIntensityModel::new())),
             timeout_model: Arc::new(RwLock::new(timeout_model)),

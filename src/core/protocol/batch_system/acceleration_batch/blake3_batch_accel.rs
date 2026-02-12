@@ -71,36 +71,6 @@ impl CacheEffectModel {
         }
     }
 
-    /// Количество промахов кэша для размера данных
-    pub fn cache_misses(&self, size: usize) -> usize {
-        let lines = (size + self.cache_line_size - 1) / self.cache_line_size;
-
-        if size <= self.l1_cache_size {
-            0
-        } else if size <= self.l2_cache_size {
-            lines - self.l1_cache_size / self.cache_line_size
-        } else if size <= self.l3_cache_size {
-            lines - self.l2_cache_size / self.cache_line_size
-        } else {
-            lines - self.l3_cache_size / self.cache_line_size
-        }
-    }
-
-    /// Штраф за кэш-промахи
-    pub fn cache_penalty(&self, size: usize) -> f64 {
-        let misses = self.cache_misses(size);
-
-        if size <= self.l1_cache_size {
-            0.0
-        } else if size <= self.l2_cache_size {
-            misses as f64 * self.l1_miss_penalty
-        } else if size <= self.l3_cache_size {
-            misses as f64 * self.l2_miss_penalty
-        } else {
-            misses as f64 * self.l3_miss_penalty
-        }
-    }
-
     /// Оптимальный размер для кэша
     pub fn optimal_size(&self) -> usize {
         self.l1_cache_size / 2

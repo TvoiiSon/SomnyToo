@@ -249,19 +249,6 @@ impl AggregatedMetric {
 
         last - prev
     }
-
-    /// Получение ускорения (второй производной)
-    pub fn second_derivative(&self) -> f64 {
-        if self.values.len() < 3 {
-            return 0.0;
-        }
-
-        let last = *self.values.back().unwrap_or(&0.0);
-        let prev = *self.values.get(self.values.len() - 2).unwrap_or(&0.0);
-        let prev2 = *self.values.get(self.values.len() - 3).unwrap_or(&0.0);
-
-        last - 2.0 * prev + prev2
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -418,7 +405,7 @@ pub struct AnomalyDetector {
     /// История аномалий
     pub history: VecDeque<Anomaly>,
     trend_history: DashMap<String, VecDeque<f64>>,
-    min_samples_for_trend: usize,
+    _min_samples_for_trend: usize,
 }
 
 impl AnomalyDetector {
@@ -429,7 +416,7 @@ impl AnomalyDetector {
             trend_threshold: 0.5,
             history: VecDeque::with_capacity(1000),
             trend_history: DashMap::new(),
-            min_samples_for_trend: 5,
+            _min_samples_for_trend: 5,
         }
     }
 

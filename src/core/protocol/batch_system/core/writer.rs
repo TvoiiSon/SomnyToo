@@ -153,11 +153,6 @@ impl BackpressureModel {
         }
     }
 
-    /// Достигнут ли порог backpressure
-    pub fn is_backpressure(&self) -> bool {
-        self.current_queue >= self.max_queue_size / 2
-    }
-
     /// Критический уровень backpressure
     pub fn is_critical(&self) -> bool {
         self.current_queue >= self.max_queue_size * 9 / 10
@@ -201,18 +196,6 @@ pub struct WriteTask {
     pub requires_flush: bool,
     pub created_at: Instant,
     pub size_bytes: usize,
-}
-
-impl WriteTask {
-    pub fn priority_score(&self) -> i32 {
-        match self.priority {
-            Priority::Critical => 1000,
-            Priority::High => 750,
-            Priority::Normal => 500,
-            Priority::Low => 250,
-            Priority::Background => 100,
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -261,7 +244,7 @@ impl Default for WriterStats {
 pub struct BatchWriter {
     config: BatchConfig,
     batch_model: Arc<RwLock<WriteBatchModel>>,
-    backpressure_model: Arc<RwLock<BackpressureModel>>,
+    _backpressure_model: Arc<RwLock<BackpressureModel>>,
     connections: Arc<RwLock<Vec<ConnectionWriter>>>,
     task_queue: Arc<Mutex<BinaryHeap<PrioritizedWriteTask>>>,
     task_tx: mpsc::Sender<WriteTask>,
@@ -298,12 +281,12 @@ impl BatchWriter {
             config.write_timeout,
         );
 
-        let backpressure_model = BackpressureModel::new(config.max_pending_writes);
+        let _backpressure_model = Arc::new(RwLock::new(BackpressureModel::new(config.max_pending_writes)));
 
         Self {
             config: config.clone(),
             batch_model: Arc::new(RwLock::new(batch_model)),
-            backpressure_model: Arc::new(RwLock::new(backpressure_model)),
+            _backpressure_model,
             connections: Arc::new(RwLock::new(Vec::new())),
             task_queue: Arc::new(Mutex::new(BinaryHeap::with_capacity(config.max_pending_writes))),
             task_tx,

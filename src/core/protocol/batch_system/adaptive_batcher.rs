@@ -1180,12 +1180,6 @@ impl AdaptiveBatcher {
     pub async fn get_batch_size(&self) -> usize {
         *self.current_batch_size.read().await
     }
-
-    pub async fn force_adaptation(&self) {
-        let new_size = self.compute_batch_size().await;
-        *self.current_batch_size.write().await = new_size;
-        info!("🎯 Batch size adapted to {} (mathematical optimal)", new_size);
-    }
 }
 
 #[derive(Debug, Clone)]

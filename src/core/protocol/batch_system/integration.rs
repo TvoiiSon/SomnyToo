@@ -102,14 +102,6 @@ impl SystemStateModel {
         self.lambda * self.latency_ms / 1000.0
     }
 
-    pub fn batch_formation_time_ms(&self) -> f64 {
-        if self.lambda < 0.1 {
-            1000.0
-        } else {
-            self.b as f64 / self.lambda * 1000.0
-        }
-    }
-
     pub fn update(&mut self,
                   lambda: f64,
                   latency_ms: f64,
@@ -140,9 +132,9 @@ pub struct AdaptiveSystemController {
     reader: Arc<BatchReader>,
     writer: Arc<BatchWriter>,
     metrics: Arc<MetricsTracingSystem>,
-    optimization_model: Arc<RwLock<ConfigOptimizationModel>>,
+    _optimization_model: Arc<RwLock<ConfigOptimizationModel>>,
     pid_latency: Arc<RwLock<PIDController>>,
-    pid_throughput: Arc<RwLock<PIDController>>,
+    _pid_throughput: Arc<RwLock<PIDController>>,
     adaptation_history: Arc<RwLock<VecDeque<AdaptationRecord>>>,
     command_tx: broadcast::Sender<SystemCommand>,
     control_interval: Duration,
@@ -174,9 +166,9 @@ impl AdaptiveSystemController {
         metrics: Arc<MetricsTracingSystem>,
         command_tx: broadcast::Sender<SystemCommand>,
     ) -> Self {
-        let optimization_model = Arc::new(RwLock::new(ConfigOptimizationModel::new()));
+        let _optimization_model = Arc::new(RwLock::new(ConfigOptimizationModel::new()));
         let pid_latency = Arc::new(RwLock::new(PIDController::auto_tune(0.5, 10.0)));
-        let pid_throughput = Arc::new(RwLock::new(PIDController::new(0.3, 0.1, 0.05)));
+        let _pid_throughput = Arc::new(RwLock::new(PIDController::new(0.3, 0.1, 0.05)));
 
         Self {
             state: Arc::new(RwLock::new(SystemStateModel::new())),
@@ -190,9 +182,9 @@ impl AdaptiveSystemController {
             reader,
             writer,
             metrics,
-            optimization_model,
+            _optimization_model,
             pid_latency,
-            pid_throughput,
+            _pid_throughput,
             adaptation_history: Arc::new(RwLock::new(VecDeque::with_capacity(100))),
             command_tx,
             control_interval: Duration::from_secs(1),
@@ -895,11 +887,6 @@ impl AdaptiveSystemController {
               health * 100.0, state.lambda, state.rho, state.latency_ms, state.b, state.m);
 
         self.metrics.record_metric("system.health", health).await;
-    }
-
-    pub async fn get_adaptation_history(&self, limit: usize) -> Vec<AdaptationRecord> {
-        let history = self.adaptation_history.read().await;
-        history.iter().rev().take(limit).cloned().collect()
     }
 
     pub async fn stop(&self) {
@@ -3134,19 +3121,6 @@ impl ResourceScheduler {
             resource_limits: limits,
             allocation_history: VecDeque::with_capacity(100),
         }
-    }
-
-    pub fn proportional_allocation(&mut self, total_resources: f64) -> HashMap<String, f64> {
-        let total_weight: f64 = self.component_weights.values().sum();
-        let mut allocation = HashMap::new();
-
-        for (component, weight) in &self.component_weights {
-            let share = (weight / total_weight) * total_resources;
-            allocation.insert(component.clone(), share);
-        }
-
-        self.resource_allocation = allocation.clone();
-        allocation
     }
 }
 

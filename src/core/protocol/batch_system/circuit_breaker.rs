@@ -95,28 +95,6 @@ impl CircuitBreakerMarkovModel {
         // Нормировка
         self.availability = self.availability.clamp(0.0, 1.0);
     }
-
-    /// Вероятность перехода из i в j за время t
-    pub fn transition_probability(&self, from: usize, to: usize, t: f64) -> f64 {
-        if from >= 3 || to >= 3 {
-            return 0.0;
-        }
-
-        // Проверка корректности интенсивностей
-        let q_ii = match from {
-            0 => -self.transition_rates[0][1] - self.transition_rates[0][2],
-            1 => -self.transition_rates[1][0] - self.transition_rates[1][2],
-            2 => -self.transition_rates[2][0] - self.transition_rates[2][1],
-            _ => 0.0,
-        };
-
-        if from == to {
-            (-q_ii * t).exp()
-        } else {
-            self.transition_rates[from][to] / q_ii.abs() *
-                (1.0 - (-q_ii * t).exp())
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -220,16 +198,6 @@ pub enum CircuitState {
     Closed = 0,     // Нормальная работа
     Open = 1,       // Открыт - запросы блокируются
     HalfOpen = 2,   // Пробный режим
-}
-
-impl CircuitState {
-    pub fn as_str(&self) -> &'static str {
-        match self {
-            CircuitState::Closed => "CLOSED",
-            CircuitState::Open => "OPEN",
-            CircuitState::HalfOpen => "HALF_OPEN",
-        }
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -684,29 +652,26 @@ pub struct CircuitBreakerManager {
     breakers: DashMap<String, Arc<CircuitBreaker>>,
     config: Arc<super::config::BatchConfig>,
     metrics: Arc<DashMap<String, MetricValue>>,
-    system_markov: RwLock<CircuitBreakerMarkovModel>,
-    global_failure_rate: RwLock<FailureRateModel>,
+    _system_markov: RwLock<CircuitBreakerMarkovModel>,
+    _global_failure_rate: RwLock<FailureRateModel>,
 }
 
 impl CircuitBreakerManager {
-
     pub fn new(config: Arc<super::config::BatchConfig>) -> Self {
         info!("🏢 Initializing CircuitBreakerManager");
 
-        let mut system_markov = CircuitBreakerMarkovModel::new();
-        system_markov.compute_steady_state();
-
-        let global_failure_rate = FailureRateModel::new(
+        let _system_markov = RwLock::new(CircuitBreakerMarkovModel::new());
+        let _global_failure_rate = RwLock::new(FailureRateModel::new(
             0.01,
             Duration::from_secs(300)
-        );
+        ));
 
         Self {
             breakers: DashMap::new(),
             config,
             metrics: Arc::new(DashMap::new()),
-            system_markov: RwLock::new(system_markov),
-            global_failure_rate: RwLock::new(global_failure_rate),
+            _system_markov,
+            _global_failure_rate,
         }
     }
 
@@ -738,21 +703,6 @@ impl CircuitBreakerManager {
         }
 
         stats
-    }
-
-    pub fn get_all_breakers(&self) -> Vec<Arc<CircuitBreaker>> {
-        self.breakers.iter().map(|e| e.value().clone()).collect()
-    }
-
-    pub async fn reset_all(&self) {
-        info!("🔄 Resetting all circuit breakers");
-
-        for breaker in self.breakers.iter() {
-            breaker.value().reset().await;
-        }
-
-        self.metrics.insert("circuit_breaker.global.reset".to_string(),
-                            MetricValue::Float(1.0));
     }
 }
 

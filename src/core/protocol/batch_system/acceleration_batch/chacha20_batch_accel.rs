@@ -48,12 +48,6 @@ impl SIMDPerformanceModel {
             size as f64 * self.scalar_time_per_byte
         }
     }
-
-    /// Пропускная способность
-    pub fn throughput(&self, size: usize, use_simd: bool) -> f64 {
-        let time_sec = self.execution_time(size, use_simd) / 1_000_000_000.0;
-        size as f64 / time_sec
-    }
 }
 
 #[derive(Debug, Clone)]
@@ -171,14 +165,6 @@ impl SimdFeatures {
     /// Функция эффективности для NEON
     pub fn neon_efficiency(&self) -> f64 {
         if self.neon { 0.80 } else { 0.0 }
-    }
-
-    /// Максимальная эффективность SIMD
-    pub fn max_efficiency(&self) -> f64 {
-        self.avx512_efficiency()
-            .max(self.avx2_efficiency())
-            .max(self.neon_efficiency())
-            .max(0.5)
     }
 }
 
